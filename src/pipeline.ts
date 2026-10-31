@@ -135,9 +135,14 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   let attributed = attribute(hunks, sessions, root, { since, extraRoots });
   const texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== 'deleted').map((h) => h.file))]);
   attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p) });
+  // Without any transcript every hunk would be "unattributed": noise, not a finding.
+  const mode: Report['mode'] = sessions.length === 0 ? 'risk-scan' : 'provenance';
+  if (mode === 'risk-scan') attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== 'unattributed') }));
 
   const kind = opts.classify ?? 'none';
-  if (kind !== 'none' && attributed.length) {
+  if (kind !== 'none' && attributed.length && mode === 'risk-scan') {
+    log('no agent transcripts, so there are no prompts to check intent against; skipping intent check');
+  } else if (kind !== 'none' && attributed.length) {
     const classifier = createClassifier(kind, { model: opts.model, onProgress: (done: number, total: number) => log(`intent check ${done}/${total} batches`) });
     if (classifier) {
       log(`checking intent with ${classifier.name}`);
@@ -159,6 +164,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
     generatedAt: new Date().toISOString(),
     repo: { root, name: await repoName(root), branch: await currentBranch(root) },
     range: rangeLabel,
+    mode,
     sessions: sessions
       .filter((s) => contributing.has(s.id))
       .map(({ id, harness, path: p, startedAt, endedAt, title }) => ({ id, harness, path: tildify(p, home), startedAt, endedAt, title })),

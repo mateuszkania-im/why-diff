@@ -218,6 +218,12 @@ export interface Report {
   repo: { root: string; name: string; branch?: string };
   /** What was diffed, e.g. "main...HEAD" or "working tree" */
   range: string;
+  /**
+   * `provenance`: agent sessions were found and hunks are traced to prompts.
+   * `risk-scan`: no transcripts at all (a reviewer's machine, CI), so only the
+   * deterministic labels apply and `unattributed` labels are dropped.
+   */
+  mode: 'provenance' | 'risk-scan';
   /** Sessions that contributed to this diff (see `Summary.sessionsFound` for the number discovered) */
   sessions: Pick<Session, 'id' | 'harness' | 'path' | 'startedAt' | 'endedAt' | 'title'>[];
   /** Prompts that own at least one hunk */

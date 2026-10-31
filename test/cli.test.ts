@@ -9,6 +9,7 @@ import { tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
 
 const root = path.resolve(__dirname, '..');
 const tsxLoader = pathToFileURL(path.join(root, 'node_modules', 'tsx', 'dist', 'esm', 'index.mjs')).href;
+const NO_CLAUDE = '/nonexistent/why-diff-test-claude';
 const GIT_ENV = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
 
 let repo: string;
@@ -22,8 +23,8 @@ function git(cwd: string, ...args: string[]): string {
 }
 
 function cli(args: string[]): { status: number | null; stdout: string; stderr: string } {
-  // PATH holds only node and git: no `claude`, so no LLM backend can ever be found.
-  const env: NodeJS.ProcessEnv = { PATH: bareBin, HOME: home, GIT_CONFIG_NOSYSTEM: '1', ...GIT_ENV };
+  // The node bin dir can hold a global `claude` (npm i -g); point the classifier at a missing binary so no LLM is ever reached.
+  const env: NodeJS.ProcessEnv = { PATH: bareBin, HOME: home, GIT_CONFIG_NOSYSTEM: '1', WHY_DIFF_CLAUDE_BIN: NO_CLAUDE, ...GIT_ENV };
   const r = spawnSync(process.execPath, ['--import', tsxLoader, path.join(root, 'src', 'cli.ts'), ...args], { cwd: repo, encoding: 'utf8', env });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
 }
@@ -68,6 +69,12 @@ describe('argument validation', () => {
     const r = cli(['--fail-on', 'unrequested', '-q']);
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('--fail-on unrequested needs --classify');
+  });
+
+  it('--fail-on unrequested exits 2 when no LLM backend is available instead of passing silently', () => {
+    const r = cli(['-w', '-f', 'md', '-q', '--classify', '--fail-on', 'unrequested']);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('--fail-on unrequested: the intent check did not run (no LLM backend available');
   });
 
   it('rejects an unparseable --since date', () => {

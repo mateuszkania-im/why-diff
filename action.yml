@@ -1,0 +1,85 @@
+name: why-diff
+description: >-
+  Risk scan of a pull request diff (skipped or weakened tests, new dependencies,
+  CI and config changes, lint suppressions, secret-like strings), posted as one
+  sticky PR comment. Needs `permissions: pull-requests: write` and
+  `actions/checkout` with `fetch-depth: 0`.
+author: mateuszkania-im
+branding:
+  icon: git-pull-request
+  color: purple
+
+inputs:
+  fail-on:
+    description: >-
+      Fail the job if: risk, tests, unattributed (comma list). Empty means never fail.
+      `unattributed` is ignored when no agent transcripts are present (always the case in CI).
+    required: false
+    default: ''
+  comment:
+    description: Post or update one sticky why-diff comment on the pull request ('true' or 'false').
+    required: false
+    default: 'true'
+  base:
+    description: Branch the pull request targets, compared as origin/<base>...HEAD.
+    required: false
+    default: ${{ github.base_ref }}
+
+outputs:
+  report:
+    description: Path of the Markdown report written by the action.
+    value: ${{ steps.report.outputs.report }}
+  exit-code:
+    description: Exit code of why-diff (0 ok, 1 a --fail-on check matched).
+    value: ${{ steps.report.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - id: report
+      name: Run why-diff
+      shell: bash
+      env:
+        WHY_DIFF_BASE: ${{ inputs.base }}
+        WHY_DIFF_FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        report="$RUNNER_TEMP/why-diff.md"
+        args=(--format md -q)
+        if [ -n "$WHY_DIFF_BASE" ]; then args+=(--base "$WHY_DIFF_BASE"); fi
+        if [ -n "$WHY_DIFF_FAIL_ON" ]; then args+=(--fail-on "$WHY_DIFF_FAIL_ON"); fi
+        set +e
+        node "$GITHUB_ACTION_PATH/plugin/bin/why-diff.mjs" "${args[@]}" > "$report"
+        code=$?
+        set -e
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        # 0 = clean, 1 = a --fail-on check matched (reported after the comment). Anything else is an error.
+        if [ "$code" -gt 1 ]; then exit "$code"; fi
+        cat "$report" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Post sticky comment
+      if: inputs.comment == 'true' && github.event.pull_request.number
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        REPORT: ${{ steps.report.outputs.report }}
+      run: |
+        marker='<!-- why-diff:comment -->'
+        body="$RUNNER_TEMP/why-diff-comment.md"
+        { echo "$marker"; cat "$REPORT"; } > "$body"
+        id=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+          --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n 1)
+        if [ -n "$id" ]; then
+          gh api -X PATCH "repos/$REPO/issues/comments/$id" -F "body=@$body" > /dev/null
+        else
+          gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -F "body=@$body" > /dev/null
+        fi
+
+    - name: Apply fail-on
+      if: steps.report.outputs.exit-code == '1'
+      shell: bash
+      run: |
+        echo "why-diff: a --fail-on check matched (see the report above)" >&2
+        exit 1

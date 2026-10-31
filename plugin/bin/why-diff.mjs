@@ -2626,7 +2626,7 @@ var program = new Command();
 var import_picocolors2 = __toESM(require_picocolors(), 1);
 import { mkdir as mkdir3, writeFile as writeFile3 } from "node:fs/promises";
 import path11 from "node:path";
-import { spawn } from "node:child_process";
+import { spawn as spawn2 } from "node:child_process";
 
 // src/pipeline.ts
 import os5 from "node:os";
@@ -7268,8 +7268,12 @@ async function buildReport(opts = {}) {
   log(`found ${sessions.length} agent session(s), ${hunks.length} hunk(s)`);
   let prompts = sessions.flatMap((s) => s.prompts), attributed = attribute(hunks, sessions, root, { since, extraRoots }), texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== "deleted").map((h) => h.file))]);
   attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p) });
+  let mode = sessions.length === 0 ? "risk-scan" : "provenance";
+  mode === "risk-scan" && (attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== "unattributed") })));
   let kind = opts.classify ?? "none";
-  if (kind !== "none" && attributed.length) {
+  if (kind !== "none" && attributed.length && mode === "risk-scan")
+    log("no agent transcripts, so there are no prompts to check intent against; skipping intent check");
+  else if (kind !== "none" && attributed.length) {
     let classifier = createClassifier(kind, { model: opts.model, onProgress: (done, total) => log(`intent check ${done}/${total} batches`) });
     classifier ? (log(`checking intent with ${classifier.name}`), attributed = await classifyHunks(attributed, prompts, classifier, { repoRoot: root })) : log("no LLM backend available (install Claude Code, or set ANTHROPIC_API_KEY / OPENAI_API_KEY); skipping intent check");
   }
@@ -7282,6 +7286,7 @@ async function buildReport(opts = {}) {
     generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
     repo: { root, name: await repoName(root), branch: await currentBranch(root) },
     range: rangeLabel,
+    mode,
     sessions: sessions.filter((s) => contributing.has(s.id)).map(({ id, harness, path: p, startedAt, endedAt, title }) => ({ id, harness, path: tildify(p, home), startedAt, endedAt, title })),
     prompts: prompts.filter((p) => usedPromptIds.has(p.id)),
     edits: editTable(attributed, sessions),
@@ -7374,7 +7379,7 @@ function describeSessions(report) {
   }
   return found > 0 ? `no agent session contributed to this diff (${plural(found, "session")} found in the window)` : "no agent sessions found";
 }
-var NO_SESSIONS_HINT = "check the harness (--harness), the time window (--since), pass --session <file>, or use --scan-all for sessions run from another folder";
+var RISK_SCAN_NOTE = "No agent transcripts here, so lines are not traced to prompts. The PR author can add provenance with `why-diff pr`.", NO_SESSIONS_HINT = "check the harness (--harness), the time window (--since), pass --session <file>, or use --scan-all for sessions run from another folder";
 function headline(report) {
   let s = report.summary, tracedPct = s.addedLines > 0 ? Math.round(s.agentLines / s.addedLines * 100) : 0, intentRan = !!s.intent || report.hunks.some((h) => h.intent), unrequestedHunks = s.intent?.unrequested ?? report.hunks.filter((h) => h.intent?.verdict === "unrequested").length, unattributedHunks = report.hunks.filter((h) => !h.prompt || h.match === "none").length, riskLabels = 0, warnLabels = 0;
   for (let r of collectRisks(report, "warn"))
@@ -8281,10 +8286,16 @@ _Report truncated to fit the size limit._
   return md;
 }
 function build(report, o) {
-  let H = "#".repeat(o.headingLevel ?? 2), sub = H + "#", h = headline(report), s = report.summary, out = [];
-  out.push(`${H} Provenance`), out.push("");
-  let headlineBits = [h.noAddedLines ? "no added lines" : `**${h.tracedPct}%** of added lines trace to a prompt`];
-  h.intentRan && headlineBits.push(h.unrequestedHunks === 0 ? "nothing unrequested" : `**${h.unrequestedHunks}** ${h.unrequestedHunks === 1 ? "hunk" : "hunks"} nobody asked for`), headlineBits.push(h.touchedTests ? "**tests touched**" : "tests untouched"), h.unattributedHunks > 0 && headlineBits.push(`**${h.unattributedHunks}** unattributed ${h.unattributedHunks === 1 ? "hunk" : "hunks"}`), out.push(`> ${headlineBits.join(" \xB7 ")}`), out.push("");
+  let H = "#".repeat(o.headingLevel ?? 2), sub = H + "#", h = headline(report), s = report.summary, out = [], scan = report.mode === "risk-scan";
+  if (scan) {
+    out.push(`${H} why-diff risk scan`), out.push(""), out.push(text(RISK_SCAN_NOTE)), out.push("");
+    let risky = h.riskLabels + h.warnLabels;
+    out.push(`> ${risky === 0 ? "no risks found" : `**${risky}** ${risky === 1 ? "finding" : "findings"}`} \xB7 ${h.touchedTests ? "**tests touched**" : "tests untouched"}`), out.push("");
+  } else {
+    out.push(`${H} Provenance`), out.push("");
+    let headlineBits = [h.noAddedLines ? "no added lines" : `**${h.tracedPct}%** of added lines trace to a prompt`];
+    h.intentRan && headlineBits.push(h.unrequestedHunks === 0 ? "nothing unrequested" : `**${h.unrequestedHunks}** ${h.unrequestedHunks === 1 ? "hunk" : "hunks"} nobody asked for`), headlineBits.push(h.touchedTests ? "**tests touched**" : "tests untouched"), h.unattributedHunks > 0 && headlineBits.push(`**${h.unattributedHunks}** unattributed ${h.unattributedHunks === 1 ? "hunk" : "hunks"}`), out.push(`> ${headlineBits.join(" \xB7 ")}`), out.push("");
+  }
   let risks = collectRisks(report, "warn");
   if (risks.length > 0) {
     out.push(`${sub} Risks (${risks.length})`), out.push(""), out.push("| | File | Label | Detail |"), out.push("|---|---|---|---|");
@@ -8292,14 +8303,19 @@ function build(report, o) {
       out.push(`| ${badge(r.label.severity)} | ${riskCell(r)} | \`${code(r.label.kind)}\` | ${cell(r.label.detail)} |`);
     risks.length > o.maxRisks && out.push(`| | | | _\u2026 ${risks.length - o.maxRisks} more not shown_ |`), out.push("");
   }
-  if (out.push(`${sub} Summary`), out.push(""), out.push("| | |"), out.push("|---|---|"), out.push(`| Diff | \`${code(report.range)}\` in \`${code(report.repo.name)}\`${report.repo.branch ? ` (\`${code(report.repo.branch)}\`)` : ""} |`), out.push(`| Sessions | ${text(describeSessions(report))}${s.sessions === 0 ? `; ${text(NO_SESSIONS_HINT)}` : ""} |`), out.push(`| Prompts | ${s.prompts} |`), out.push(`| Hunks | ${s.hunks} in ${plural(s.files, "file")} (+${s.addedLines} \u2212${s.removedLines}) |`), out.push(`| Agent-traced lines | ${s.agentLines} of ${s.addedLines} added${h.noAddedLines ? "" : ` (${h.tracedPct}%)`} |`), out.push(`| Unattributed lines | ${s.unattributedLines}${h.unattributedHunks > 0 ? ` in ${plural(h.unattributedHunks, "hunk")}` : ""} |`), s.intent) {
+  if (out.push(`${sub} Summary`), out.push(""), out.push("| | |"), out.push("|---|---|"), out.push(`| Diff | \`${code(report.range)}\` in \`${code(report.repo.name)}\`${report.repo.branch ? ` (\`${code(report.repo.branch)}\`)` : ""} |`), scan || (out.push(`| Sessions | ${text(describeSessions(report))}${s.sessions === 0 ? `; ${text(NO_SESSIONS_HINT)}` : ""} |`), out.push(`| Prompts | ${s.prompts} |`)), out.push(`| Hunks | ${s.hunks} in ${plural(s.files, "file")} (+${s.addedLines} \u2212${s.removedLines}) |`), scan || (out.push(`| Agent-traced lines | ${s.agentLines} of ${s.addedLines} added${h.noAddedLines ? "" : ` (${h.tracedPct}%)`} |`), out.push(`| Unattributed lines | ${s.unattributedLines}${h.unattributedHunks > 0 ? ` in ${plural(h.unattributedHunks, "hunk")}` : ""} |`)), s.intent) {
     let i = s.intent;
     out.push(`| Intent | ${i.requested} requested \xB7 ${i.implied} implied \xB7 ${i.unrequested} unrequested \xB7 ${i.unclear} unclear${h.classifierModel ? ` (${code(h.classifierModel)})` : ""} |`);
   }
   out.push(`| Tests | ${s.touchedTests ? "touched" : "untouched"} |`), out.push("");
   let { groups, unattributed } = groupByPrompt(report), budget = o.maxHunks, hidden = 0;
-  out.push(`${sub} Prompts`), out.push("");
-  for (let g of groups) {
+  if (scan) {
+    out.push(`${sub} Changes (${report.hunks.length})`), out.push("");
+    let shown = report.hunks.slice(0, Math.max(0, budget));
+    hidden += report.hunks.length - shown.length, budget -= shown.length, shown.length > 0 && out.push(...hunkTable(shown, !1)), out.push("");
+  }
+  scan || out.push(`${sub} Prompts`, "");
+  for (let g of scan ? [] : groups) {
     let p = g.prompt, added = 0, removed = 0;
     for (let a of g.hunks) {
       let n = hunkCounts(a.hunk);
@@ -8317,7 +8333,7 @@ function build(report, o) {
     }
     out.push("</details>"), out.push("");
   }
-  if (unattributed.length > 0) {
+  if (!scan && unattributed.length > 0) {
     out.push(`${sub} Unattributed (${unattributed.length})`), out.push(""), out.push("No agent edit explains these hunks: a human change, a tool outside the recorded sessions, or a generated file."), out.push("");
     let shown = unattributed.slice(0, Math.max(0, budget));
     hidden += unattributed.length - shown.length, budget -= shown.length, shown.length > 0 && out.push(...hunkTable(shown)), shown.length < unattributed.length && out.push(`_\u2026 ${unattributed.length - shown.length} more not shown_`), out.push("");
@@ -8326,11 +8342,11 @@ function build(report, o) {
 `) + `
 `;
 }
-function hunkTable(hunks) {
-  let rows = ["| File | Lines | +/\u2212 | Match | Labels | Intent |", "|---|---|---|---|---|---|"];
+function hunkTable(hunks, provenance = !0) {
+  let rows = provenance ? ["| File | Lines | +/\u2212 | Match | Labels | Intent |", "|---|---|---|---|---|---|"] : ["| File | Lines | +/\u2212 | Labels |", "|---|---|---|---|"];
   for (let a of hunks) {
     let { added, removed } = hunkCounts(a.hunk), counts = `+${added}${removed > 0 ? ` \u2212${removed}` : ""}`, match = a.match === "partial" ? `partial (${Math.round(a.coverage * 100)}%)` : a.match, labels = sortLabels(a.labels).map((l) => `${badge(l.severity)} ${code(l.kind)}`).join("<br>"), intent = a.intent ? `${verdictBadge(a.intent.verdict)}` : "\u2014";
-    rows.push(`| \`${code(a.hunk.file)}\` | ${lineRange(a.hunk, "\u2013")} | ${counts} | ${match} | ${labels} | ${intent} |`);
+    rows.push(provenance ? `| \`${code(a.hunk.file)}\` | ${lineRange(a.hunk, "\u2013")} | ${counts} | ${match} | ${labels} | ${intent} |` : `| \`${code(a.hunk.file)}\` | ${lineRange(a.hunk, "\u2013")} | ${counts} | ${labels || "\u2014"} |`);
   }
   return rows;
 }
@@ -8399,10 +8415,10 @@ function renderTerminal(report, opts = {}) {
     out.push(fit(trimTrailing(segs), width));
   }, blank = () => {
     out.push("");
-  }, h = headline(report), s = report.summary;
+  }, h = headline(report), s = report.summary, scan = report.mode === "risk-scan";
   {
     let left = [
-      ["why-diff", bold],
+      [scan ? "why-diff risk scan" : "why-diff", bold],
       ["  ", id],
       [report.repo.name, bold],
       ["  ", id],
@@ -8410,8 +8426,15 @@ function renderTerminal(report, opts = {}) {
     ], right = [report.repo.branch, shortDate(report.generatedAt)].filter((x) => !!x).join(" \xB7 "), leftLen = segLen(left);
     right && leftLen + 2 + vlen(right) <= width ? line(...left, [" ".repeat(width - leftLen - vlen(right)), id], [right, dim]) : line(...left);
   }
-  blank();
-  {
+  if (blank(), scan) {
+    for (let row of wrapWords(RISK_SCAN_NOTE, width - 2)) line(["  ", id], [row, c.yellow]);
+    let meta = [
+      `${plural(s.hunks, "hunk")} in ${plural(s.files, "file")}`,
+      `+${s.addedLines} \u2212${s.removedLines}`,
+      h.touchedTests ? `tests touched ${GLYPH.tests}` : "tests untouched"
+    ];
+    for (let row of wrapParts(meta.map((m) => [[m, dim]]), width - 2)) line(["  ", id], ...row);
+  } else {
     let pctStyle = h.tracedPct >= 90 ? c.green : h.tracedPct >= 60 ? c.yellow : c.red, parts = [];
     if (parts.push(h.noAddedLines ? [["no added lines", dim]] : [[`${h.tracedPct}%`, (t) => bold(pctStyle(t))], [" of added lines trace to a prompt", id]]), h.intentRan) {
       let n = h.unrequestedHunks;
@@ -8421,8 +8444,6 @@ function renderTerminal(report, opts = {}) {
     }
     parts.push(h.touchedTests ? [[`tests touched ${GLYPH.tests}`, (t) => bold(c.yellow(t))]] : [["tests untouched", dim]]), h.unattributedHunks > 0 && parts.push([[String(h.unattributedHunks), (t) => bold(c.yellow(t))], [` unattributed ${h.unattributedHunks === 1 ? "hunk" : "hunks"}`, c.yellow]]);
     for (let row of wrapParts(parts, width - 2)) line(["  ", id], ...row);
-  }
-  {
     let meta = [
       `${plural(s.hunks, "hunk")} in ${plural(s.files, "file")}`,
       `+${s.addedLines} \u2212${s.removedLines}`,
@@ -8487,33 +8508,38 @@ function renderTerminal(report, opts = {}) {
       a.intent?.reason && line(["      ", id], [`${GLYPH[verdict]} ${a.intent.reason}`, dim]);
     }
   };
-  blank(), line(["PROMPTS", bold], [` (${groups.length})`, dim]);
-  for (let g of groups) {
-    let { prompt } = g, added = 0, removed = 0;
-    for (let a of g.hunks) {
-      let n = hunkCounts(a.hunk);
-      added += n.added, removed += n.removed;
+  if (scan) {
+    blank(), line(["CHANGES", bold], [` (${allHunks.length})`, dim]);
+    for (let a of allHunks) hunkRow(a);
+  } else {
+    blank(), line(["PROMPTS", bold], [` (${groups.length})`, dim]);
+    for (let g of groups) {
+      let { prompt } = g, added = 0, removed = 0;
+      for (let a of g.hunks) {
+        let n = hunkCounts(a.hunk);
+        added += n.added, removed += n.removed;
+      }
+      let hs = harnessStyle[prompt.harness] ?? id;
+      blank(), line([GLYPH.prompt + " ", hs], ["\u201C", dim], [truncate2(prompt.text, Math.max(20, width - 6)), bold], ["\u201D", dim]);
+      let metaSegs = [
+        ["  ", id],
+        [prompt.harness, hs],
+        [" \xB7 ", dim],
+        [shortTime(prompt.at), dim],
+        [" \xB7 ", dim],
+        [`session ${shortSession(prompt.sessionId)}`, dim],
+        [" \xB7 ", dim],
+        [g.hunks.length === 0 ? "no hunks in this diff" : plural(g.hunks.length, "hunk"), g.hunks.length === 0 ? dim : id]
+      ];
+      g.hunks.length > 0 && metaSegs.push([" \xB7 ", dim], [`+${added}`, c.green], [removed > 0 ? ` \u2212${removed}` : "", c.red]), line(...metaSegs);
+      for (let a of g.hunks) hunkRow(a);
     }
-    let hs = harnessStyle[prompt.harness] ?? id;
-    blank(), line([GLYPH.prompt + " ", hs], ["\u201C", dim], [truncate2(prompt.text, Math.max(20, width - 6)), bold], ["\u201D", dim]);
-    let metaSegs = [
-      ["  ", id],
-      [prompt.harness, hs],
-      [" \xB7 ", dim],
-      [shortTime(prompt.at), dim],
-      [" \xB7 ", dim],
-      [`session ${shortSession(prompt.sessionId)}`, dim],
-      [" \xB7 ", dim],
-      [g.hunks.length === 0 ? "no hunks in this diff" : plural(g.hunks.length, "hunk"), g.hunks.length === 0 ? dim : id]
-    ];
-    g.hunks.length > 0 && metaSegs.push([" \xB7 ", dim], [`+${added}`, c.green], [removed > 0 ? ` \u2212${removed}` : "", c.red]), line(...metaSegs);
-    for (let a of g.hunks) hunkRow(a);
-  }
-  if (blank(), unattributed.length === 0)
-    line(["UNATTRIBUTED", bold], ["  none, every hunk traces to a prompt", dim]);
-  else {
-    line(["UNATTRIBUTED", bold], [` (${unattributed.length})`, dim], ["  no agent edit explains these", dim]);
-    for (let a of unattributed) hunkRow(a);
+    if (blank(), unattributed.length === 0)
+      line(["UNATTRIBUTED", bold], ["  none, every hunk traces to a prompt", dim]);
+    else {
+      line(["UNATTRIBUTED", bold], [` (${unattributed.length})`, dim], ["  no agent edit explains these", dim]);
+      for (let a of unattributed) hunkRow(a);
+    }
   }
   return blank(), line([`why-diff v${report.version} \xB7 generated ${shortDateTime(report.generatedAt)}`, dim]), out.join(`
 `) + `
@@ -8533,6 +8559,12 @@ function fit(segs, width) {
     budget -= vlen(take), take && parts.push(st ? st(take) : take);
   }
   return parts.join("") + "\u2026";
+}
+function wrapWords(text2, width) {
+  let rows = [], row = "";
+  for (let word of text2.split(" "))
+    row && vlen(row) + 1 + vlen(word) > width ? (rows.push(row), row = word) : row = row ? `${row} ${word}` : word;
+  return row && rows.push(row), rows;
 }
 function wrapParts(parts, width) {
   let rows = [], row = [], len = 0;
@@ -8684,9 +8716,59 @@ async function writeState(dir, file, state) {
   }
 }
 
+// src/pr.ts
+import { spawn } from "node:child_process";
+var SECTION_START = "<!-- why-diff:start -->", SECTION_END = "<!-- why-diff:end -->", PR_BODY_LIMIT = 65536;
+function upsertSection(body, section) {
+  let block = `${SECTION_START}
+${section.replace(/\s+$/, "")}
+${SECTION_END}`, start = body.indexOf(SECTION_START), end = start >= 0 ? body.indexOf(SECTION_END, start + SECTION_START.length) : -1;
+  return start >= 0 && end >= 0 ? body.slice(0, start) + block + body.slice(end + SECTION_END.length) : body === "" ? `${block}
+` : `${body}${body.endsWith(`
+`) ? `
+` : `
+
+`}${block}
+`;
+}
+function sectionBudget(body) {
+  return PR_BODY_LIMIT - upsertSection(body, "").length - 1;
+}
+function ghRunner(bin = process.env.WHY_DIFF_GH_BIN || "gh") {
+  return (args, input) => new Promise((resolve, reject) => {
+    let child = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] }), stdout = "", stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (c) => {
+      stdout += c;
+    }), child.stderr.setEncoding("utf8").on("data", (c) => {
+      stderr += c;
+    }), child.on("error", (err) => {
+      reject(err.code === "ENOENT" ? new Error("GitHub CLI (gh) not found on PATH: install it from https://cli.github.com and run `gh auth login`") : err);
+    }), child.on("close", (code2) => resolve({ code: code2 ?? 1, stdout, stderr })), child.stdin.on("error", () => {
+    }), child.stdin.end(input ?? "");
+  });
+}
+async function readPrBody(gh) {
+  let r = await gh(["pr", "view", "--json", "body"]);
+  if (r.code !== 0) {
+    let why = r.stderr.trim().split(`
+`)[0] || `gh exited with ${r.code}`;
+    throw new Error(`no pull request found for the current branch (${why}); open one first, why-diff pr only edits an existing PR`);
+  }
+  try {
+    let body = JSON.parse(r.stdout).body;
+    return typeof body == "string" ? body : "";
+  } catch {
+    throw new Error("could not read the pull request body from `gh pr view --json body`");
+  }
+}
+async function writePrBody(gh, body) {
+  let r = await gh(["pr", "edit", "--body-file", "-"], body);
+  if (r.code !== 0) throw new Error(`gh pr edit failed: ${r.stderr.trim() || `exit ${r.code}`}`);
+}
+
 // src/cli.ts
 var HARNESSES = ["claude-code", "codex", "opencode"], CLASSIFIERS = ["auto", "claude-cli", "anthropic", "openai"], FAIL_ON = ["risk", "unrequested", "tests", "unattributed"], VERSION = "0.1.0", program2 = new Command();
-program2.name("why-diff").version(VERSION, "-V, --version").description("Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it.").argument("[range]", "git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree").argument("[paths...]", "limit to these paths (give them after --, e.g. why-diff -- src)").option("--base <ref>", "branch or ref to compare against (default: auto-detected, incl. CI pull request targets)").option("-w, --working-tree", "only uncommitted changes vs HEAD").addOption(new Option("-f, --format <format>", "output format").choices(["terminal", "md", "html", "json"])).option("--html", "shortcut for --format html (writes .why-diff/report.html and opens it)").option("-o, --out <file>", "write output to a file instead of stdout").option("--no-open", "do not open the HTML report in a browser").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo (sibling folders, workspace roots) that edited files in it; slower").option("-v, --verbose", "show rationale, commands and label details").option("--fail-on <what>", "exit 1 if: risk | unrequested | tests | unattributed (comma list) \u2014 for CI and hooks").option("--redact-prompts", "omit prompt text and agent rationales from the output (secrets are always masked)").option("-q, --quiet", "no progress output").action(async (rangeArg, pathArgs, o) => {
+program2.name("why-diff").enablePositionalOptions().version(VERSION, "-V, --version").description("Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it.").argument("[range]", "git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree").argument("[paths...]", "limit to these paths (give them after --, e.g. why-diff -- src)").option("--base <ref>", "branch or ref to compare against (default: auto-detected, incl. CI pull request targets)").option("-w, --working-tree", "only uncommitted changes vs HEAD").addOption(new Option("-f, --format <format>", "output format").choices(["terminal", "md", "html", "json"])).option("--html", "shortcut for --format html (writes .why-diff/report.html and opens it)").option("-o, --out <file>", "write output to a file instead of stdout").option("--no-open", "do not open the HTML report in a browser").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo (sibling folders, workspace roots) that edited files in it; slower").option("-v, --verbose", "show rationale, commands and label details").option("--fail-on <what>", "exit 1 if: risk | unrequested | tests | unattributed (comma list) \u2014 for CI and hooks").option("--redact-prompts", "omit prompt text and agent rationales from the output (secrets are always masked)").option("-q, --quiet", "no progress output").action(async (rangeArg, pathArgs, o) => {
   let progress = (msg) => {
     o.quiet || process.stderr.write(import_picocolors2.default.dim(`\xB7 ${msg}
 `));
@@ -8736,10 +8818,44 @@ program2.name("why-diff").version(VERSION, "-V, --version").description("Trace e
 `) ? out : out + `
 `);
   if (failChecks.length) {
-    let s = report.summary, failed = failChecks.filter((c) => c === "risk" && report.hunks.some((h) => h.labels.some((l) => l.severity === "risk")) || c === "unrequested" && (s.intent?.unrequested ?? 0) > 0 || c === "tests" && s.touchedTests || c === "unattributed" && s.unattributedLines > 0);
+    let s = report.summary;
+    if (failChecks.includes("unrequested") && report.hunks.length > 0 && !s.intent) {
+      let why = report.mode === "risk-scan" ? "no agent transcripts, so there are no prompts to check against" : "no LLM backend available: install Claude Code, or set ANTHROPIC_API_KEY / OPENAI_API_KEY";
+      throw new Error(`--fail-on unrequested: the intent check did not run (${why})`);
+    }
+    failChecks.includes("unattributed") && report.mode === "risk-scan" && process.stderr.write(import_picocolors2.default.yellow(`why-diff: --fail-on unattributed ignored: no agent transcripts here, so nothing can be attributed
+`));
+    let failed = failChecks.filter((c) => c === "risk" && report.hunks.some((h) => h.labels.some((l) => l.severity === "risk")) || c === "unrequested" && (s.intent?.unrequested ?? 0) > 0 || c === "tests" && s.touchedTests || c === "unattributed" && report.mode !== "risk-scan" && s.unattributedLines > 0);
     failed.length && (process.stderr.write(import_picocolors2.default.red(`why-diff: failing on ${failed.join(", ")}
 `)), process.exitCode = 1);
   }
+});
+program2.command("pr").description("put the report into the current branch's pull request body (gh pr edit); never pushes or creates a PR").option("--base <ref>", "branch or ref the PR targets (default: auto-detected)").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--scan-all", "also scan transcripts started outside the repo that edited files in it; slower").option("--redact-prompts", "omit prompt text and agent rationales (secrets are always masked)").option("--dry-run", "print the new PR body instead of editing the PR").option("-q, --quiet", "no progress output").action(async (o) => {
+  let progress = (msg) => {
+    o.quiet || process.stderr.write(import_picocolors2.default.dim(`\xB7 ${msg}
+`));
+  }, classify = "none";
+  if (o.classify === !0) classify = "auto";
+  else if (o.classify) {
+    if (!CLASSIFIERS.includes(o.classify)) throw new Error(`unknown --classify backend "${String(o.classify)}" (use ${CLASSIFIERS.join(", ")})`);
+    classify = o.classify;
+  }
+  let gh = ghRunner(), body = await readPrBody(gh), built = await buildReport({
+    base: o.base,
+    scanAll: !!o.scanAll,
+    classify,
+    model: o.model,
+    onProgress: progress
+  }), report = o.redactPrompts ? redactReport(built, "prompts") : built, section = renderReport(report, "md", { maxChars: Math.max(1e3, Math.min(6e4, sectionBudget(body))) }), next = upsertSection(body, section);
+  if (o.dryRun) {
+    process.stdout.write(next);
+    return;
+  }
+  if (next === body) {
+    progress("pull request body already up to date");
+    return;
+  }
+  await writePrBody(gh, next), progress("updated the pull request body");
 });
 program2.command("guard").description("Claude Code Stop hook: block the agent from finishing if it skipped, weakened or deleted tests").option("--on <kinds>", "labels that block (comma list)", "test-skip-added,tests-disabled,assertion-removed,secret-like,ci-changed").action(async (o) => {
   let raw = await readStdin(), payload = {};
@@ -8760,7 +8876,7 @@ function readStdin() {
 }
 function openFile(file) {
   let cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open", args = process.platform === "win32" ? ["/c", "start", "", file] : [file];
-  spawn(cmd, args, { stdio: "ignore", detached: !0 }).on("error", () => {
+  spawn2(cmd, args, { stdio: "ignore", detached: !0 }).on("error", () => {
   }).unref();
 }
 program2.parseAsync().catch((err) => {

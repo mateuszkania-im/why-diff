@@ -16,6 +16,7 @@ import {
   lineRange,
   NO_SESSIONS_HINT,
   plural,
+  RISK_SCAN_NOTE,
   shortDateTime,
   shortSession,
   shortTime,
@@ -67,14 +68,25 @@ function build(report: Report, o: BuildOpts): string {
   const s = report.summary;
   const out: string[] = [];
 
-  out.push(`${H} Provenance`);
-  out.push('');
-  const headlineBits = [h.noAddedLines ? 'no added lines' : `**${h.tracedPct}%** of added lines trace to a prompt`];
-  if (h.intentRan) headlineBits.push(h.unrequestedHunks === 0 ? 'nothing unrequested' : `**${h.unrequestedHunks}** ${h.unrequestedHunks === 1 ? 'hunk' : 'hunks'} nobody asked for`);
-  headlineBits.push(h.touchedTests ? '**tests touched**' : 'tests untouched');
-  if (h.unattributedHunks > 0) headlineBits.push(`**${h.unattributedHunks}** unattributed ${h.unattributedHunks === 1 ? 'hunk' : 'hunks'}`);
-  out.push(`> ${headlineBits.join(' · ')}`);
-  out.push('');
+  const scan = report.mode === 'risk-scan';
+  if (scan) {
+    out.push(`${H} why-diff risk scan`);
+    out.push('');
+    out.push(text(RISK_SCAN_NOTE));
+    out.push('');
+    const risky = h.riskLabels + h.warnLabels;
+    out.push(`> ${risky === 0 ? 'no risks found' : `**${risky}** ${risky === 1 ? 'finding' : 'findings'}`} · ${h.touchedTests ? '**tests touched**' : 'tests untouched'}`);
+    out.push('');
+  } else {
+    out.push(`${H} Provenance`);
+    out.push('');
+    const headlineBits = [h.noAddedLines ? 'no added lines' : `**${h.tracedPct}%** of added lines trace to a prompt`];
+    if (h.intentRan) headlineBits.push(h.unrequestedHunks === 0 ? 'nothing unrequested' : `**${h.unrequestedHunks}** ${h.unrequestedHunks === 1 ? 'hunk' : 'hunks'} nobody asked for`);
+    headlineBits.push(h.touchedTests ? '**tests touched**' : 'tests untouched');
+    if (h.unattributedHunks > 0) headlineBits.push(`**${h.unattributedHunks}** unattributed ${h.unattributedHunks === 1 ? 'hunk' : 'hunks'}`);
+    out.push(`> ${headlineBits.join(' · ')}`);
+    out.push('');
+  }
 
   // ---- Risks first -------------------------------------------------------
   const risks = collectRisks(report, 'warn');
@@ -96,11 +108,15 @@ function build(report: Report, o: BuildOpts): string {
   out.push('| | |');
   out.push('|---|---|');
   out.push(`| Diff | \`${code(report.range)}\` in \`${code(report.repo.name)}\`${report.repo.branch ? ` (\`${code(report.repo.branch)}\`)` : ''} |`);
-  out.push(`| Sessions | ${text(describeSessions(report))}${s.sessions === 0 ? `; ${text(NO_SESSIONS_HINT)}` : ''} |`);
-  out.push(`| Prompts | ${s.prompts} |`);
+  if (!scan) {
+    out.push(`| Sessions | ${text(describeSessions(report))}${s.sessions === 0 ? `; ${text(NO_SESSIONS_HINT)}` : ''} |`);
+    out.push(`| Prompts | ${s.prompts} |`);
+  }
   out.push(`| Hunks | ${s.hunks} in ${plural(s.files, 'file')} (+${s.addedLines} −${s.removedLines}) |`);
-  out.push(`| Agent-traced lines | ${s.agentLines} of ${s.addedLines} added${h.noAddedLines ? '' : ` (${h.tracedPct}%)`} |`);
-  out.push(`| Unattributed lines | ${s.unattributedLines}${h.unattributedHunks > 0 ? ` in ${plural(h.unattributedHunks, 'hunk')}` : ''} |`);
+  if (!scan) {
+    out.push(`| Agent-traced lines | ${s.agentLines} of ${s.addedLines} added${h.noAddedLines ? '' : ` (${h.tracedPct}%)`} |`);
+    out.push(`| Unattributed lines | ${s.unattributedLines}${h.unattributedHunks > 0 ? ` in ${plural(h.unattributedHunks, 'hunk')}` : ''} |`);
+  }
   if (s.intent) {
     const i = s.intent;
     out.push(`| Intent | ${i.requested} requested · ${i.implied} implied · ${i.unrequested} unrequested · ${i.unclear} unclear${h.classifierModel ? ` (${code(h.classifierModel)})` : ''} |`);
@@ -113,9 +129,19 @@ function build(report: Report, o: BuildOpts): string {
   let budget = o.maxHunks;
   let hidden = 0;
 
-  out.push(`${sub} Prompts`);
-  out.push('');
-  for (const g of groups) {
+  if (scan) {
+    // No prompts to group by: one table of every hunk with its labels.
+    out.push(`${sub} Changes (${report.hunks.length})`);
+    out.push('');
+    const shown = report.hunks.slice(0, Math.max(0, budget));
+    hidden += report.hunks.length - shown.length;
+    budget -= shown.length;
+    if (shown.length > 0) out.push(...hunkTable(shown, false));
+    out.push('');
+  }
+
+  if (!scan) out.push(`${sub} Prompts`, '');
+  for (const g of scan ? [] : groups) {
     const p = g.prompt;
     let added = 0;
     let removed = 0;
@@ -152,7 +178,7 @@ function build(report: Report, o: BuildOpts): string {
   }
 
   // ---- Unattributed ------------------------------------------------------
-  if (unattributed.length > 0) {
+  if (!scan && unattributed.length > 0) {
     out.push(`${sub} Unattributed (${unattributed.length})`);
     out.push('');
     out.push('No agent edit explains these hunks: a human change, a tool outside the recorded sessions, or a generated file.');
@@ -174,8 +200,10 @@ function build(report: Report, o: BuildOpts): string {
   return out.join('\n') + '\n';
 }
 
-function hunkTable(hunks: AttributedHunk[]): string[] {
-  const rows = ['| File | Lines | +/− | Match | Labels | Intent |', '|---|---|---|---|---|---|'];
+function hunkTable(hunks: AttributedHunk[], provenance = true): string[] {
+  const rows = provenance
+    ? ['| File | Lines | +/− | Match | Labels | Intent |', '|---|---|---|---|---|---|']
+    : ['| File | Lines | +/− | Labels |', '|---|---|---|---|'];
   for (const a of hunks) {
     const { added, removed } = hunkCounts(a.hunk);
     const counts = `+${added}${removed > 0 ? ` −${removed}` : ''}`;
@@ -184,7 +212,9 @@ function hunkTable(hunks: AttributedHunk[]): string[] {
       .map((l) => `${badge(l.severity)} ${code(l.kind)}`)
       .join('<br>');
     const intent = a.intent ? `${verdictBadge(a.intent.verdict)}` : '—';
-    rows.push(`| \`${code(a.hunk.file)}\` | ${lineRange(a.hunk, '–')} | ${counts} | ${match} | ${labels} | ${intent} |`);
+    rows.push(provenance
+      ? `| \`${code(a.hunk.file)}\` | ${lineRange(a.hunk, '–')} | ${counts} | ${match} | ${labels} | ${intent} |`
+      : `| \`${code(a.hunk.file)}\` | ${lineRange(a.hunk, '–')} | ${counts} | ${labels || '—'} |`);
   }
   return rows;
 }

@@ -15,6 +15,7 @@ import {
   lineRange,
   NO_SESSIONS_HINT,
   plural,
+  RISK_SCAN_NOTE,
   riskRef,
   shortDate,
   shortDateTime,
@@ -99,11 +100,12 @@ export function renderTerminal(report: Report, opts: TerminalOptions = {}): stri
 
   const h = headline(report);
   const s = report.summary;
+  const scan = report.mode === 'risk-scan';
 
   // ---- Title -------------------------------------------------------------
   {
     const left: Seg[] = [
-      ['why-diff', bold],
+      [scan ? 'why-diff risk scan' : 'why-diff', bold],
       ['  ', id],
       [report.repo.name, bold],
       ['  ', id],
@@ -121,7 +123,15 @@ export function renderTerminal(report: Report, opts: TerminalOptions = {}): stri
   blank();
 
   // ---- Headline ----------------------------------------------------------
-  {
+  if (scan) {
+    for (const row of wrapWords(RISK_SCAN_NOTE, width - 2)) line(['  ', id], [row, c.yellow]);
+    const meta: string[] = [
+      `${plural(s.hunks, 'hunk')} in ${plural(s.files, 'file')}`,
+      `+${s.addedLines} −${s.removedLines}`,
+      h.touchedTests ? `tests touched ${GLYPH.tests}` : 'tests untouched',
+    ];
+    for (const row of wrapParts(meta.map((m): Seg[] => [[m, dim]]), width - 2)) line(['  ', id], ...row);
+  } else {
     const pctStyle: Style = h.tracedPct >= 90 ? c.green : h.tracedPct >= 60 ? c.yellow : c.red;
     const parts: Seg[][] = [];
     parts.push(h.noAddedLines
@@ -140,8 +150,7 @@ export function renderTerminal(report: Report, opts: TerminalOptions = {}): stri
       parts.push([[String(h.unattributedHunks), (t) => bold(c.yellow(t))], [` unattributed ${h.unattributedHunks === 1 ? 'hunk' : 'hunks'}`, c.yellow]]);
     }
     for (const row of wrapParts(parts, width - 2)) line(['  ', id], ...row);
-  }
-  {
+
     const meta: string[] = [
       `${plural(s.hunks, 'hunk')} in ${plural(s.files, 'file')}`,
       `+${s.addedLines} −${s.removedLines}`,
@@ -235,42 +244,48 @@ export function renderTerminal(report: Report, opts: TerminalOptions = {}): stri
     }
   };
 
-  blank();
-  line(['PROMPTS', bold], [` (${groups.length})`, dim]);
-  for (const g of groups) {
-    const { prompt } = g;
-    let added = 0;
-    let removed = 0;
-    for (const a of g.hunks) {
-      const n = hunkCounts(a.hunk);
-      added += n.added;
-      removed += n.removed;
-    }
-    const hs = harnessStyle[prompt.harness] ?? id;
+  if (scan) {
     blank();
-    line([GLYPH.prompt + ' ', hs], ['“', dim], [truncate(prompt.text, Math.max(20, width - 6)), bold], ['”', dim]);
-    const metaSegs: Seg[] = [
-      ['  ', id],
-      [prompt.harness, hs],
-      [' · ', dim],
-      [shortTime(prompt.at), dim],
-      [' · ', dim],
-      [`session ${shortSession(prompt.sessionId)}`, dim],
-      [' · ', dim],
-      [g.hunks.length === 0 ? 'no hunks in this diff' : plural(g.hunks.length, 'hunk'), g.hunks.length === 0 ? dim : id],
-    ];
-    if (g.hunks.length > 0) metaSegs.push([' · ', dim], [`+${added}`, c.green], [removed > 0 ? ` −${removed}` : '', c.red]);
-    line(...metaSegs);
-    for (const a of g.hunks) hunkRow(a);
-  }
-
-  // ---- Unattributed ------------------------------------------------------
-  blank();
-  if (unattributed.length === 0) {
-    line(['UNATTRIBUTED', bold], ['  none, every hunk traces to a prompt', dim]);
+    line(['CHANGES', bold], [` (${allHunks.length})`, dim]);
+    for (const a of allHunks) hunkRow(a);
   } else {
-    line(['UNATTRIBUTED', bold], [` (${unattributed.length})`, dim], ['  no agent edit explains these', dim]);
-    for (const a of unattributed) hunkRow(a);
+    blank();
+    line(['PROMPTS', bold], [` (${groups.length})`, dim]);
+    for (const g of groups) {
+      const { prompt } = g;
+      let added = 0;
+      let removed = 0;
+      for (const a of g.hunks) {
+        const n = hunkCounts(a.hunk);
+        added += n.added;
+        removed += n.removed;
+      }
+      const hs = harnessStyle[prompt.harness] ?? id;
+      blank();
+      line([GLYPH.prompt + ' ', hs], ['“', dim], [truncate(prompt.text, Math.max(20, width - 6)), bold], ['”', dim]);
+      const metaSegs: Seg[] = [
+        ['  ', id],
+        [prompt.harness, hs],
+        [' · ', dim],
+        [shortTime(prompt.at), dim],
+        [' · ', dim],
+        [`session ${shortSession(prompt.sessionId)}`, dim],
+        [' · ', dim],
+        [g.hunks.length === 0 ? 'no hunks in this diff' : plural(g.hunks.length, 'hunk'), g.hunks.length === 0 ? dim : id],
+      ];
+      if (g.hunks.length > 0) metaSegs.push([' · ', dim], [`+${added}`, c.green], [removed > 0 ? ` −${removed}` : '', c.red]);
+      line(...metaSegs);
+      for (const a of g.hunks) hunkRow(a);
+    }
+
+    // ---- Unattributed ------------------------------------------------------
+    blank();
+    if (unattributed.length === 0) {
+      line(['UNATTRIBUTED', bold], ['  none, every hunk traces to a prompt', dim]);
+    } else {
+      line(['UNATTRIBUTED', bold], [` (${unattributed.length})`, dim], ['  no agent edit explains these', dim]);
+      for (const a of unattributed) hunkRow(a);
+    }
   }
 
   // ---- Footer ------------------------------------------------------------
@@ -302,6 +317,22 @@ function fit(segs: readonly Seg[], width: number): string {
     if (take) parts.push(st ? st(take) : take);
   }
   return parts.join('') + '…';
+}
+
+/** Break plain text into rows of at most `width` columns at spaces. */
+function wrapWords(text: string, width: number): string[] {
+  const rows: string[] = [];
+  let row = '';
+  for (const word of text.split(' ')) {
+    if (row && vlen(row) + 1 + vlen(word) > width) {
+      rows.push(row);
+      row = word;
+    } else {
+      row = row ? `${row} ${word}` : word;
+    }
+  }
+  if (row) rows.push(row);
+  return rows;
 }
 
 /** Lay out segment groups separated by " · ", wrapping to new rows when they would overflow. */

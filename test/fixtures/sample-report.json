@@ -8,6 +8,7 @@
     "branch": "feat/dark-mode"
   },
   "range": "main...HEAD",
+  "mode": "provenance",
   "sessions": [
     {
       "id": "a3f9c2d1-7b4e-4c8a-9e21-5d6f8a0b1c2e",

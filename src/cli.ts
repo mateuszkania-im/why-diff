@@ -17,6 +17,7 @@ import { renderReport, isReportFormat, type ReportFormat } from './report/index.
 import type { Harness, LabelKind } from './types.js';
 import { runGuard, type GuardPayload } from './guard.js';
 import type { ClassifierKind } from './classify/index.js';
+import { ghRunner, readPrBody, sectionBudget, upsertSection, writePrBody } from './pr.js';
 
 const HARNESSES: Harness[] = ['claude-code', 'codex', 'opencode'];
 const CLASSIFIERS: ClassifierKind[] = ['auto', 'claude-cli', 'anthropic', 'openai'];
@@ -30,6 +31,8 @@ const program = new Command();
 
 program
   .name('why-diff')
+  // Options after a subcommand name belong to that subcommand (`why-diff pr -q`).
+  .enablePositionalOptions()
   .version(VERSION, '-V, --version')
   .description('Trace every hunk of an AI agent\'s diff back to the prompt and tool call that wrote it.')
   .argument('[range]', 'git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree')
@@ -120,16 +123,72 @@ program
 
     if (failChecks.length) {
       const s = report.summary;
+      if (failChecks.includes('unrequested') && report.hunks.length > 0 && !s.intent) {
+        const why = report.mode === 'risk-scan'
+          ? 'no agent transcripts, so there are no prompts to check against'
+          : 'no LLM backend available: install Claude Code, or set ANTHROPIC_API_KEY / OPENAI_API_KEY';
+        throw new Error(`--fail-on unrequested: the intent check did not run (${why})`);
+      }
+      if (failChecks.includes('unattributed') && report.mode === 'risk-scan') {
+        process.stderr.write(pc.yellow('why-diff: --fail-on unattributed ignored: no agent transcripts here, so nothing can be attributed\n'));
+      }
       const failed = failChecks.filter((c) =>
         (c === 'risk' && report.hunks.some((h) => h.labels.some((l) => l.severity === 'risk'))) ||
         (c === 'unrequested' && (s.intent?.unrequested ?? 0) > 0) ||
         (c === 'tests' && s.touchedTests) ||
-        (c === 'unattributed' && s.unattributedLines > 0));
+        (c === 'unattributed' && report.mode !== 'risk-scan' && s.unattributedLines > 0));
       if (failed.length) {
         process.stderr.write(pc.red(`why-diff: failing on ${failed.join(', ')}\n`));
         process.exitCode = 1;
       }
     }
+  });
+
+/**
+ * `why-diff pr`: write the report into the body of the current branch's open
+ * pull request (between why-diff markers), so reviewers without the
+ * transcripts see the provenance. Never pushes, never creates a PR.
+ */
+program
+  .command('pr')
+  .description('put the report into the current branch\'s pull request body (gh pr edit); never pushes or creates a PR')
+  .option('--base <ref>', 'branch or ref the PR targets (default: auto-detected)')
+  .option('-c, --classify [backend]', 'LLM intent check: auto | claude-cli | anthropic | openai', false)
+  .option('-m, --model <model>', 'model for the intent check (default: haiku)')
+  .option('--scan-all', 'also scan transcripts started outside the repo that edited files in it; slower')
+  .option('--redact-prompts', 'omit prompt text and agent rationales (secrets are always masked)')
+  .option('--dry-run', 'print the new PR body instead of editing the PR')
+  .option('-q, --quiet', 'no progress output')
+  .action(async (o: Record<string, unknown>) => {
+    const progress = (msg: string) => { if (!o.quiet) process.stderr.write(pc.dim(`· ${msg}\n`)); };
+    let classify: ClassifierKind = 'none';
+    if (o.classify === true) classify = 'auto';
+    else if (o.classify) {
+      if (!CLASSIFIERS.includes(o.classify as ClassifierKind)) throw new Error(`unknown --classify backend "${String(o.classify)}" (use ${CLASSIFIERS.join(', ')})`);
+      classify = o.classify as ClassifierKind;
+    }
+    const gh = ghRunner();
+    const body = await readPrBody(gh);
+    const built = await buildReport({
+      base: o.base as string | undefined,
+      scanAll: Boolean(o.scanAll),
+      classify,
+      model: o.model as string | undefined,
+      onProgress: progress,
+    });
+    const report = o.redactPrompts ? redactReport(built, 'prompts') : built;
+    const section = renderReport(report, 'md', { maxChars: Math.max(1000, Math.min(60_000, sectionBudget(body))) });
+    const next = upsertSection(body, section);
+    if (o.dryRun) {
+      process.stdout.write(next);
+      return;
+    }
+    if (next === body) {
+      progress('pull request body already up to date');
+      return;
+    }
+    await writePrBody(gh, next);
+    progress('updated the pull request body');
   });
 
 /**

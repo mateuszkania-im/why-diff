@@ -466,3 +466,53 @@ describe('zero-line hunks (pure rename of a test file)', () => {
     expect(renderHtml(r)).toContain('tests-disabled');
   });
 });
+
+describe('risk-scan mode (no agent transcripts)', () => {
+  function riskScan(): Report {
+    const r = clone(sample);
+    r.mode = 'risk-scan';
+    r.sessions = [];
+    r.prompts = [];
+    r.edits = {};
+    for (const h of r.hunks) {
+      h.prompt = undefined;
+      h.match = 'none';
+      h.coverage = 0;
+      h.editIds = [];
+      h.edits = [];
+      h.labels = h.labels.filter((l) => l.kind !== 'unattributed');
+      delete h.intent;
+    }
+    r.summary = { ...r.summary, sessions: 0, sessionsFound: 0, prompts: 0, agentLines: 0, unattributedLines: r.summary.addedLines };
+    delete r.summary.intent;
+    delete r.summary.labels.unattributed;
+    return r;
+  }
+  const NOTE = 'No agent transcripts here, so lines are not traced to prompts. The PR author can add provenance with `why-diff pr`.';
+
+  it('markdown starts with the risk-scan heading and the note, without provenance sections', () => {
+    const md = renderMarkdown(riskScan());
+    expect(md.startsWith('## why-diff risk scan\n')).toBe(true);
+    expect(md).toContain(NOTE);
+    expect(md).not.toContain('## Provenance');
+    expect(md).not.toContain('### Prompts');
+    expect(md).not.toContain('### Unattributed');
+    expect(md).not.toContain('trace to a prompt');
+    expect(md).toContain('### Risks');
+    expect(md).toContain('formatDate');
+  });
+
+  it('terminal shows the risk-scan heading and note instead of prompts', () => {
+    const term = renderTerminal(riskScan(), { color: false, width: 160 });
+    expect(term).toContain('why-diff risk scan');
+    expect(term).toContain(NOTE);
+    expect(term).not.toContain('PROMPTS');
+    expect(term).not.toContain('UNATTRIBUTED');
+    expect(term).not.toContain('trace to a prompt');
+    expect(term).toContain('RISKS');
+  });
+
+  it('provenance reports keep the usual heading', () => {
+    expect(renderMarkdown(sample).startsWith('## Provenance\n')).toBe(true);
+  });
+});
