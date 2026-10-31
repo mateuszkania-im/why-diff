@@ -2634,7 +2634,7 @@ import { readFile as readFile5 } from "node:fs/promises";
 
 // src/git.ts
 import { execFile } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import path2 from "node:path";
 import { promisify } from "node:util";
 var execFileAsync = promisify(execFile), GitError = class extends Error {
@@ -2665,6 +2665,20 @@ async function git(cwd, args, opts = {}) {
 }
 async function repoRoot(cwd) {
   return git(cwd, ["rev-parse", "--show-toplevel"]);
+}
+async function worktreeRoots(cwd) {
+  try {
+    let self = await realpath(await repoRoot(cwd)), out = await git(cwd, ["worktree", "list", "--porcelain"]), roots = [];
+    for (let line of out.split(`
+`)) {
+      if (!line.startsWith("worktree ")) continue;
+      let p = line.slice(9), real = await realpath(p).catch(() => path2.resolve(p));
+      real !== self && !roots.includes(real) && roots.push(real);
+    }
+    return roots;
+  } catch {
+    return [];
+  }
 }
 async function currentBranch(cwd) {
   try {
@@ -3046,14 +3060,14 @@ function attribute(hunks, sessions, repoRoot2, opts = {}) {
   let diffFiles = /* @__PURE__ */ new Set();
   for (let h of hunks)
     diffFiles.add(h.file), h.oldFile && diffFiles.add(h.oldFile);
-  let index = indexEdits(sessions, repoRoot2, diffFiles);
+  let index = indexEdits(sessions, repoRoot2, diffFiles, opts.extraRoots);
   return index.sinceMs = opts.since?.getTime(), hunks.flatMap((hunk) => attributeHunk(hunk, index, prompts));
 }
-function indexEdits(sessions, repoRoot2, diffFiles = /* @__PURE__ */ new Set()) {
-  let roots = rootVariants(repoRoot2), byFile = /* @__PURE__ */ new Map(), bash = [], shell = /* @__PURE__ */ new Map(), seq = 0, resolved = sessions.map((session) => {
+function indexEdits(sessions, repoRoot2, diffFiles = /* @__PURE__ */ new Set(), extraRoots = []) {
+  let roots = [repoRoot2, ...extraRoots].flatMap(rootVariants), byFile = /* @__PURE__ */ new Map(), bash = [], shell = /* @__PURE__ */ new Map(), seq = 0, resolved = sessions.map((session) => {
     let cwdVariants = rootVariants(session.cwd);
     return session.edits.map((edit) => edit.failed ? null : repoRelativePath(edit.filePath, roots, session.cwd, cwdVariants));
-  }), worktrees = worktreeRoots(sessions, resolved, diffFiles);
+  }), worktrees = worktreeRoots2(sessions, resolved, diffFiles);
   for (let [si, session] of sessions.entries())
     for (let [ei, edit] of session.edits.entries()) {
       if (edit.failed) continue;
@@ -3103,7 +3117,7 @@ var NESTED_WORKTREE = /(?:^|\/)\.?(?:claude\/)?worktrees\/[^/]+\//;
 function absoluteEditPath(edit, cwd) {
   return path3.isAbsolute(edit.filePath) ? path3.normalize(edit.filePath) : cwd ? path3.resolve(cwd, edit.filePath) : null;
 }
-function worktreeRoots(sessions, resolved, diffFiles) {
+function worktreeRoots2(sessions, resolved, diffFiles) {
   let byBase = /* @__PURE__ */ new Map();
   for (let f of diffFiles) {
     if (!f.includes("/")) continue;
@@ -4350,7 +4364,7 @@ function compactHunks(hunks) {
 
 // src/adapters/claude.ts
 import { createReadStream as createReadStream2 } from "node:fs";
-import { readdir, readFile as readFile2, realpath, stat as stat2 } from "node:fs/promises";
+import { readdir, readFile as readFile2, realpath as realpath2, stat as stat2 } from "node:fs/promises";
 import os2 from "node:os";
 import path5 from "node:path";
 import readline from "node:readline";
@@ -4866,7 +4880,7 @@ var ClaudeCodeAdapter = class {
     } catch {
       return [];
     }
-    let roots = await rootVariants2(repoRoot2), prefixes = roots.map(encodeProjectDir), needles = filePathNeedles(roots, path5.sep), found = [];
+    let roots = (await Promise.all([repoRoot2, ...opts.extraRoots ?? []].map(rootVariants2))).flat(), prefixes = roots.map(encodeProjectDir), needles = filePathNeedles(roots, path5.sep), found = [];
     for (let d of dirents) {
       if (!d.isDirectory()) continue;
       let inRepo = prefixes.some((p) => d.name === p || d.name.startsWith(`${p}-`)), parent = !inRepo && prefixes.some((p) => p.startsWith(`${d.name}-`)), elsewhere = !inRepo && !parent;
@@ -5275,7 +5289,7 @@ async function readMeta(file) {
 async function rootVariants2(root) {
   let normalised = path5.resolve(root), variants = /* @__PURE__ */ new Set([normalised]);
   try {
-    variants.add(await realpath(normalised));
+    variants.add(await realpath2(normalised));
   } catch {
   }
   return [...variants];
@@ -5283,7 +5297,7 @@ async function rootVariants2(root) {
 async function isInside(roots, cwd) {
   let candidates = /* @__PURE__ */ new Set([path5.resolve(cwd)]);
   try {
-    candidates.add(await realpath(cwd));
+    candidates.add(await realpath2(cwd));
   } catch {
   }
   for (let root of roots)
@@ -5294,7 +5308,7 @@ async function isInside(roots, cwd) {
 async function isAncestor(cwd, roots) {
   let candidates = /* @__PURE__ */ new Set([path5.resolve(cwd)]);
   try {
-    candidates.add(await realpath(cwd));
+    candidates.add(await realpath2(cwd));
   } catch {
   }
   for (let c of candidates) {
@@ -5318,7 +5332,7 @@ function str(v) {
 
 // src/adapters/codex.ts
 import { createReadStream as createReadStream3 } from "node:fs";
-import { readdir as readdir2, realpath as realpath2, stat as stat3 } from "node:fs/promises";
+import { readdir as readdir2, realpath as realpath3, stat as stat3 } from "node:fs/promises";
 import os3 from "node:os";
 import path7 from "node:path";
 import { createInterface } from "node:readline";
@@ -5732,7 +5746,7 @@ async function readCodexMeta(file) {
 }
 async function realpathSafe(p) {
   try {
-    return await realpath2(p);
+    return await realpath3(p);
   } catch {
     return path7.resolve(p);
   }
@@ -5750,7 +5764,7 @@ async function listDir(dir) {
 }
 var DAY_MS = 864e5;
 async function discover(repoRoot2, opts = {}) {
-  let root = path7.join(codexHome(opts.home), "sessions"), repo = await realpathSafe(repoRoot2), needles = [.../* @__PURE__ */ new Set([repo, path7.resolve(repoRoot2)])].map((r) => `${r}/`), found = [];
+  let root = path7.join(codexHome(opts.home), "sessions"), repos = [await realpathSafe(repoRoot2), ...await Promise.all((opts.extraRoots ?? []).map(realpathSafe))], needles = [.../* @__PURE__ */ new Set([...repos, path7.resolve(repoRoot2), ...(opts.extraRoots ?? []).map((r) => path7.resolve(r))])].map((r) => `${r}/`), found = [];
   for (let y of (await listDir(root)).filter((d) => /^\d{4}$/.test(d)))
     for (let m of (await listDir(path7.join(root, y))).filter((d) => /^\d{2}$/.test(d)))
       for (let d of (await listDir(path7.join(root, y, m))).filter((x) => /^\d{2}$/.test(x))) {
@@ -5762,7 +5776,9 @@ async function discover(repoRoot2, opts = {}) {
           let file = path7.join(dayDir, name), st = await stat3(file).catch(() => null);
           if (!st || opts.since && st.mtime < opts.since) continue;
           let meta = await readCodexMeta(file);
-          meta && (opts.until && meta.timestamp && new Date(meta.timestamp) > opts.until || !isInside2(repo, await realpathSafe(meta.cwd)) && !(opts.scanAll && await fileMentions(file, needles)) || found.push(file));
+          if (!meta || opts.until && meta.timestamp && new Date(meta.timestamp) > opts.until) continue;
+          let cwdReal = await realpathSafe(meta.cwd);
+          !repos.some((r) => isInside2(r, cwdReal)) && !(opts.scanAll && await fileMentions(file, needles)) || found.push(file);
         }
       }
   return found;
@@ -6088,7 +6104,7 @@ var codexAdapter = {
 
 // src/adapters/opencode.ts
 import { existsSync } from "node:fs";
-import { readdir as readdir3, readFile as readFile3, realpath as realpath3 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile3, realpath as realpath4 } from "node:fs/promises";
 import os4 from "node:os";
 import path8 from "node:path";
 function opencodeDataDir(home) {
@@ -6241,7 +6257,7 @@ async function loadDbSession(dbPath, sessionId) {
 }
 async function realpathSafe2(p) {
   try {
-    return await realpath3(p);
+    return await realpath4(p);
   } catch {
     return path8.resolve(p);
   }
@@ -6251,7 +6267,11 @@ function isInside3(root, child) {
   return rel === "" || !rel.startsWith("..") && !path8.isAbsolute(rel);
 }
 async function discover2(repoRoot2, opts = {}) {
-  let dataDir = opencodeDataDir(opts.home), repo = await realpathSafe2(repoRoot2), keep = async (h) => opts.since && h.updated < opts.since.getTime() || opts.until && h.created > opts.until.getTime() ? !1 : isInside3(repo, await realpathSafe2(h.directory)), found = [], seen = /* @__PURE__ */ new Set(), dbPath = path8.join(dataDir, "opencode.db");
+  let dataDir = opencodeDataDir(opts.home), repos = await Promise.all([repoRoot2, ...opts.extraRoots ?? []].map(realpathSafe2)), keep = async (h) => {
+    if (opts.since && h.updated < opts.since.getTime() || opts.until && h.created > opts.until.getTime()) return !1;
+    let dir = await realpathSafe2(h.directory);
+    return repos.some((r) => isInside3(r, dir));
+  }, found = [], seen = /* @__PURE__ */ new Set(), dbPath = path8.join(dataDir, "opencode.db");
   for (let h of await dbSessionHeaders(dbPath))
     seen.add(h.id), await keep(h) && found.push(`${dbPath}#${h.id}`);
   for (let file of await jsonSessionFiles(path8.join(dataDir, "storage"))) {
@@ -6908,7 +6928,7 @@ async function buildReport(opts = {}) {
   }
   log(`diffing ${rangeLabel}`);
   let hunks = parseUnifiedDiff(await getDiff(root, target)), window = await commitTimes(root, target).catch(() => {
-  }), since = opts.since ?? (window ? new Date(new Date(window.since).getTime() - 6 * 36e5) : void 0), sessions = [];
+  }), since = opts.since ?? (window ? new Date(new Date(window.since).getTime() - 6 * 36e5) : void 0), sessions = [], extraRoots = await worktreeRoots(root);
   if (opts.sessionFiles?.length)
     for (let file of opts.sessionFiles) {
       let adapter = guessAdapter(file);
@@ -6919,7 +6939,7 @@ async function buildReport(opts = {}) {
     for (let h of harnesses) {
       let adapter = ADAPTERS[h], paths = [];
       try {
-        paths = await adapter.discover(root, { since, home: opts.home, scanAll: opts.scanAll });
+        paths = await adapter.discover(root, { since, home: opts.home, scanAll: opts.scanAll, extraRoots });
       } catch {
       }
       for (let p of paths)
@@ -6933,7 +6953,7 @@ async function buildReport(opts = {}) {
     sessions.length === 0 && hunks.length > 0 && !opts.scanAll && log("no agent sessions found for this repo in the time window; if the agent ran from another folder, try --scan-all (or --since / --session)");
   }
   log(`found ${sessions.length} agent session(s), ${hunks.length} hunk(s)`);
-  let prompts = sessions.flatMap((s) => s.prompts), attributed = attribute(hunks, sessions, root, { since });
+  let prompts = sessions.flatMap((s) => s.prompts), attributed = attribute(hunks, sessions, root, { since, extraRoots });
   attributed = labelHunks(attributed, { prompts, repoRoot: root });
   let kind = opts.classify ?? "none";
   if (kind !== "none" && attributed.length) {

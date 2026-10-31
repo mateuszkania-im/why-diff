@@ -4,7 +4,7 @@
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import type { Harness, Report, Session, SessionAdapter } from './types.js';
-import { getDiff, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, SHALLOW_HINT, type DiffTarget } from './git.js';
+import { getDiff, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
 import { attribute } from './attribute.js';
 import { labelHunks } from './labels.js';
@@ -96,6 +96,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   const since = opts.since ?? (window ? new Date(new Date(window.since).getTime() - 6 * 3600_000) : undefined);
 
   const sessions: Session[] = [];
+  const extraRoots = await worktreeRoots(root);
   if (opts.sessionFiles?.length) {
     for (const file of opts.sessionFiles) {
       const adapter = guessAdapter(file);
@@ -107,7 +108,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
       const adapter = ADAPTERS[h];
       let paths: string[] = [];
       try {
-        paths = await adapter.discover(root, { since, home: opts.home, scanAll: opts.scanAll });
+        paths = await adapter.discover(root, { since, home: opts.home, scanAll: opts.scanAll, extraRoots });
       } catch { /* harness not installed */ }
       for (const p of paths) {
         try {
@@ -125,7 +126,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   log(`found ${sessions.length} agent session(s), ${hunks.length} hunk(s)`);
 
   const prompts = sessions.flatMap((s) => s.prompts);
-  let attributed = attribute(hunks, sessions, root, { since });
+  let attributed = attribute(hunks, sessions, root, { since, extraRoots });
   attributed = labelHunks(attributed, { prompts, repoRoot: root });
 
   const kind = opts.classify ?? 'none';

@@ -318,11 +318,12 @@ async function discover(
   opts: DiscoverOptions = {},
 ): Promise<string[]> {
   const dataDir = opencodeDataDir(opts.home);
-  const repo = await realpathSafe(repoRoot);
+  const repos = await Promise.all([repoRoot, ...(opts.extraRoots ?? [])].map(realpathSafe));
   const keep = async (h: Omit<RawSession, 'messages'>): Promise<boolean> => {
     if (opts.since && h.updated < opts.since.getTime()) return false;
     if (opts.until && h.created > opts.until.getTime()) return false;
-    return isInside(repo, await realpathSafe(h.directory));
+    const dir = await realpathSafe(h.directory);
+    return repos.some((r) => isInside(r, dir));
   };
 
   const found: string[] = [];

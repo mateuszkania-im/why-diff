@@ -7,7 +7,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
@@ -98,6 +98,27 @@ export async function git(cwd: string, args: string[], opts: { trim?: boolean } 
 /** Absolute path of the repository top level containing `cwd`. */
 export async function repoRoot(cwd: string): Promise<string> {
   return git(cwd, ['rev-parse', '--show-toplevel']);
+}
+
+/**
+ * Absolute real paths of every git worktree of the repository containing `cwd`,
+ * except the one `cwd` belongs to. Empty when git cannot list them.
+ */
+export async function worktreeRoots(cwd: string): Promise<string[]> {
+  try {
+    const self = await realpath(await repoRoot(cwd));
+    const out = await git(cwd, ['worktree', 'list', '--porcelain']);
+    const roots: string[] = [];
+    for (const line of out.split('\n')) {
+      if (!line.startsWith('worktree ')) continue;
+      const p = line.slice('worktree '.length);
+      const real = await realpath(p).catch(() => path.resolve(p));
+      if (real !== self && !roots.includes(real)) roots.push(real);
+    }
+    return roots;
+  } catch {
+    return [];
+  }
 }
 
 /** Current branch name, or `undefined` on a detached HEAD / unborn branch. */

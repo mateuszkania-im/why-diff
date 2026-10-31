@@ -150,7 +150,7 @@ const HUNK_HEADER = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(.*)$/;
  *                  still match by content (branches merged later), but are not
  *                  used for the weak file-only fallback.
  */
-export function attribute(hunks: Hunk[], sessions: Session[], repoRoot: string, opts: { since?: Date } = {}): AttributedHunk[] {
+export function attribute(hunks: Hunk[], sessions: Session[], repoRoot: string, opts: { since?: Date; extraRoots?: string[] } = {}): AttributedHunk[] {
   const prompts = new Map<string, Prompt>();
   for (const s of sessions) for (const p of s.prompts) prompts.set(p.id, p);
 
@@ -159,7 +159,7 @@ export function attribute(hunks: Hunk[], sessions: Session[], repoRoot: string, 
     diffFiles.add(h.file);
     if (h.oldFile) diffFiles.add(h.oldFile);
   }
-  const index = indexEdits(sessions, repoRoot, diffFiles);
+  const index = indexEdits(sessions, repoRoot, diffFiles, opts.extraRoots);
   index.sinceMs = opts.since?.getTime();
   return hunks.flatMap((hunk) => attributeHunk(hunk, index, prompts));
 }
@@ -200,8 +200,8 @@ interface ShellIndex {
   globs: string[];
 }
 
-function indexEdits(sessions: Session[], repoRoot: string, diffFiles: Set<string> = new Set()): EditIndex {
-  const roots = rootVariants(repoRoot);
+function indexEdits(sessions: Session[], repoRoot: string, diffFiles: Set<string> = new Set(), extraRoots: string[] = []): EditIndex {
+  const roots = [repoRoot, ...extraRoots].flatMap(rootVariants);
   const byFile = new Map<string, IndexedEdit[]>();
   const bash: IndexedEdit[] = [];
   const shell = new Map<string, ShellCommand>();

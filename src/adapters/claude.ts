@@ -193,7 +193,7 @@ export class ClaudeCodeAdapter implements SessionAdapter {
     } catch {
       return [];
     }
-    const roots = await rootVariants(repoRoot);
+    const roots = (await Promise.all([repoRoot, ...(opts.extraRoots ?? [])].map(rootVariants))).flat();
     const prefixes = roots.map(encodeProjectDir);
     const needles = filePathNeedles(roots, path.sep);
     const found: Array<{ path: string; startedAt: number }> = [];

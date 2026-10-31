@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -5,8 +6,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { parseUnifiedDiff } from '../src/diff-parse.js';
 import { buildReport } from '../src/pipeline.js';
-import { GitError, commitTimes, currentBranch, getDiff, hasHead, isShallow, listUntracked, repoName, repoRoot, resolveDefaultTarget } from '../src/git.js';
-import { tempDir } from './helpers/claude-fixture.js';
+import { GitError, commitTimes, currentBranch, getDiff, hasHead, isShallow, listUntracked, repoName, repoRoot, resolveDefaultTarget, worktreeRoots } from '../src/git.js';
+import { tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
 
 const ENV = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
 const dirs: string[] = [];
@@ -234,5 +235,40 @@ describe('base and window resolution', () => {
     expect(await isShallow(clone)).toBe(true);
     await expect(buildReport({ cwd: clone, range: 'origin/main...HEAD', home: parent })).rejects.toThrow('fetch-depth: 0');
     await expect(buildReport({ cwd: clone, home: parent })).rejects.toThrow('fetch-depth: 0');
+  });
+
+  it('lists other worktrees but not the current root', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'base');
+    expect(await worktreeRoots(repo)).toEqual([]);
+    const wt = `${repo}-wt`;
+    dirs.push(wt);
+    sh(repo, 'worktree', 'add', '-q', wt, '-b', 'wt');
+    const real = realpathSync(wt);
+    expect(await worktreeRoots(repo)).toEqual([real]);
+    expect(await worktreeRoots(wt)).toEqual([realpathSync(repo)]);
+  });
+
+  it('attributes a merged change to a session that ran in a sibling git worktree', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'README.md', 'hi\n', 'base');
+    const wt = `${repo}-wt`;
+    dirs.push(wt);
+    sh(repo, 'worktree', 'add', '-q', wt, '-b', 'wt');
+    const content = 'export const answer = 42;\n';
+    put(wt, 'a.js', content);
+    sh(wt, 'add', 'a.js');
+    sh(wt, 'commit', '-q', '-m', 'add a');
+    const at = new Date().toISOString();
+    const home = tempDir('why-diff-home-');
+    dirs.push(home);
+    writeSyntheticTranscript(home, realpathSync(wt), 'wt-session-0001', [
+      { prompt: 'create a.js exporting the answer', at, calls: [{ tool: 'Write', at, input: { file_path: path.join(realpathSync(wt), 'a.js'), content } }] },
+    ]);
+    sh(repo, 'merge', '-q', '--ff-only', 'wt');
+    const report = await buildReport({ cwd: repo, range: 'HEAD~1...HEAD', home, harnesses: ['claude-code'], classify: 'none' });
+    expect(report.hunks).toHaveLength(1);
+    expect(report.hunks[0]?.match).toBe('exact');
+    expect(report.hunks[0]?.prompt?.text).toContain('create a.js');
   });
 });

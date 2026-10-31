@@ -236,6 +236,8 @@ export interface DiscoverOptions {
    * scan of every transcript modified in the window.
    */
   scanAll?: boolean;
+  /** Other checkouts of the same repo (git worktrees); sessions started there count like ones in the repo root. */
+  extraRoots?: string[];
 }
 
 /** Adapter contract: find & parse sessions for a repo. */

@@ -143,7 +143,8 @@ async function discover(
 ): Promise<string[]> {
   const root = path.join(codexHome(opts.home), 'sessions');
   const repo = await realpathSafe(repoRoot);
-  const needles = [...new Set([repo, path.resolve(repoRoot)])].map((r) => `${r}/`);
+  const repos = [repo, ...(await Promise.all((opts.extraRoots ?? []).map(realpathSafe)))];
+  const needles = [...new Set([...repos, path.resolve(repoRoot), ...(opts.extraRoots ?? []).map((r) => path.resolve(r))])].map((r) => `${r}/`);
   const found: string[] = [];
 
   for (const y of (await listDir(root)).filter((d) => /^\d{4}$/.test(d))) {
@@ -161,7 +162,8 @@ async function discover(
           const meta = await readCodexMeta(file);
           if (!meta) continue;
           if (opts.until && meta.timestamp && new Date(meta.timestamp) > opts.until) continue;
-          if (!isInside(repo, await realpathSafe(meta.cwd)) && !(opts.scanAll && (await fileMentions(file, needles)))) continue;
+          const cwdReal = await realpathSafe(meta.cwd);
+          if (!repos.some((r) => isInside(r, cwdReal)) && !(opts.scanAll && (await fileMentions(file, needles)))) continue;
           found.push(file);
         }
       }
