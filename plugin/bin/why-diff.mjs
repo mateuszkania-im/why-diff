@@ -4528,6 +4528,7 @@ function buildScopeIndex(hunks, ctx) {
   return {
     promptDirs,
     promptFiles,
+    promptTexts: new Map(ctx.prompts.map((p) => [p.id, p.text.toLowerCase()])),
     promptText: ctx.prompts.map((p) => p.text).join(`
 `).toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
@@ -4556,15 +4557,23 @@ function sameArea(a, b) {
 function related(a, b) {
   return a === b ? !0 : a === "." || b === "." ? !1 : a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
+function pathTokens(path12) {
+  let base = posix.basename(path12), stem = base.replace(/\.[^.]+$/, ""), segments = posix.dirname(path12).split("/").filter((s) => s.length >= 4 && s !== ".");
+  return [base, ...stem.length >= 4 ? [stem] : [], ...segments];
+}
+function anchoredBy(path12, id, scope) {
+  let text2 = scope.promptTexts.get(id) ?? "";
+  if (pathTokens(path12).some((t) => mentioned(t, text2))) return !0;
+  let dir = posix.dirname(path12);
+  for (let d of scope.promptDirs.get(id) ?? []) if (d !== "." && sameArea(d, dir)) return !0;
+  return !1;
+}
 function outOfScopeReason(path12, scope, ids) {
   if (!scope.promptText || isLockfile(path12) || isSnapshotFile(path12)) return null;
-  let base = posix.basename(path12), stem = base.replace(/\.[^.]+$/, ""), dir = posix.dirname(path12), segments = dir.split("/").filter((s) => s.length >= 4 && s !== ".");
-  if ([base, ...stem.length >= 4 ? [stem] : [], ...segments].some((t) => mentioned(t, scope.promptText))) return null;
-  for (let id of ids)
-    for (let d of scope.promptDirs.get(id) ?? []) if (d !== "." && sameArea(d, dir)) return null;
-  if (scope.agentFiles.every((f) => f === path12)) return null;
-  let others = uniq(ids.flatMap((id) => scope.promptFiles.get(id) ?? [])).filter((f) => f !== path12);
-  return others.length > 0 && others.filter((f) => related(posix.dirname(f), dir)).length / others.length > 0.5 ? null : `Not mentioned in any prompt and away from the agent's other edits (${dir === "." ? "repo root" : `${dir}/`})`;
+  let dir = posix.dirname(path12);
+  if (pathTokens(path12).some((t) => mentioned(t, scope.promptText)) || ids.some((id) => anchoredBy(path12, id, scope)) || scope.agentFiles.every((f) => f === path12)) return null;
+  let others = uniq(ids.flatMap((id) => scope.promptFiles.get(id) ?? [])).filter((f) => f !== path12), anchored = others.filter((f) => ids.some((id) => (scope.promptFiles.get(id) ?? []).includes(f) && anchoredBy(f, id, scope))), pool = anchored.length > 0 ? anchored : others;
+  return pool.length > 0 && pool.filter((f) => related(posix.dirname(f), dir)).length / pool.length > 0.5 ? null : `Not mentioned in any prompt and away from the agent's other edits (${dir === "." ? "repo root" : `${dir}/`})`;
 }
 
 // src/types.ts

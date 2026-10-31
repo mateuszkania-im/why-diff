@@ -758,6 +758,15 @@ describe('out-of-scope', () => {
     expect(flagged(ci[1])).toBe(true);
   });
 
+  it('wandering files do not vouch for each other under an anchored prompt', () => {
+    const p = [prompt('fix src/cart.js')];
+    const three = labelHunks([hunk('src/cart.js', ['+x']), hunk('infra/a.tf', ['+1']), hunk('infra/b.tf', ['+2']), hunk('infra/c.tf', ['+3'])], { repoRoot: '/repo', prompts: p });
+    expect(three.slice(1).map(flagged)).toEqual([true, true, true]);
+    const two = labelHunks([hunk('src/cart.js', ['+x']), hunk('infra/a.tf', ['+1']), hunk('infra/b.tf', ['+2'])], { repoRoot: '/repo', prompts: p });
+    expect(two.slice(1).map(flagged)).toEqual([true, true]);
+    expect(flagged(three[0])).toBe(false);
+  });
+
   it('does not treat URLs in a prompt as paths', () => {
     const out = labelHunks([hunk('src/cart.js', ['+x']), hunk('ab/cd/ref.md', ['+y'])], {
       repoRoot: '/repo',

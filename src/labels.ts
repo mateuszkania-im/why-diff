@@ -1463,6 +1463,8 @@ interface ScopeIndex {
   promptDirs: Map<string, Set<string>>;
   /** Distinct repo paths of the agent-attributed hunks each prompt produced. */
   promptFiles: Map<string, string[]>;
+  /** Lower-cased text of each prompt, by id. */
+  promptTexts: Map<string, string>;
   fileText?: LabelContext['fileText'];
 }
 
@@ -1500,6 +1502,7 @@ function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex
   return {
     promptDirs,
     promptFiles,
+    promptTexts: new Map(ctx.prompts.map((p) => [p.id, p.text.toLowerCase()])),
     promptText: ctx.prompts.map((p) => p.text).join('\n').toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
     goneSourceStems: goneSourceStems(hunks, ctx.repoRoot),
@@ -1552,28 +1555,44 @@ function related(a: string, b: string): boolean {
  *   the first two path segments) with a file or path that prompt mentions;
  * - it sits with the rest of that prompt's work: more than half of the other
  *   files the same prompt touched live in the same directory or an
- *   ancestor/descendant.
+ *   ancestor/descendant. When the prompt names some touched file (it is
+ *   anchored), only those anchored files count, so wandering files never vouch
+ *   for each other; a prompt that names nothing we touched is judged on all
+ *   its files.
  *
  * Skipped when there are no prompts or the agent touched a single file, and
  * for lockfiles and snapshots (derived artefacts of an in-scope change).
  */
-function outOfScopeReason(path: string, scope: ScopeIndex, ids: string[]): string | null {
-  if (!scope.promptText || isLockfile(path) || isSnapshotFile(path)) return null;
+function pathTokens(path: string): string[] {
   const base = posix.basename(path);
   const stem = base.replace(/\.[^.]+$/, '');
+  const segments = posix.dirname(path).split('/').filter((s) => s.length >= 4 && s !== '.');
+  return [base, ...(stem.length >= 4 ? [stem] : []), ...segments];
+}
+
+/** True when the prompt names the file (or its directory), or points at its area. */
+function anchoredBy(path: string, id: string, scope: ScopeIndex): boolean {
+  const text = scope.promptTexts.get(id) ?? '';
+  if (pathTokens(path).some((t) => mentioned(t, text))) return true;
   const dir = posix.dirname(path);
-  const segments = dir.split('/').filter((s) => s.length >= 4 && s !== '.');
-  const tokens = [base, ...(stem.length >= 4 ? [stem] : []), ...segments];
-  if (tokens.some((t) => mentioned(t, scope.promptText))) return null;
-  for (const id of ids) {
-    for (const d of scope.promptDirs.get(id) ?? []) if (d !== '.' && sameArea(d, dir)) return null;
-  }
+  for (const d of scope.promptDirs.get(id) ?? []) if (d !== '.' && sameArea(d, dir)) return true;
+  return false;
+}
+
+function outOfScopeReason(path: string, scope: ScopeIndex, ids: string[]): string | null {
+  if (!scope.promptText || isLockfile(path) || isSnapshotFile(path)) return null;
+  const dir = posix.dirname(path);
+  if (pathTokens(path).some((t) => mentioned(t, scope.promptText))) return null;
+  if (ids.some((id) => anchoredBy(path, id, scope))) return null;
 
   if (scope.agentFiles.every((f) => f === path)) return null;
   const others = uniq(ids.flatMap((id) => scope.promptFiles.get(id) ?? [])).filter((f) => f !== path);
-  if (others.length > 0) {
-    const near = others.filter((f) => related(posix.dirname(f), dir)).length;
-    if (near / others.length > 0.5) return null;
+  // A prompt that names some touched file is anchored: only anchored files vouch for their neighbours.
+  const anchored = others.filter((f) => ids.some((id) => (scope.promptFiles.get(id) ?? []).includes(f) && anchoredBy(f, id, scope)));
+  const pool = anchored.length > 0 ? anchored : others;
+  if (pool.length > 0) {
+    const near = pool.filter((f) => related(posix.dirname(f), dir)).length;
+    if (near / pool.length > 0.5) return null;
   }
   return `Not mentioned in any prompt and away from the agent's other edits (${dir === '.' ? 'repo root' : `${dir}/`})`;
 }
