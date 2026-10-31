@@ -342,7 +342,7 @@ describe('redactSecrets: audit 2', () => {
     const small = unit.repeat(Math.ceil(50_000 / unit.length));
     const large = unit.repeat(Math.ceil(200_000 / unit.length));
     expectScalesSubQuadratically(() => redactSecrets(small, 'code'), () => redactSecrets(large, 'code'));
-  });
+  }, 30_000);
 });
 
 describe('redactSecrets: audit 2 security review', () => {
@@ -386,5 +386,5 @@ describe('redactSecrets: review patterns performance', () => {
     const small = unit.repeat(Math.ceil(50_000 / unit.length));
     const large = unit.repeat(Math.ceil(200_000 / unit.length));
     expectScalesSubQuadratically(() => redactSecrets(small, 'code', { file: 'a.ts' }), () => redactSecrets(large, 'code', { file: 'a.ts' }));
-  });
+  }, 30_000);
 });

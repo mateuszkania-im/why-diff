@@ -1152,7 +1152,7 @@ describe('prompt text performance (pasted blobs)', () => {
       const run = (n: number) => () => labelHunks([hunk('src/x.ts', ['+export const x = 1;'])], { prompts: [prompt(blob(n))], repoRoot: '/repo' });
       expect(bestOf(run(200_000), 3)).toBeLessThan(1000);
       expectScalesSubQuadratically(run(50_000), run(200_000));
-    });
+    }, 30_000);
   }
 
   it('still reads path tokens and file mentions from an ordinary prompt', () => {

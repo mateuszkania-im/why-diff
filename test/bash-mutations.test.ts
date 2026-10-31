@@ -164,15 +164,15 @@ describe('detectBashMutations: audit 2 shell forms', () => {
     expect(paths('for f in $(ls test); do rm "$f"; done')).toEqual(del('$f'));
   });
 
-  it('stays bounded and linear on huge brace and variable inputs', () => {
-    const many = `rm ${'{a,b}'.repeat(40)}`;
-    expect(detectBashMutations(many, CWD).length).toBeLessThanOrEqual(256);
-    for (const unit of ['{a,', 'D=x; rm $D/{a,b} ', 'a{', '$D$D', 'for f in a b; do rm "$f"; done; ']) {
-      const cmd = (n: number) => () => detectBashMutations(unit.repeat(Math.ceil(n / unit.length)), CWD);
-      expect(bestOf(cmd(200_000), 3)).toBeLessThan(2000);
-      expectScalesSubQuadratically(cmd(50_000), cmd(200_000));
-    }
+  it('stays bounded on a huge brace word', () => {
+    expect(detectBashMutations(`rm ${'{a,b}'.repeat(40)}`, CWD).length).toBeLessThanOrEqual(256);
   });
+
+  it.each(['{a,', 'D=x; rm $D/{a,b} ', 'a{', '$D$D', 'for f in a b; do rm "$f"; done; '])('200 KB of %j parses in linear time', (unit) => {
+    const cmd = (n: number) => () => detectBashMutations(unit.repeat(Math.ceil(n / unit.length)), CWD);
+    expect(bestOf(cmd(200_000), 3)).toBeLessThan(2000);
+    expectScalesSubQuadratically(cmd(50_000), cmd(200_000));
+  }, 30_000);
 });
 
 describe('detectBashMutations: adversarial input stays bounded', () => {

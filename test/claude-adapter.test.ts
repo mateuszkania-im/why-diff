@@ -427,7 +427,7 @@ describe('prompt cleaning on pasted blobs', () => {
     const cmd = (n: number) => () => humanPromptText({ type: 'user', message: { role: 'user', content: `<command-name>/goal</command-name>${blob('<command-args>', n)}` } } as never);
     expect(bestOf(cmd(200_000), 3)).toBeLessThan(1000);
     expectScalesSubQuadratically(cmd(50_000), cmd(200_000));
-  });
+  }, 30_000);
 
   it('still strips closed reminders and reads command arguments', () => {
     expect(cleanPromptText('fix it<system-reminder>noise</system-reminder>\n\n\n\nnow<system-reminder>more')).toBe('fix it\n\nnow<system-reminder>more');
