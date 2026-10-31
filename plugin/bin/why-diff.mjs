@@ -3113,7 +3113,7 @@ function attribute(hunks, sessions, repoRoot2, opts = {}) {
   for (let s of sessions) for (let p of s.prompts) prompts.set(p.id, p);
   let diffFiles = /* @__PURE__ */ new Set();
   for (let h of hunks)
-    diffFiles.add(h.file), h.oldFile && diffFiles.add(h.oldFile);
+    diffFiles.add(h.file.normalize("NFC")), h.oldFile && diffFiles.add(h.oldFile.normalize("NFC"));
   let index = indexEdits(sessions, repoRoot2, diffFiles, opts.extraRoots);
   return index.sinceMs = opts.since?.getTime(), hunks.flatMap((hunk) => attributeHunk(hunk, index, prompts));
 }
@@ -3144,8 +3144,8 @@ function indexEdits(sessions, repoRoot2, diffFiles = /* @__PURE__ */ new Set(), 
   for (let list of byFile.values()) list.sort(byRecency);
   return bash.sort(byRecency), { byFile, bash, shell: [...shell.values()], roots: roots.map((r) => r.split(path3.sep).join("/")) };
 }
-function touchedByShell(file, index) {
-  let shell = index.shellIndex ??= buildShellIndex(index);
+function touchedByShell(raw, index) {
+  let file = raw.normalize("NFC"), shell = index.shellIndex ??= buildShellIndex(index);
   if (shell.tokens.has(file) || shell.rels.has(file) || shell.rels.has("") || shell.rels.has(".")) return !0;
   for (let slash = file.lastIndexOf("/"); slash > 0; slash = file.lastIndexOf("/", slash - 1))
     if (shell.rels.has(file.slice(0, slash))) return !0;
@@ -3244,9 +3244,9 @@ function difference(a, b) {
   return out;
 }
 function repoRelativePath(filePath, roots, cwd = "", cwdVariants = rootVariants(cwd)) {
-  let candidates = /* @__PURE__ */ new Set(), abs = path3.isAbsolute(filePath) ? path3.normalize(filePath) : cwd ? path3.resolve(cwd, filePath) : null;
+  let candidates = /* @__PURE__ */ new Set(), nfcCwd = cwd.normalize("NFC"), abs = path3.isAbsolute(filePath) ? path3.normalize(filePath.normalize("NFC")) : nfcCwd ? path3.resolve(nfcCwd, filePath.normalize("NFC")) : null;
   if (!abs) return null;
-  candidates.add(abs);
+  cwdVariants = cwdVariants.map((v) => v.normalize("NFC")), roots = roots.map((r) => r.normalize("NFC")), candidates.add(abs);
   for (let v of cwdVariants)
     for (let w of cwdVariants)
       v !== w && (abs === v || abs.startsWith(v + path3.sep)) && candidates.add(w + abs.slice(v.length));
@@ -3414,7 +3414,7 @@ function formatRange(start, count) {
   return count === 1 ? `${start}` : `${start},${count}`;
 }
 function candidatesFor(hunk, index) {
-  let files = hunk.oldFile ? [hunk.file, hunk.oldFile] : [hunk.file], set = /* @__PURE__ */ new Set();
+  let files = (hunk.oldFile ? [hunk.file, hunk.oldFile] : [hunk.file]).map((f) => f.normalize("NFC")), set = /* @__PURE__ */ new Set();
   for (let f of files) for (let e of index.byFile.get(f) ?? []) set.add(e);
   for (let e of index.bash)
     e.rel === null || set.has(e) || !shellRelCounts(e.edit.bashOp, e.rel) && !NON_CONTENT_OPS.has(e.edit.bashOp ?? "") || files.some((f) => bashPathMatches(e.rel ?? "", f)) && set.add(e);
@@ -9051,9 +9051,9 @@ async function guard(payload, opts) {
   let root = await repoRoot(payload.cwd ?? process.cwd()), session = await claudeCodeAdapter.parse(payload.transcript_path), roots = [root, ...await worktreeRoots(root)].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdVariants = rootVariants(session.cwd), paths = [...new Set(session.edits.filter((e) => !e.failed).map((e) => {
     let rel = repoRelativePath(e.filePath, roots, session.cwd, cwdVariants);
     if (!rel) return null;
-    let p = rel.split(path11.sep).join("/");
-    return e.kind === "bash" && SHELL_GLOB.test(p) ? `:(glob)${p}` : `:(literal)${p}`;
-  }).filter((p) => !!p))];
+    let p = rel.split(path11.sep).join("/"), magic = e.kind === "bash" && SHELL_GLOB.test(p) ? ":(glob)" : ":(literal)";
+    return [.../* @__PURE__ */ new Set([p, p.normalize("NFD")])].map((v) => `${magic}${v}`);
+  }).flatMap((p) => p ?? []))];
   if (!paths.length) return NO_BLOCK;
   let baseRev = "HEAD";
   if (await hasHead(root)) {
@@ -9071,7 +9071,7 @@ async function guard(payload, opts) {
     config,
     keepAgentIgnored: !0
   }), shellTargets = (ops) => new Set(session.edits.filter((e) => !e.failed && e.kind === "bash" && ops.has(e.bashOp ?? "")).map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants)).filter((p) => !!p).map((p) => p.split(path11.sep).join("/").replace(/^(\.\/)+/, "").replace(/\/+$/, ""))), removedByShell = shellTargets(REMOVE_OPS), rewrittenByShell = shellTargets(REWRITE_OPS), targeted = (targets, file, dirs) => {
-    let f = file.replace(/^(\.\/)+/, "");
+    let f = file.normalize("NFC").replace(/^(\.\/)+/, "");
     for (let r of targets)
       if (r && (f === r || dirs && f.startsWith(`${r}/`) || SHELL_GLOB.test(r) && globToRegExp(r).test(f)))
         return !0;

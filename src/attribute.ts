@@ -156,8 +156,8 @@ export function attribute(hunks: Hunk[], sessions: Session[], repoRoot: string, 
 
   const diffFiles = new Set<string>();
   for (const h of hunks) {
-    diffFiles.add(h.file);
-    if (h.oldFile) diffFiles.add(h.oldFile);
+    diffFiles.add(h.file.normalize('NFC'));
+    if (h.oldFile) diffFiles.add(h.oldFile.normalize('NFC'));
   }
   const index = indexEdits(sessions, repoRoot, diffFiles, opts.extraRoots);
   index.sinceMs = opts.since?.getTime();
@@ -264,7 +264,8 @@ function indexEdits(sessions: Session[], repoRoot: string, diffFiles: Set<string
  * script run from elsewhere, `node fix.js src/a.ts`), which bash-mutations
  * cannot follow.
  */
-function touchedByShell(file: string, index: EditIndex): boolean {
+function touchedByShell(raw: string, index: EditIndex): boolean {
+  const file = raw.normalize('NFC');
   const shell = (index.shellIndex ??= buildShellIndex(index));
   if (shell.tokens.has(file) || shell.rels.has(file) || shell.rels.has('') || shell.rels.has('.')) return true;
   for (let slash = file.lastIndexOf('/'); slash > 0; slash = file.lastIndexOf('/', slash - 1)) {
@@ -421,9 +422,14 @@ export function repoRelativePath(
   cwd = '',
   cwdVariants: string[] = rootVariants(cwd),
 ): string | null {
+  // Compared in Unicode NFC: macOS file APIs and agents may hand over NFD names (`cafe\u0301.js`)
+  // where git reports NFC (`caf\u00e9.js`).
   const candidates = new Set<string>();
-  const abs = path.isAbsolute(filePath) ? path.normalize(filePath) : cwd ? path.resolve(cwd, filePath) : null;
+  const nfcCwd = cwd.normalize('NFC');
+  const abs = path.isAbsolute(filePath) ? path.normalize(filePath.normalize('NFC')) : nfcCwd ? path.resolve(nfcCwd, filePath.normalize('NFC')) : null;
   if (!abs) return null;
+  cwdVariants = cwdVariants.map((v) => v.normalize('NFC'));
+  roots = roots.map((r) => r.normalize('NFC'));
   candidates.add(abs);
   for (const v of cwdVariants) {
     for (const w of cwdVariants) {
@@ -774,7 +780,7 @@ function formatRange(start: number, count: number): string {
 
 /** Edits that touched this hunk's file (new or old name), including bash prefix/glob hits. */
 function candidatesFor(hunk: Hunk, index: EditIndex): IndexedEdit[] {
-  const files = hunk.oldFile ? [hunk.file, hunk.oldFile] : [hunk.file];
+  const files = (hunk.oldFile ? [hunk.file, hunk.oldFile] : [hunk.file]).map((f) => f.normalize('NFC'));
   const set = new Set<IndexedEdit>();
   for (const f of files) for (const e of index.byFile.get(f) ?? []) set.add(e);
   for (const e of index.bash) {

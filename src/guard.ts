@@ -67,9 +67,11 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
       const rel = repoRelativePath(e.filePath, roots, session.cwd, cwdVariants);
       if (!rel) return null;
       const p = rel.split(path.sep).join('/');
-      return e.kind === 'bash' && SHELL_GLOB.test(p) ? `:(glob)${p}` : `:(literal)${p}`;
+      const magic = e.kind === 'bash' && SHELL_GLOB.test(p) ? ':(glob)' : ':(literal)';
+      // Paths are compared in NFC; a file stored under its NFD name (Linux) still has to be diffed.
+      return [...new Set([p, p.normalize('NFD')])].map((v) => `${magic}${v}`);
     })
-    .filter((p): p is string => Boolean(p)))];
+    .flatMap((p) => p ?? []))];
   if (!paths.length) return NO_BLOCK;
 
   let baseRev = 'HEAD';
@@ -106,7 +108,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   const removedByShell = shellTargets(REMOVE_OPS);
   const rewrittenByShell = shellTargets(REWRITE_OPS);
   const targeted = (targets: Set<string>, file: string, dirs: boolean): boolean => {
-    const f = file.replace(/^(\.\/)+/, '');
+    const f = file.normalize('NFC').replace(/^(\.\/)+/, '');
     for (const r of targets) {
       if (!r) continue;
       if (f === r || (dirs && f.startsWith(`${r}/`))) return true;

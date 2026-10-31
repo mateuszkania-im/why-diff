@@ -1126,3 +1126,16 @@ describe('attribute: shell commands that do not change content', () => {
     }
   });
 });
+
+describe('attribute: Unicode normalisation of file names', () => {
+  const NFD = 'src/café.js';
+  const NFC = 'src/café.js';
+  it('attributes an agent Write of an NFD name to the NFC path git reports, and the other way round', () => {
+    for (const [written, reported] of [[NFD, NFC], [NFC, NFD]] as const) {
+      const s = session(S, [P0], [edit(S, P0.id, written, null, 'export const x = 1;\nexport const y = 2;\n', { kind: 'write', tool: 'Write' })]);
+      const [h] = attribute([hunk(reported, ['+export const x = 1;', '+export const y = 2;'], { status: 'added' })], [s], ROOT);
+      expect(h?.match).toBe('exact');
+      expect(h?.hunk.file).toBe(reported);
+    }
+  });
+});

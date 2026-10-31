@@ -406,6 +406,22 @@ describe('runGuard', () => {
   }, 60_000);
 });
 
+describe('runGuard with Unicode file names', () => {
+  for (const [name, form] of [['NFD', 'NFD'], ['NFC', 'NFC']] as const) {
+    it(`blocks on an it.skip the agent wrote into a test file named in ${name}`, async () => {
+      const { repo, home, stateDir } = makeRepo();
+      const file = path.join(repo, 'test', 'caf\u00e9.test.js'.normalize(form));
+      writeFileSync(file, testFile());
+      sh(repo, ['add', '-A']);
+      sh(repo, ['commit', '-qm', 'cafe'], LONG_AGO);
+      const transcript = writeSyntheticTranscript(home, repo, 's-nfd', [{ prompt: 'fix t5', at: SESSION_AT, calls: [{ tool: 'Edit', at: CALL_AT, input: { file_path: path.join(repo, 'test', 'cafe\u0301.test.js'), old_string: SKIP_OLD, new_string: SKIP_NEW } }] }]);
+      writeFileSync(file, readFileSync(file, 'utf8').replace(SKIP_OLD, SKIP_NEW));
+      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-nfd' }, { blocking: BLOCKING, home, stateDir });
+      expect(r.block).toBe(true);
+    });
+  }
+});
+
 describe('runGuard on pasted blobs', () => {
   for (const [name, blob] of [
     ['a word run', 'a'.repeat(300_000)],
