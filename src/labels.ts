@@ -1546,21 +1546,19 @@ function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex
     if (!d) promptDirs.set(id, (d = new Set()));
     return d;
   };
+  const lowered = new Map(ctx.prompts.map((p) => [p.id, p.text.toLowerCase()]));
   for (const h of agent) {
     const path = toRepoPath(h.hunk.file, ctx.repoRoot);
     for (const id of hunkPromptIds(h)) {
       let set = promptFileSets.get(id);
       if (!set) promptFileSets.set(id, (set = new Set()));
       set.add(path);
-      const text = ctx.prompts.find((p) => p.id === id)?.text.toLowerCase() ?? '';
-      if (fileMentioned(path, text)) dirsOf(id).add(posix.dirname(path));
+      if (fileMentioned(path, lowered.get(id) ?? '')) dirsOf(id).add(posix.dirname(path));
     }
   }
   for (const p of ctx.prompts) {
     // Path-like tokens ("src/cart.js") name their directory directly. URLs and domain-like tokens are not paths.
-    const text = p.text.replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, ' ');
-    for (const m of text.matchAll(/[\w@.-]+(?:\/[\w@.-]+)+/g)) {
-      const token = m[0].replace(/^\.\//, '');
+    for (const token of promptPathTokens(p.text)) {
       if (/^[\w-]+\.[a-z]{2,}\//i.test(token)) continue;
       const dir = posix.dirname(token);
       if (dir !== '.') dirsOf(p.id).add(dir);
@@ -1571,12 +1569,63 @@ function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex
     promptFiles: new Map([...promptFileSets].map(([id, set]) => [id, [...set]])),
     anchoredFiles: new Map(),
     pools: new Map(),
-    promptTexts: new Map(ctx.prompts.map((p) => [p.id, p.text.toLowerCase()])),
+    promptTexts: lowered,
     promptText: ctx.prompts.map((p) => p.text).join('\n').toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
     goneSourceStems: goneSourceStems(hunks, ctx.repoRoot),
     ...(ctx.fileText ? { fileText: ctx.fileText } : {}),
   };
+}
+
+/** Prompt text scanned for path tokens: pasted blobs are cut to their first and last 32 KB. */
+const PROMPT_SCAN_CAP = 64 * 1024;
+
+function capPromptText(text: string): string {
+  return text.length <= PROMPT_SCAN_CAP ? text : `${text.slice(0, PROMPT_SCAN_CAP / 2)}\n${text.slice(-PROMPT_SCAN_CAP / 2)}`;
+}
+
+const SCHEME_CHAR = /[a-z0-9+.-]/i;
+const PATH_RUN = /[\w@./-]+/g;
+
+/**
+ * Path-like tokens (`src/cart.js`, `./lib/a`) in a prompt, in linear time: the text is split on
+ * whitespace, a URL (`scheme://...`) drops the rest of its token, and each run of path characters
+ * yields its slash-joined groups of non-empty segments. Same result as matching
+ * `[\w@.-]+(?:\/[\w@.-]+)+` after removing URLs, without the backtracking on long word runs.
+ */
+export function promptPathTokens(text: string): string[] {
+  const out: string[] = [];
+  for (let token of capPromptText(text).split(/\s+/)) {
+    if (!token.includes('/')) continue;
+    token = token.slice(0, urlStart(token));
+    for (const run of token.match(PATH_RUN) ?? []) {
+      let group: string[] = [];
+      const flush = (): void => {
+        if (group.length >= 2) out.push(group.join('/').replace(/^\.\//, ''));
+        group = [];
+      };
+      for (const part of run.split('/')) {
+        if (part) group.push(part);
+        else flush();
+      }
+      flush();
+    }
+  }
+  return out;
+}
+
+/** Index where the first `scheme://` URL starts in a whitespace-free token, or its length. */
+function urlStart(token: string): number {
+  let from = 0;
+  for (;;) {
+    const k = token.indexOf('://', from);
+    if (k < 0) return token.length;
+    let s = k;
+    while (s > 0 && SCHEME_CHAR.test(token.charAt(s - 1))) s--;
+    while (s < k && !/[a-z]/i.test(token.charAt(s))) s++;
+    if (s < k) return s;
+    from = k + 1;
+  }
 }
 
 /** True when the text names the file by basename, or by stem (>= 4 chars). */

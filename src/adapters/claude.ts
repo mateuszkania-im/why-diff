@@ -126,7 +126,6 @@ const TOOL_USE_ID = Buffer.from('"tool_use_id":"');
 function mayEdit(name: string): boolean {
   return EDIT_TOOLS.has(name) || /write_file|create_file$/i.test(name);
 }
-const SYSTEM_REMINDER = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
 /** `promptSource` values that mean "a person (or the SDK caller) wrote this". */
 const HUMAN_SOURCES = new Set(['typed', 'queued', 'sdk', 'human']);
 /** `promptSource` values injected by the harness itself (hooks, cron, task notifications). */
@@ -591,8 +590,8 @@ export function humanPromptText(line: TranscriptLine): string | null {
     // Built-in commands (`/goal <task>`) carry no origin in Claude Code 2.1.x. One
     // with arguments is an instruction the agent acts on, unless it only
     // configures the session (`/clear`, `/compact <focus>`, `/model x`).
-    const name = /<command-name>\/?([\s\S]*?)<\/command-name>/.exec(text)?.[1]?.trim() ?? '';
-    const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(text)?.[1]?.trim();
+    const name = (tagText(text, 'command-name') ?? '').trim().replace(/^\//, '').trim();
+    const args = tagText(text, 'command-args')?.trim();
     return args && !SESSION_COMMANDS.has(name) ? slashCommandText(text) : null;
   }
   if (!explicitlyHuman && NON_HUMAN_PREFIXES.some((p) => text.startsWith(p))) return null;
@@ -601,13 +600,40 @@ export function humanPromptText(line: TranscriptLine): string | null {
 
 /** Strip system reminders and surrounding whitespace. */
 export function cleanPromptText(raw: string): string {
-  return raw.replace(SYSTEM_REMINDER, '').replace(/\n{3,}/g, '\n\n').trim();
+  return stripTags(raw, 'system-reminder').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/**
+ * Text inside the first `<tag>...</tag>` pair, like `/<tag>([\s\S]*?)<\/tag>/.exec`, but with
+ * indexOf so that a pasted blob of unclosed tags cannot make it quadratic.
+ */
+function tagText(text: string, tag: string): string | undefined {
+  const open = `<${tag}>`;
+  const i = text.indexOf(open);
+  if (i < 0) return undefined;
+  const j = text.indexOf(`</${tag}>`, i + open.length);
+  return j < 0 ? undefined : text.slice(i + open.length, j);
+}
+
+/** Remove every `<tag>...</tag>` block (a trailing unclosed tag stays), in linear time. */
+function stripTags(text: string, tag: string): string {
+  const open = `<${tag}>`;
+  const close = `</${tag}>`;
+  let out = '';
+  let pos = 0;
+  for (;;) {
+    const i = text.indexOf(open, pos);
+    const j = i < 0 ? -1 : text.indexOf(close, i + open.length);
+    if (j < 0) return out + text.slice(pos);
+    out += text.slice(pos, i);
+    pos = j + close.length;
+  }
 }
 
 /** `<command-name>/foo</command-name><command-args>bar</command-args>` -> "/foo bar". */
 function slashCommandText(text: string): string | null {
-  const name = /<command-name>([\s\S]*?)<\/command-name>/.exec(text)?.[1]?.trim();
-  const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(text)?.[1]?.trim();
+  const name = tagText(text, 'command-name')?.trim();
+  const args = tagText(text, 'command-args')?.trim();
   if (!name) return null;
   return args ? `${name} ${args}` : name;
 }

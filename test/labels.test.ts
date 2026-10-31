@@ -1127,3 +1127,25 @@ describe('out-of-scope performance', () => {
     );
   });
 });
+
+describe('prompt text performance (pasted blobs)', () => {
+  const blobs: Array<[string, (n: number) => string]> = [
+    ['one long word run', (n) => 'a'.repeat(n)],
+    ['a dotted run', (n) => 'a.'.repeat(n / 2)],
+    ['a word run ending in a slash', (n) => `${'a'.repeat(n - 1)}/`],
+    ['a scheme-like run', (n) => `${'a'.repeat(n - 3)}:/x`],
+  ];
+  for (const [name, blob] of blobs) {
+    it(`labels a 200 KB prompt made of ${name} in linear time`, () => {
+      const run = (n: number) => () => labelHunks([hunk('src/x.ts', ['+export const x = 1;'])], { prompts: [prompt(blob(n))], repoRoot: '/repo' });
+      expect(bestOf(run(200_000), 3)).toBeLessThan(1000);
+      expectScalesSubQuadratically(run(50_000), run(200_000));
+    });
+  }
+
+  it('still reads path tokens and file mentions from an ordinary prompt', () => {
+    const h = hunk('src/cart/total.ts', ['+export const x = 1;']);
+    expect(kinds(h)).not.toContain('out-of-scope');
+    expect(labelsOf(h, [prompt('please fix src/cart/total.ts')]).map((l) => l.kind)).not.toContain('out-of-scope');
+  });
+});

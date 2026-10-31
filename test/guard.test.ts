@@ -371,6 +371,24 @@ describe('runGuard', () => {
   }, 60_000);
 });
 
+describe('runGuard on pasted blobs', () => {
+  for (const [name, blob] of [
+    ['a word run', 'a'.repeat(300_000)],
+    ['dotted words', 'a.'.repeat(150_000)],
+    ['unclosed reminder tags', '<system-reminder>'.repeat(18_000)],
+  ] as const) {
+    it(`blocks on a 300 KB prompt of ${name} well within the hook timeout`, async () => {
+      const { repo, home, stateDir } = makeRepo();
+      const transcript = writeSyntheticTranscript(home, repo, 's-blob', [{ prompt: `fix t5 ${blob}`, at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
+      applyEdit(repo, SKIP_OLD, SKIP_NEW);
+      const t0 = Date.now();
+      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-blob' }, { blocking: BLOCKING, home, stateDir });
+      expect(Date.now() - t0).toBeLessThan(5000);
+      expect(r.block).toBe(true);
+    }, 120_000);
+  }
+});
+
 describe('why-diff guard CLI', () => {
   it('exits 2 with the message on stderr when the agent skipped a test, 0 otherwise', () => {
     const { repo, home } = makeRepo();

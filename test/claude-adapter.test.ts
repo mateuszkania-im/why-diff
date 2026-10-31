@@ -416,3 +416,21 @@ describe('fixture materialisation', () => {
     expect(session.edits[0]?.filePath).toBe(path.join(repo, 'src/format.ts'));
   });
 });
+
+describe('prompt cleaning on pasted blobs', () => {
+  it('strips system reminders and reads slash commands in linear time on unclosed tags', async () => {
+    const { bestOf, expectScalesSubQuadratically } = await import('./helpers/perf.js');
+    const blob = (tag: string, n: number) => tag.repeat(Math.floor(n / tag.length));
+    const clean = (n: number) => () => cleanPromptText(blob('<system-reminder>', n));
+    expect(bestOf(clean(200_000), 3)).toBeLessThan(1000);
+    expectScalesSubQuadratically(clean(50_000), clean(200_000));
+    const cmd = (n: number) => () => humanPromptText({ type: 'user', message: { role: 'user', content: `<command-name>/goal</command-name>${blob('<command-args>', n)}` } } as never);
+    expect(bestOf(cmd(200_000), 3)).toBeLessThan(1000);
+    expectScalesSubQuadratically(cmd(50_000), cmd(200_000));
+  });
+
+  it('still strips closed reminders and reads command arguments', () => {
+    expect(cleanPromptText('fix it<system-reminder>noise</system-reminder>\n\n\n\nnow<system-reminder>more')).toBe('fix it\n\nnow<system-reminder>more');
+    expect(humanPromptText({ type: 'user', message: { role: 'user', content: '<command-name>/goal</command-name><command-args>ship it</command-args>' } } as never)).toBe('/goal ship it');
+  });
+});

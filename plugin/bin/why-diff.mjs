@@ -4587,37 +4587,66 @@ function buildScopeIndex(hunks, ctx) {
   let agent = hunks.filter(isAgentAttributed), promptDirs = /* @__PURE__ */ new Map(), promptFileSets = /* @__PURE__ */ new Map(), dirsOf = (id) => {
     let d = promptDirs.get(id);
     return d || promptDirs.set(id, d = /* @__PURE__ */ new Set()), d;
-  };
+  }, lowered = new Map(ctx.prompts.map((p) => [p.id, p.text.toLowerCase()]));
   for (let h of agent) {
     let path13 = toRepoPath(h.hunk.file, ctx.repoRoot);
     for (let id of hunkPromptIds(h)) {
       let set = promptFileSets.get(id);
-      set || promptFileSets.set(id, set = /* @__PURE__ */ new Set()), set.add(path13);
-      let text2 = ctx.prompts.find((p) => p.id === id)?.text.toLowerCase() ?? "";
-      fileMentioned(path13, text2) && dirsOf(id).add(posix.dirname(path13));
+      set || promptFileSets.set(id, set = /* @__PURE__ */ new Set()), set.add(path13), fileMentioned(path13, lowered.get(id) ?? "") && dirsOf(id).add(posix.dirname(path13));
     }
   }
-  for (let p of ctx.prompts) {
-    let text2 = p.text.replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, " ");
-    for (let m of text2.matchAll(/[\w@.-]+(?:\/[\w@.-]+)+/g)) {
-      let token = m[0].replace(/^\.\//, "");
+  for (let p of ctx.prompts)
+    for (let token of promptPathTokens(p.text)) {
       if (/^[\w-]+\.[a-z]{2,}\//i.test(token)) continue;
       let dir = posix.dirname(token);
       dir !== "." && dirsOf(p.id).add(dir);
     }
-  }
   return {
     promptDirs,
     promptFiles: new Map([...promptFileSets].map(([id, set]) => [id, [...set]])),
     anchoredFiles: /* @__PURE__ */ new Map(),
     pools: /* @__PURE__ */ new Map(),
-    promptTexts: new Map(ctx.prompts.map((p) => [p.id, p.text.toLowerCase()])),
+    promptTexts: lowered,
     promptText: ctx.prompts.map((p) => p.text).join(`
 `).toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
     goneSourceStems: goneSourceStems(hunks, ctx.repoRoot),
     ...ctx.fileText ? { fileText: ctx.fileText } : {}
   };
+}
+var PROMPT_SCAN_CAP = 64 * 1024;
+function capPromptText(text2) {
+  return text2.length <= PROMPT_SCAN_CAP ? text2 : `${text2.slice(0, PROMPT_SCAN_CAP / 2)}
+${text2.slice(-PROMPT_SCAN_CAP / 2)}`;
+}
+var SCHEME_CHAR = /[a-z0-9+.-]/i, PATH_RUN = /[\w@./-]+/g;
+function promptPathTokens(text2) {
+  let out = [];
+  for (let token of capPromptText(text2).split(/\s+/))
+    if (token.includes("/")) {
+      token = token.slice(0, urlStart(token));
+      for (let run of token.match(PATH_RUN) ?? []) {
+        let group = [], flush = () => {
+          group.length >= 2 && out.push(group.join("/").replace(/^\.\//, "")), group = [];
+        };
+        for (let part of run.split("/"))
+          part ? group.push(part) : flush();
+        flush();
+      }
+    }
+  return out;
+}
+function urlStart(token) {
+  let from = 0;
+  for (; ; ) {
+    let k = token.indexOf("://", from);
+    if (k < 0) return token.length;
+    let s = k;
+    for (; s > 0 && SCHEME_CHAR.test(token.charAt(s - 1)); ) s--;
+    for (; s < k && !/[a-z]/i.test(token.charAt(s)); ) s++;
+    if (s < k) return s;
+    from = k + 1;
+  }
 }
 function fileMentioned(path13, text2) {
   let base = posix.basename(path13), stem = base.replace(/\.[^.]+$/, "");
@@ -5270,7 +5299,7 @@ var HARNESS = "claude-code", RATIONALE_MAX = 500, PEEK_LINES = 60, AGENT_TOOLS =
 function mayEdit(name) {
   return EDIT_TOOLS.has(name) || /write_file|create_file$/i.test(name);
 }
-var SYSTEM_REMINDER = /<system-reminder>[\s\S]*?<\/system-reminder>/g, HUMAN_SOURCES = /* @__PURE__ */ new Set(["typed", "queued", "sdk", "human"]), NON_HUMAN_SOURCES = /* @__PURE__ */ new Set(["system", "hook", "scheduled", "cron", "automation"]), NON_HUMAN_PREFIXES = [
+var HUMAN_SOURCES = /* @__PURE__ */ new Set(["typed", "queued", "sdk", "human"]), NON_HUMAN_SOURCES = /* @__PURE__ */ new Set(["system", "hook", "scheduled", "cron", "automation"]), NON_HUMAN_PREFIXES = [
   "<command-",
   "<local-command",
   "<task-notification",
@@ -5597,18 +5626,32 @@ function humanPromptText(line) {
   let explicitlyHuman = line.origin?.kind === "human" || line.promptSource !== void 0 && HUMAN_SOURCES.has(line.promptSource);
   if (text2.startsWith("<command-name>") || text2.startsWith("<command-message>")) {
     if (explicitlyHuman) return slashCommandText(text2);
-    let name = /<command-name>\/?([\s\S]*?)<\/command-name>/.exec(text2)?.[1]?.trim() ?? "";
-    return /<command-args>([\s\S]*?)<\/command-args>/.exec(text2)?.[1]?.trim() && !SESSION_COMMANDS.has(name) ? slashCommandText(text2) : null;
+    let name = (tagText(text2, "command-name") ?? "").trim().replace(/^\//, "").trim();
+    return tagText(text2, "command-args")?.trim() && !SESSION_COMMANDS.has(name) ? slashCommandText(text2) : null;
   }
   return !explicitlyHuman && NON_HUMAN_PREFIXES.some((p) => text2.startsWith(p)) ? null : text2;
 }
 function cleanPromptText(raw) {
-  return raw.replace(SYSTEM_REMINDER, "").replace(/\n{3,}/g, `
+  return stripTags(raw, "system-reminder").replace(/\n{3,}/g, `
 
 `).trim();
 }
+function tagText(text2, tag) {
+  let open = `<${tag}>`, i = text2.indexOf(open);
+  if (i < 0) return;
+  let j = text2.indexOf(`</${tag}>`, i + open.length);
+  return j < 0 ? void 0 : text2.slice(i + open.length, j);
+}
+function stripTags(text2, tag) {
+  let open = `<${tag}>`, close = `</${tag}>`, out = "", pos = 0;
+  for (; ; ) {
+    let i = text2.indexOf(open, pos), j = i < 0 ? -1 : text2.indexOf(close, i + open.length);
+    if (j < 0) return out + text2.slice(pos);
+    out += text2.slice(pos, i), pos = j + close.length;
+  }
+}
 function slashCommandText(text2) {
-  let name = /<command-name>([\s\S]*?)<\/command-name>/.exec(text2)?.[1]?.trim(), args = /<command-args>([\s\S]*?)<\/command-args>/.exec(text2)?.[1]?.trim();
+  let name = tagText(text2, "command-name")?.trim(), args = tagText(text2, "command-args")?.trim();
   return name ? args ? `${name} ${args}` : name : null;
 }
 function blockText(content) {
