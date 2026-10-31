@@ -194,7 +194,7 @@ describe('redactSecrets: round 2', () => {
   ])('keeps %s', (t) => {
     expect(redactSecrets(t)).toBe(t);
   });
-  it.each(['a:"', "a:'a ", 'password="', 'a=" b'])('200 KB of %j is fast', (unit) => {
+  it.each(['a:"', "a:'a ", 'password="', 'a=" b', 'token:a ', '{token:a ', 'token:a,', '{"token":a '])('200 KB of %j is fast', (unit) => {
     const input = unit.repeat(Math.ceil(200_000 / unit.length));
     const t0 = performance.now();
     redactSecrets(input);

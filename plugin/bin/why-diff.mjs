@@ -3592,9 +3592,9 @@ function redactSecrets(text2) {
     let v = bare ?? "";
     if (ENV_REF.test(v) || CALL.test(v) || MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) || CODE_WORDS.has(v.toLowerCase()) || !strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
     if (op === ":" && /^[A-Za-z]+$/.test(v)) {
-      let text3 = str3 ?? "", at = offset ?? 0, lineStart = text3.lastIndexOf(`
-`, at - 1) + 1, configLike = q !== "" || /^[\s{,-]*$/.test(text3.slice(lineStart, at)), restEnd = text3.indexOf(`
-`, at + m.length), rest = text3.slice(at + m.length, restEnd === -1 ? void 0 : restEnd);
+      let text3 = str3 ?? "", at = offset ?? 0, WINDOW = 200, back = text3.slice(Math.max(0, at - WINDOW), at), nl = back.lastIndexOf(`
+`), prefix = nl === -1 ? at > WINDOW ? null : back : back.slice(nl + 1), configLike = q !== "" || prefix !== null && /^[\s{,-]*$/.test(prefix), after = at + m.length, rest = text3.slice(after, after + WINDOW).split(`
+`, 1)[0] ?? "";
       if (!configLike || !/^\s*[,;}\]]?\s*$/.test(rest)) return m;
     }
     return `${head}${DOTS}`;

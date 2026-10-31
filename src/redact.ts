@@ -105,10 +105,15 @@ export function redactSecrets(text: string): string {
     if (op === ':' && /^[A-Za-z]+$/.test(v)) {
       const text = str ?? '';
       const at = offset ?? 0;
-      const lineStart = text.lastIndexOf('\n', at - 1) + 1;
-      const configLike = q !== '' || /^[\s{,-]*$/.test(text.slice(lineStart, at));
-      const restEnd = text.indexOf('\n', at + m.length);
-      const rest = text.slice(at + m.length, restEnd === -1 ? undefined : restEnd);
+      // Bounded look-around keeps this linear on very long lines.
+      const WINDOW = 200;
+      const back = text.slice(Math.max(0, at - WINDOW), at);
+      const nl = back.lastIndexOf('\n');
+      const prefix = nl === -1 ? (at > WINDOW ? null : back) : back.slice(nl + 1);
+      const configLike = q !== '' || (prefix !== null && /^[\s{,-]*$/.test(prefix));
+      const after = at + m.length;
+      const ahead = text.slice(after, after + WINDOW);
+      const rest = ahead.split('\n', 1)[0] ?? '';
       if (!configLike || !/^\s*[,;}\]]?\s*$/.test(rest)) return m;
     }
     return `${head}${DOTS}`;
