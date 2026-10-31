@@ -8912,7 +8912,7 @@ function renderReport(report, format, opts = {}) {
 
 // src/guard.ts
 import { createHash as createHash2, randomBytes } from "node:crypto";
-import { mkdir as mkdir2, readFile as readFile7, rename as rename2, rm, stat as stat4, writeFile as writeFile2 } from "node:fs/promises";
+import { lstat, mkdir as mkdir2, readFile as readFile7, rename as rename2, rm, writeFile as writeFile2 } from "node:fs/promises";
 import path11 from "node:path";
 var DEFAULT_BLOCK_ON = ["test-skip-added", "tests-disabled", "assertion-removed", "secret-like", "ci-changed", "protected-path"], NO_BLOCK = { block: !1, hits: [] };
 async function runGuard(payload, opts) {
@@ -9005,7 +9005,8 @@ async function recordState(dir, file, key, entry) {
     await mkdir2(dir, { recursive: !0 }), path11.basename(dir) === ".why-diff" && await writeFile2(path11.join(dir, ".gitignore"), `*
 `, { flag: "wx" }).catch(() => {
     });
-    let lock = `${file}.lock`, locked = await acquireLock(lock);
+    let lock = `${file}.lock`;
+    if (!await acquireLock(lock)) return;
     try {
       let state = await readState(file);
       state[key] = entry;
@@ -9019,31 +9020,38 @@ async function recordState(dir, file, key, entry) {
         });
       }
     } finally {
-      locked && await rm(lock, { force: !0 }).catch(() => {
+      await rm(lock, { force: !0 }).catch(() => {
       });
     }
   } catch {
   }
 }
-var LOCK_WAIT_MS = 3e3, LOCK_STALE_MS = 1e4;
-async function acquireLock(lock) {
-  let deadline = Date.now() + LOCK_WAIT_MS;
+var LOCK_WAIT_MS = 3e3, LOCK_STALE = 1e4, pause = () => new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 20)));
+async function acquireLock(lock, opts = {}) {
+  let deadline = Date.now() + (opts.waitMs ?? LOCK_WAIT_MS), staleMs = opts.staleMs ?? LOCK_STALE;
   for (; ; ) {
+    if (Date.now() > deadline) return !1;
     try {
       return await writeFile2(lock, String(process.pid), { flag: "wx" }), !0;
     } catch (err) {
       if (err.code !== "EEXIST") return !1;
     }
+    let info;
     try {
-      if (Date.now() - (await stat4(lock)).mtimeMs > LOCK_STALE_MS) {
-        await rm(lock, { force: !0 });
-        continue;
-      }
-    } catch {
+      info = await lstat(lock);
+    } catch (err) {
+      if (err.code !== "ENOENT") return !1;
+      await pause();
       continue;
     }
-    if (Date.now() > deadline) return !1;
-    await new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 20)));
+    if (!info.isFile()) return !1;
+    if (Date.now() - info.mtimeMs > staleMs)
+      try {
+        await rm(lock);
+      } catch (err) {
+        if (err.code !== "ENOENT") return !1;
+      }
+    await pause();
   }
 }
 

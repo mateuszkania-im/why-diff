@@ -8,7 +8,7 @@
  * same file never does. Every internal error means "do not block".
  */
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
@@ -182,9 +182,9 @@ async function readState(file: string): Promise<GuardState> {
 
 /**
  * Store one session's entry. Guards of parallel sessions write the same file, so the update runs
- * under an exclusive lock file (`wx` create; a lock older than {@link LOCK_STALE_MS} is taken
+ * under an exclusive lock file (`wx` create; a lock older than {@link LOCK_STALE} is taken
  * over), merges into the latest on-disk state, and lands with an atomic temp-file + rename.
- * If the lock cannot be had in time the merged write still happens, unlocked (best effort).
+ * If the lock cannot be had, nothing is written (a possible repeat block, never a hang).
  */
 async function recordState(dir: string, file: string, key: string, entry: { hash: string; at: string }): Promise<void> {
   try {
@@ -193,7 +193,8 @@ async function recordState(dir: string, file: string, key: string, entry: { hash
       await writeFile(path.join(dir, '.gitignore'), '*\n', { flag: 'wx' }).catch(() => {});
     }
     const lock = `${file}.lock`;
-    const locked = await acquireLock(lock);
+    // No lock, no write: the state only dedupes repeat blocks, so skipping it is always safe.
+    if (!(await acquireLock(lock))) return;
     try {
       const state = await readState(file);
       state[key] = entry;
@@ -207,7 +208,7 @@ async function recordState(dir: string, file: string, key: string, entry: { hash
         await rm(tmp, { force: true }).catch(() => {});
       }
     } finally {
-      if (locked) await rm(lock, { force: true }).catch(() => {});
+      await rm(lock, { force: true }).catch(() => {});
     }
   } catch {
     // state is best effort; a failed write only means a possible repeat block
@@ -215,26 +216,44 @@ async function recordState(dir: string, file: string, key: string, entry: { hash
 }
 
 const LOCK_WAIT_MS = 3000;
-const LOCK_STALE_MS = 10_000;
+const LOCK_STALE = 10_000;
 
-async function acquireLock(lock: string): Promise<boolean> {
-  const deadline = Date.now() + LOCK_WAIT_MS;
+const pause = (): Promise<void> => new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 20)));
+
+/**
+ * Take the state lock: exclusive `wx` create of a regular file. A lock older than `staleMs` is
+ * removed and retried. Every iteration checks the deadline first and every retry sleeps, so this
+ * always returns within about `waitMs`: false (no lock) on timeout, on a lock path that is not a
+ * regular file, on a stale lock that cannot be removed, or on any unexpected error. The guard must
+ * never hang; without the lock the dedupe state is simply not written.
+ */
+export async function acquireLock(lock: string, opts: { waitMs?: number; staleMs?: number } = {}): Promise<boolean> {
+  const deadline = Date.now() + (opts.waitMs ?? LOCK_WAIT_MS);
+  const staleMs = opts.staleMs ?? LOCK_STALE;
   for (;;) {
+    if (Date.now() > deadline) return false;
     try {
       await writeFile(lock, String(process.pid), { flag: 'wx' });
       return true;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') return false;
     }
+    let info;
     try {
-      if (Date.now() - (await stat(lock)).mtimeMs > LOCK_STALE_MS) {
-        await rm(lock, { force: true });
-        continue;
-      }
-    } catch {
-      continue; // released between our attempts
+      info = await lstat(lock);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+      await pause(); // released between our attempts
+      continue;
     }
-    if (Date.now() > deadline) return false;
-    await new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 20)));
+    if (!info.isFile()) return false; // a directory, symlink or device is never our lock
+    if (Date.now() - info.mtimeMs > staleMs) {
+      try {
+        await rm(lock);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+      }
+    }
+    await pause();
   }
 }

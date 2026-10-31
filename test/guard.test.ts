@@ -1,9 +1,9 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { runGuard } from '../src/guard.js';
+import { acquireLock, runGuard } from '../src/guard.js';
 import type { LabelKind } from '../src/types.js';
 import { tempDir, writeSyntheticTranscript, type SyntheticCall } from './helpers/claude-fixture.js';
 import { bestOfAsync, expectSubQuadratic } from './helpers/perf.js';
@@ -214,6 +214,52 @@ describe('runGuard', () => {
     expect(results.every((r) => r.block)).toBe(true);
     const state = JSON.parse(readFileSync(path.join(stateDir, 'guard-state.json'), 'utf8')) as Record<string, unknown>;
     expect(Object.keys(state).sort()).toEqual(ids);
+  });
+
+  describe('state lock never hangs the guard', () => {
+    const old = new Date(Date.now() - 3600_000);
+    it('a lock path that is a directory: the decision comes back quickly', async () => {
+      const { repo, home, stateDir } = makeRepo();
+      mkdirSync(path.join(stateDir, 'guard-state.json.lock'));
+      utimesSync(path.join(stateDir, 'guard-state.json.lock'), old, old);
+      const transcript = writeSyntheticTranscript(home, repo, 's-lockdir', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
+      applyEdit(repo, SKIP_OLD, SKIP_NEW);
+      const t0 = Date.now();
+      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-lockdir' }, { blocking: BLOCKING, home, stateDir });
+      expect(r.block).toBe(true);
+      expect(Date.now() - t0).toBeLessThan(5000);
+    }, 10_000);
+
+    it('a stale lock that cannot be removed: acquireLock gives up instead of looping', async () => {
+      const dir = temp('why-diff-guard-lockro-');
+      const lock = path.join(dir, 'state.lock');
+      writeFileSync(lock, '1');
+      utimesSync(lock, old, old);
+      chmodSync(dir, 0o555);
+      try {
+        const t0 = Date.now();
+        expect(await acquireLock(lock, { waitMs: 200, staleMs: 1000 })).toBe(false);
+        expect(Date.now() - t0).toBeLessThan(2000);
+      } finally {
+        chmodSync(dir, 0o755);
+      }
+    }, 10_000);
+
+    it('a stale lock that is re-created all the time: acquireLock stops at the deadline', async () => {
+      const dir = temp('why-diff-guard-lockre-');
+      const lock = path.join(dir, 'state.lock');
+      // Another writer keeps putting back a stale-looking lock (a hostile or broken peer).
+      const keep = setInterval(() => {
+        try { writeFileSync(lock, '1'); utimesSync(lock, old, old); } catch { /* racing */ }
+      }, 0);
+      try {
+        const t0 = Date.now();
+        await acquireLock(lock, { waitMs: 300, staleMs: 1000 });
+        expect(Date.now() - t0).toBeLessThan(3000);
+      } finally {
+        clearInterval(keep);
+      }
+    }, 10_000);
   });
 
   it('creates the state dir with a * .gitignore', async () => {
