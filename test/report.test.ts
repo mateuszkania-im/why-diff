@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { AttributedHunk, Prompt, Report } from '../src/types.js';
+import { SECTION_END, SECTION_START, sectionBudget, upsertSection } from '../src/pr.js';
 import { renderHtml, renderJson, renderMarkdown, renderReport, renderTerminal, isReportFormat } from '../src/report/index.js';
 import { detectColor } from '../src/report/terminal.js';
 import { collectRisks, describeSessions, groupByPrompt, headline, reportHash, riskRef, truncate } from '../src/report/shared.js';
@@ -349,6 +350,38 @@ describe('renderMarkdown', () => {
     expect(md).toContain('omitted to keep this comment short');
     const tiny = renderMarkdown(big, { maxChars: 4000 });
     expect(tiny.length).toBeLessThanOrEqual(4000);
+  });
+});
+
+describe('renderMarkdown with many long prompts', () => {
+  function promptHeavy(n: number, size: number): Report {
+    const r = clone(sample);
+    const base = r.prompts[0]!;
+    r.prompts = Array.from({ length: n }, (_, i) => ({ ...base, id: `${base.sessionId}:${i}`, index: i, text: `prompt ${i}: ${'please refactor the parser and keep the tests green. '.repeat(Math.ceil(size / 52)).slice(0, size)}` }));
+    return r;
+  }
+  const balanced = (md: string) => (md.match(/<details>/g) ?? []).length === (md.match(/<\/details>/g) ?? []).length;
+
+  it('caps each quoted prompt and keeps <details> balanced within the size limit', () => {
+    const md = renderMarkdown(promptHeavy(40, 3300));
+    expect(md.length).toBeLessThanOrEqual(60_000);
+    expect(balanced(md)).toBe(true);
+    for (const q of md.split('\n').filter((l) => l.startsWith('> prompt '))) expect(q.length).toBeLessThanOrEqual(1503);
+    for (const cap of [4000, 9000, 20_000]) {
+      const small = renderMarkdown(promptHeavy(40, 3300), { maxChars: cap });
+      expect(small.length).toBeLessThanOrEqual(cap);
+      expect(balanced(small)).toBe(true);
+    }
+  });
+
+  it('leaves the PR text after the end marker outside any open block', () => {
+    const body = `Intro\n\n${SECTION_START}\nold\n${SECTION_END}\n\nUser notes after the section.\n`;
+    const md = renderMarkdown(promptHeavy(40, 3300), { maxChars: Math.min(60_000, sectionBudget(body)) });
+    const next = upsertSection(body, md);
+    expect(next.length).toBeLessThanOrEqual(65_536);
+    expect(next.endsWith(`${SECTION_END}\n\nUser notes after the section.\n`)).toBe(true);
+    const section = next.slice(next.indexOf(SECTION_START), next.indexOf(SECTION_END));
+    expect(balanced(section)).toBe(true);
   });
 });
 

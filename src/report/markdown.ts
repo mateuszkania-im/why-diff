@@ -3,7 +3,9 @@
  *
  * Risks come first, then a summary table, then one collapsible <details>
  * per prompt. Output is capped (default 60 000 chars) by progressively
- * dropping hunk rows, never by cutting mid-table.
+ * dropping hunk rows, then risk rows, then whole prompt groups; a last-resort
+ * cut happens only at a line boundary and closes any open <details>. Each
+ * quoted prompt is capped at {@link MAX_QUOTE} characters.
  */
 import type { AttributedHunk, Label, Report } from '../types.js';
 import {
@@ -37,28 +39,58 @@ export interface MarkdownOptions {
 }
 
 const DEFAULT_MAX_CHARS = 60_000;
+/** Longest prompt quote, in characters, before it is cut with an ellipsis. */
+const MAX_QUOTE = 1500;
 
 export function renderMarkdown(report: Report, opts: MarkdownOptions = {}): string {
   const maxChars = opts.maxChars ?? DEFAULT_MAX_CHARS;
   let maxHunks = Math.max(0, opts.maxHunks ?? 200);
   let maxRisks = Math.max(0, opts.maxRisks ?? 30);
-  let md = build(report, { ...opts, maxHunks, maxRisks });
-  // Shrink until it fits: halve the row budgets, then drop them entirely.
+  let maxPrompts = Number.POSITIVE_INFINITY;
+  const render = (): string => build(report, { ...opts, maxHunks, maxRisks, maxPrompts });
+  let md = render();
+  // Shrink until it fits: halve the row budgets, then drop them entirely, then drop prompt groups.
   while (md.length > maxChars && (maxHunks > 0 || maxRisks > 0)) {
     maxHunks = maxHunks > 4 ? Math.floor(maxHunks / 2) : 0;
     maxRisks = maxRisks > 4 ? Math.floor(maxRisks / 2) : 0;
-    md = build(report, { ...opts, maxHunks, maxRisks });
+    md = render();
   }
-  if (md.length > maxChars) {
-    const note = '\n\n_Report truncated to fit the size limit._\n';
-    md = md.slice(0, Math.max(0, maxChars - note.length)) + note;
+  if (md.length > maxChars) maxPrompts = report.prompts.length;
+  while (md.length > maxChars && maxPrompts > 0) {
+    maxPrompts = maxPrompts > 4 ? Math.floor(maxPrompts / 2) : maxPrompts - 1;
+    md = render();
   }
+  if (md.length > maxChars) md = cutAtLine(md, maxChars);
   return md;
+}
+
+/**
+ * Last resort: keep whole lines up to the budget, close every <details> left open and add a
+ * note, so nothing after the report (a PR author's own text) ends up inside an open block.
+ */
+function cutAtLine(md: string, maxChars: number): string {
+  const note = '\n\n_Report truncated to fit the size limit._\n';
+  const lines = md.split('\n');
+  let kept = '';
+  let open = 0;
+  for (const line of lines) {
+    const opens = (line.match(/<details>/g) ?? []).length;
+    const closes = (line.match(/<\/details>/g) ?? []).length;
+    const nextOpen = Math.max(0, open + opens - closes);
+    const candidate = `${kept}${line}\n`;
+    if (candidate.length + nextOpen * '\n</details>'.length + note.length > maxChars) break;
+    kept = candidate;
+    open = nextOpen;
+  }
+  const out = `${kept}${'\n</details>'.repeat(open)}${note}`;
+  return out.length <= maxChars ? out : note.slice(0, maxChars);
 }
 
 interface BuildOpts extends MarkdownOptions {
   maxHunks: number;
   maxRisks: number;
+  /** Prompt groups rendered; the rest are summarised in one line. */
+  maxPrompts: number;
 }
 
 function build(report: Report, o: BuildOpts): string {
@@ -143,7 +175,8 @@ function build(report: Report, o: BuildOpts): string {
   }
 
   if (!scan) out.push(`${sub} Prompts`, '');
-  for (const g of scan ? [] : groups) {
+  const shownGroups = scan ? [] : groups.slice(0, o.maxPrompts);
+  for (const g of shownGroups) {
     const p = g.prompt;
     let added = 0;
     let removed = 0;
@@ -176,6 +209,13 @@ function build(report: Report, o: BuildOpts): string {
       out.push('');
     }
     out.push('</details>');
+    out.push('');
+  }
+
+  if (!scan && shownGroups.length < groups.length) {
+    const rest = groups.slice(shownGroups.length);
+    hidden += rest.reduce((n, g) => n + g.hunks.length, 0);
+    out.push(`_… ${plural(rest.length, 'more prompt')} not shown_`);
     out.push('');
   }
 
@@ -265,5 +305,8 @@ function cell(s: string): string {
 
 /** Blockquote body: escape HTML, keep line breaks as quote continuation. */
 function quote(s: string): string {
-  return text(s.trim()).split(/\r?\n/).join('\n> ');
+  const t = s.trim();
+  const cut = /[\uD800-\uDBFF]/.test(t.charAt(MAX_QUOTE - 1)) ? MAX_QUOTE - 1 : MAX_QUOTE;
+  const capped = t.length > MAX_QUOTE ? `${t.slice(0, cut).trimEnd()}…` : t;
+  return text(capped).split(/\r?\n/).join('\n> ');
 }

@@ -8619,19 +8619,30 @@ function renderJson(report) {
 }
 
 // src/report/markdown.ts
-var DEFAULT_MAX_CHARS = 6e4;
+var DEFAULT_MAX_CHARS = 6e4, MAX_QUOTE = 1500;
 function renderMarkdown(report, opts = {}) {
-  let maxChars = opts.maxChars ?? DEFAULT_MAX_CHARS, maxHunks = Math.max(0, opts.maxHunks ?? 200), maxRisks = Math.max(0, opts.maxRisks ?? 30), md = build(report, { ...opts, maxHunks, maxRisks });
+  let maxChars = opts.maxChars ?? DEFAULT_MAX_CHARS, maxHunks = Math.max(0, opts.maxHunks ?? 200), maxRisks = Math.max(0, opts.maxRisks ?? 30), maxPrompts = Number.POSITIVE_INFINITY, render = () => build(report, { ...opts, maxHunks, maxRisks, maxPrompts }), md = render();
   for (; md.length > maxChars && (maxHunks > 0 || maxRisks > 0); )
-    maxHunks = maxHunks > 4 ? Math.floor(maxHunks / 2) : 0, maxRisks = maxRisks > 4 ? Math.floor(maxRisks / 2) : 0, md = build(report, { ...opts, maxHunks, maxRisks });
-  if (md.length > maxChars) {
-    let note = `
+    maxHunks = maxHunks > 4 ? Math.floor(maxHunks / 2) : 0, maxRisks = maxRisks > 4 ? Math.floor(maxRisks / 2) : 0, md = render();
+  for (md.length > maxChars && (maxPrompts = report.prompts.length); md.length > maxChars && maxPrompts > 0; )
+    maxPrompts = maxPrompts > 4 ? Math.floor(maxPrompts / 2) : maxPrompts - 1, md = render();
+  return md.length > maxChars && (md = cutAtLine(md, maxChars)), md;
+}
+function cutAtLine(md, maxChars) {
+  let note = `
 
 _Report truncated to fit the size limit._
+`, lines = md.split(`
+`), kept = "", open = 0;
+  for (let line of lines) {
+    let opens = (line.match(/<details>/g) ?? []).length, closes = (line.match(/<\/details>/g) ?? []).length, nextOpen = Math.max(0, open + opens - closes), candidate = `${kept}${line}
 `;
-    md = md.slice(0, Math.max(0, maxChars - note.length)) + note;
+    if (candidate.length + nextOpen * 11 + note.length > maxChars) break;
+    kept = candidate, open = nextOpen;
   }
-  return md;
+  let out = `${kept}${`
+</details>`.repeat(open)}${note}`;
+  return out.length <= maxChars ? out : note.slice(0, maxChars);
 }
 function build(report, o) {
   let H = "#".repeat(o.headingLevel ?? 2), sub = H + "#", h = headline(report), s = report.summary, out = [], scan = report.mode === "risk-scan";
@@ -8663,7 +8674,8 @@ function build(report, o) {
     hidden += report.hunks.length - shown.length, budget -= shown.length, shown.length > 0 && out.push(...hunkTable(shown, !1)), out.push("");
   }
   scan || out.push(`${sub} Prompts`, "");
-  for (let g of scan ? [] : groups) {
+  let shownGroups = scan ? [] : groups.slice(0, o.maxPrompts);
+  for (let g of shownGroups) {
     let p = g.prompt, added = 0, removed = 0;
     for (let a of g.hunks) {
       let n = hunkCounts(a.hunk);
@@ -8680,6 +8692,10 @@ function build(report, o) {
       hidden += g.hunks.length - shown.length, budget -= shown.length, shown.length > 0 && out.push(...hunkTable(shown)), shown.length < g.hunks.length && out.push(`_\u2026 ${g.hunks.length - shown.length} more ${g.hunks.length - shown.length === 1 ? "hunk" : "hunks"} not shown_`), out.push("");
     }
     out.push("</details>"), out.push("");
+  }
+  if (!scan && shownGroups.length < groups.length) {
+    let rest = groups.slice(shownGroups.length);
+    hidden += rest.reduce((n, g) => n + g.hunks.length, 0), out.push(`_\u2026 ${plural(rest.length, "more prompt")} not shown_`), out.push("");
   }
   if (!scan && unattributed.length > 0) {
     out.push(`${sub} Unattributed (${unattributed.length})`), out.push(""), out.push("No agent edit explains these hunks: a human change, a tool outside the recorded sessions, or a generated file."), out.push("");
@@ -8726,7 +8742,8 @@ function cell(s) {
   return text(s).replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
 }
 function quote(s) {
-  return text(s.trim()).split(/\r?\n/).join(`
+  let t = s.trim(), cut = /[\uD800-\uDBFF]/.test(t.charAt(MAX_QUOTE - 1)) ? MAX_QUOTE - 1 : MAX_QUOTE, capped = t.length > MAX_QUOTE ? `${t.slice(0, cut).trimEnd()}\u2026` : t;
+  return text(capped).split(/\r?\n/).join(`
 > `);
 }
 
