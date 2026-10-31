@@ -4109,7 +4109,7 @@ function detectPytestOptions(lines, added, base) {
   return hits;
 }
 function detectTestsDisabled(path13, hunk, lines, scope) {
-  let hits = [], base = posix.basename(path13), goneDirs = scope.goneSourceStems.get(testStem(base)) ?? [], sourceGone = goneDirs.some((dir) => relatedDirs(path13, dir, goneDirs.length));
+  let hits = [], base = posix.basename(path13), goneDirs = scope.goneSourceStems.get(testStem(base)) ?? [], sourceGone = goneDirs.some((dir) => relatedDirs(path13, dir, goneDirs.length, scope.pythonPackage));
   if (hunk.status === "deleted" && isTestFile(path13) && !sourceGone && hits.push(`Deletes test file ${base}`), hunk.status === "renamed" && hunk.oldFile && isTestFile(hunk.oldFile)) {
     let oldBase = posix.basename(hunk.oldFile);
     if (oldBase !== base && TEST_BASENAME.test(oldBase)) {
@@ -4157,11 +4157,11 @@ function goneSourceStems(hunks, repoRoot2) {
   return out;
 }
 var LAYOUT_SEGMENTS = /* @__PURE__ */ new Set(["test", "tests", "__tests__", "__test__", "spec", "specs", "src", "lib", "source", "main", "app"]), PY_TEST_NAME = /^test_[^/]*\.py$|_test\.py$/;
-function relatedDirs(testPath, srcDir, candidates) {
+function relatedDirs(testPath, srcDir, candidates, pythonPackage) {
   let testDir = posix.dirname(testPath);
   if (testDir === srcDir) return !0;
   let norm = (dir) => dir.split("/").filter((s) => s && s !== "." && !LAYOUT_SEGMENTS.has(s)).join("/"), t = norm(testDir), src = norm(srcDir);
-  return t === src ? !0 : PY_TEST_NAME.test(posix.basename(testPath)) ? t === "" ? candidates === 1 && sourceLikeDir(srcDir) : src.endsWith(`/${t}`) : !1;
+  return t === src ? !0 : PY_TEST_NAME.test(posix.basename(testPath)) ? t === "" ? candidates === 1 && (pythonPackage?.(srcDir) === !0 || sourceLikeDir(srcDir)) : src.endsWith(`/${t}`) : !1;
 }
 var NON_SOURCE_ROOTS = /* @__PURE__ */ new Set(["tools", "tool", "scripts", "script", "bin", "docs", "doc", "examples", "example", "build", "dist", "vendor", "third_party", "bench", "benchmarks", "migrations", "ci", ".github"]);
 function sourceLikeDir(dir) {
@@ -4643,7 +4643,8 @@ function buildScopeIndex(hunks, ctx) {
 `).toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
     goneSourceStems: goneSourceStems(hunks, ctx.repoRoot),
-    ...ctx.fileText ? { fileText: ctx.fileText } : {}
+    ...ctx.fileText ? { fileText: ctx.fileText } : {},
+    ...ctx.pythonPackage ? { pythonPackage: ctx.pythonPackage } : {}
   };
 }
 var PROMPT_SCAN_CAP = 64 * 1024;
@@ -7835,8 +7836,8 @@ async function buildReport(opts = {}) {
     let kept = attributed.filter((h) => !(isIgnored(h.hunk) && h.match === "none"));
     ignoredHunks = attributed.length - kept.length, attributed = kept;
   }
-  let mode = sessions.length === 0 ? "risk-scan" : "provenance", texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== "deleted").map((h) => h.file))]);
-  attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p), protectedGlob, riskScan: mode === "risk-scan", rulesFiles }), mode === "risk-scan" && (attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== "unattributed") })));
+  let mode = sessions.length === 0 ? "risk-scan" : "provenance", texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== "deleted").map((h) => h.file))]), packages = await pythonPackageDirs(root, baseRev, hunks);
+  attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p), protectedGlob, riskScan: mode === "risk-scan", rulesFiles, pythonPackage: (d) => packages.has(d) }), mode === "risk-scan" && (attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== "unattributed") })));
   let kind = opts.classify ?? "none";
   if (kind !== "none" && attributed.length && mode === "risk-scan")
     log("no agent transcripts, so there are no prompts to check intent against; skipping intent check");
@@ -7882,6 +7883,22 @@ function headRevOf(target) {
   if (typeof target != "string") return;
   let m = /^(?:.*?)\.\.\.?(.*)$/.exec(target);
   return m ? m[1] || "HEAD" : void 0;
+}
+async function pythonPackageDirs(root, rev, hunks) {
+  let dirs = /* @__PURE__ */ new Set();
+  for (let h of hunks) {
+    let gone = h.status === "deleted" ? h.file : h.status === "renamed" && h.oldFile && h.oldFile !== h.file ? h.oldFile : null;
+    gone?.endsWith(".py") && dirs.add(path10.posix.dirname(gone));
+  }
+  let out = /* @__PURE__ */ new Set();
+  for (let dir of dirs) {
+    let init = dir === "." ? "__init__.py" : `${dir}/__init__.py`;
+    try {
+      rev !== void 0 && !rev.startsWith("-") ? await git(root, ["cat-file", "-e", `${rev}:${init}`]) : await lstat2(path10.join(root, init)), out.add(dir);
+    } catch {
+    }
+  }
+  return out;
 }
 function tildify(p, home) {
   if (!home) return p;

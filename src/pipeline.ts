@@ -176,7 +176,8 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   // Without any transcript every hunk would be "unattributed": noise, not a finding.
   const mode: Report['mode'] = sessions.length === 0 ? 'risk-scan' : 'provenance';
   const texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== 'deleted').map((h) => h.file))]);
-  attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p), protectedGlob, riskScan: mode === 'risk-scan', rulesFiles });
+  const packages = await pythonPackageDirs(root, baseRev, hunks);
+  attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p), protectedGlob, riskScan: mode === 'risk-scan', rulesFiles, pythonPackage: (d) => packages.has(d) });
   if (mode === 'risk-scan') attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== 'unattributed') }));
 
   const kind = opts.classify ?? 'none';
@@ -250,6 +251,29 @@ function headRevOf(target: DiffTarget): string | undefined {
   if (typeof target !== 'string') return undefined;
   const m = /^(?:.*?)\.\.\.?(.*)$/.exec(target);
   return m ? m[1] || 'HEAD' : undefined;
+}
+
+/**
+ * Directories of Python sources deleted or renamed away in the diff that are packages: they hold
+ * an `__init__.py` at the base revision (`rev`), or on disk when there is no base commit. One
+ * check per directory.
+ */
+async function pythonPackageDirs(root: string, rev: string | undefined, hunks: Hunk[]): Promise<Set<string>> {
+  const dirs = new Set<string>();
+  for (const h of hunks) {
+    const gone = h.status === 'deleted' ? h.file : h.status === 'renamed' && h.oldFile && h.oldFile !== h.file ? h.oldFile : null;
+    if (gone?.endsWith('.py')) dirs.add(path.posix.dirname(gone));
+  }
+  const out = new Set<string>();
+  for (const dir of dirs) {
+    const init = dir === '.' ? '__init__.py' : `${dir}/__init__.py`;
+    try {
+      if (rev !== undefined && !rev.startsWith('-')) await git(root, ['cat-file', '-e', `${rev}:${init}`]);
+      else await lstat(path.join(root, init));
+      out.add(dir);
+    } catch { /* not a package */ }
+  }
+  return out;
 }
 
 /** Replace a leading home directory with `~` so reports do not leak the user name. */

@@ -418,6 +418,25 @@ describe('report paths', () => {
   });
 });
 
+describe('Python package detection', () => {
+  async function labelsAfterDeleting(withInit: boolean): Promise<string[]> {
+    const repo = freshRepo();
+    put(repo, 'tools/foo.py', 'def foo():\n    return 1\n');
+    if (withInit) put(repo, 'tools/__init__.py', '');
+    put(repo, 'tests/test_foo.py', 'def test_foo():\n    assert True\n');
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-q', '-m', 'base');
+    rmSync(path.join(repo, 'tools', 'foo.py'));
+    rmSync(path.join(repo, 'tests', 'test_foo.py'));
+    const report = await buildReport({ cwd: repo, workingTree: true, home: repo });
+    return report.hunks.find((h) => h.hunk.file === 'tests/test_foo.py')?.labels.map((l) => l.kind) ?? [];
+  }
+  it('pairs a deleted top-level test with its deleted source in a tools/ package that has __init__.py', async () => {
+    expect(await labelsAfterDeleting(true)).not.toContain('tests-disabled');
+    expect(await labelsAfterDeleting(false)).toContain('tests-disabled');
+  });
+});
+
 describe('untracked symlinks', () => {
   it('shows an untracked symlink as git does (its target, mode 120000) and never reads what it points at', async () => {
     const repo = freshRepo();

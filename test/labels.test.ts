@@ -945,6 +945,18 @@ describe('tests-disabled', () => {
     expect(labelsOf('tests/test_foo.py', 'tools/foo.py')).toContain('tests-disabled');
   });
 
+  it('Python: a directory that is a package (__init__.py at the base revision) is source-like whatever its name', () => {
+    const labelsOf = (pkgs: string[], testPath: string, ...srcs: string[]): LabelKind[] => {
+      const test = renameHunk(testPath, '', 'deleted', ['-def test_x(): pass']);
+      const gone = srcs.map((p) => renameHunk(p, '', 'deleted', ['-x = 1']));
+      return labelHunks([test, ...gone], { ...ctx, pythonPackage: (dir: string) => pkgs.includes(dir) })[0]?.labels.map((l) => l.kind) ?? [];
+    };
+    expect(labelsOf(['tools'], 'tests/test_foo.py', 'tools/foo.py')).not.toContain('tests-disabled');
+    expect(labelsOf(['bench/core'], 'tests/test_foo.py', 'bench/core/foo.py')).not.toContain('tests-disabled');
+    expect(labelsOf([], 'tests/test_foo.py', 'tools/foo.py')).toContain('tests-disabled');
+    expect(labelsOf(['scripts'], 'tests/test_foo.py', 'tools/foo.py')).toContain('tests-disabled');
+  });
+
   it.each([
     ['test/index.test.js', 'x/index.js'],
     ['src/test/java/com/a/FooTest.java', 'src/main/java/com/b/Foo.java'],

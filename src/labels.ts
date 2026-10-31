@@ -32,6 +32,11 @@ export interface LabelContext {
   riskScan?: boolean;
   /** Repo-relative team-rules files that changed in this diff (always `protected-path`) */
   rulesFiles?: ReadonlySet<string>;
+  /**
+   * True when a repo-relative directory is a Python package (`__init__.py` at the base revision).
+   * A package directory is source-like whatever its name (`tools/`, `bench/`). Absent: names only.
+   */
+  pythonPackage?: (repoRelDir: string) => boolean;
 }
 
 /** Hard cap for `Label.detail`. */
@@ -632,7 +637,7 @@ function detectTestsDisabled(path: string, hunk: AttributedHunk['hunk'], lines: 
 
   // A test file deleted outright (unless the code it tests is deleted or moved in the same diff).
   const goneDirs = scope.goneSourceStems.get(testStem(base)) ?? [];
-  const sourceGone = goneDirs.some((dir) => relatedDirs(path, dir, goneDirs.length));
+  const sourceGone = goneDirs.some((dir) => relatedDirs(path, dir, goneDirs.length, scope.pythonPackage));
   if (hunk.status === 'deleted' && isTestFile(path) && !sourceGone) {
     hits.push(`Deletes test file ${base}`);
   }
@@ -713,16 +718,17 @@ const PY_TEST_NAME = /^test_[^/]*\.py$|_test\.py$/;
  * `src/main/java/com/a/Foo.java`. A Python test (`test_<stem>.py`, `<stem>_test.py`) in a
  * top-level test tree (`tests/test_foo.py`) pairs with a package source only when it is the one
  * same-stem source gone in the diff (`candidates`) and sits at the repo root, under `src/`/`lib/`
- * or in a package directory, not in a tooling root such as `tools/` or `scripts/`.
+ * or in a package directory, not in a tooling root such as `tools/` or `scripts/` (unless that
+ * directory is a Python package: `__init__.py` at the base revision).
  */
-function relatedDirs(testPath: string, srcDir: string, candidates: number): boolean {
+function relatedDirs(testPath: string, srcDir: string, candidates: number, pythonPackage?: (dir: string) => boolean): boolean {
   const testDir = posix.dirname(testPath);
   if (testDir === srcDir) return true;
   const norm = (dir: string): string => dir.split('/').filter((s) => s && s !== '.' && !LAYOUT_SEGMENTS.has(s)).join('/');
   const t = norm(testDir);
   const src = norm(srcDir);
   if (t === src) return true;
-  if (PY_TEST_NAME.test(posix.basename(testPath))) return t === '' ? candidates === 1 && sourceLikeDir(srcDir) : src.endsWith(`/${t}`);
+  if (PY_TEST_NAME.test(posix.basename(testPath))) return t === '' ? candidates === 1 && (pythonPackage?.(srcDir) === true || sourceLikeDir(srcDir)) : src.endsWith(`/${t}`);
   return false;
 }
 
@@ -1531,6 +1537,7 @@ interface ScopeIndex {
   /** Lower-cased text of each prompt, by id. */
   promptTexts: Map<string, string>;
   fileText?: LabelContext['fileText'];
+  pythonPackage?: LabelContext['pythonPackage'];
 }
 
 function hunkPromptIds(h: AttributedHunk): string[] {
@@ -1574,6 +1581,7 @@ function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
     goneSourceStems: goneSourceStems(hunks, ctx.repoRoot),
     ...(ctx.fileText ? { fileText: ctx.fileText } : {}),
+    ...(ctx.pythonPackage ? { pythonPackage: ctx.pythonPackage } : {}),
   };
 }
 
