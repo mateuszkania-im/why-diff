@@ -3675,7 +3675,7 @@ function computeLabels(h, path12, scope) {
   );
   let skips = detectTestSkips(path12, lines);
   skips.length > 0 && push("test-skip-added", "risk", `Adds ${listOf(skips)}`);
-  let disabled = detectTestsDisabled(path12, h.hunk, lines);
+  let disabled = detectTestsDisabled(path12, h.hunk, lines, scope);
   disabled.length > 0 && push("tests-disabled", "risk", disabled.join("; "));
   let assertions = detectAssertionChanges(path12, lines);
   assertions.length > 0 && push("assertion-removed", "risk", assertions.join("; ")), isSnapshotFile(path12) && push("snapshot-updated", "warn", "Snapshot file changed");
@@ -3927,63 +3927,127 @@ function detectTestSkips(path12, lines) {
   }
   return uniq(hits);
 }
-var IGNORE_KEY = /["']?(exclude|testPathIgnorePatterns|modulePathIgnorePatterns|testIgnore|testIgnorePatterns)["']?\s*[:=]/, BENIGN_IGNORE = /(?:^|[/*<>\s])(?:node_modules|dist|build|coverage|out|\.git|\.next|\.nuxt|\.cache|\.turbo|\.venv|venv|__pycache__|target|vendor|tmp|temp)(?:[/*]|$)/, RUNNER_CONFIG = /^(?:(?:vitest|jest|vite)\.config\.\w+|vitest\.workspace\.\w+|package\.json)$/, PYTEST_CONFIG = /^(?:pytest\.ini|pyproject\.toml|setup\.cfg|tox\.ini)$/, TEST_SCRIPT_KEY = /^\s*"test(?::[\w:.-]+)?"\s*:/, SWALLOW = /(?:--passWithNoTests\b|--no-error-on-unmatched-pattern\b|\|\|\s*(?:true|exit\s+0|:)(?![\w-])|;\s*(?:true|exit\s+0)\s*(?:["',]|$))/, TEST_WORDS = /\b(?:tests?|pytest|jest|vitest|mocha|rspec|phpunit|tox|nextest)\b|go\s+test|cargo\s+test|\bspec\b/i, DISABLED_SUFFIX = /\.(?:disabled?|bak|off|old|orig|skip|skipped|tmp|txt|hidden|ignore)$/i;
-function quotedStrings(text2) {
-  return [...text2.matchAll(/(["'`])((?:\\.|(?!\1).)*)\1/g)].map((m) => m[2] ?? "");
+var JEST_IGNORE_KEYS = /* @__PURE__ */ new Set(["testPathIgnorePatterns", "modulePathIgnorePatterns"]), NON_TEST_SCOPES = /* @__PURE__ */ new Set(["coverage", "optimizeDeps", "ssr", "deps", "server", "build", "typecheck", "benchmark", "nyc"]), RUNNER_CONFIG = /^(?:(?:vitest|jest|vite)\.config\.\w+|vitest\.workspace\.\w+|package\.json)$/, PYTEST_CONFIG = /^(?:pytest\.ini|pyproject\.toml|setup\.cfg|tox\.ini)$/, NOT_A_TEST_ENTRY = /(?:^|[/*<>\s])(?:node_modules|dist|build|coverage|out|\.git|\.next|\.nuxt|\.cache|\.turbo|\.venv|venv|__pycache__|target|vendor|tmp|temp|fixtures?|__fixtures__|__mocks__|mocks?|generated|__generated__|docs?)(?:[/*]|$)|\.d\.ts$|\.stories\.|\.generated\./, TESTISH_ENTRY = /\.(?:test|spec)(?:\.|\b)|(?:^|[/>}\s])(?:__tests__|tests?|specs?)(?:[/*]|$)|(?:^|\/)test_[^/]*|_test\./, BROAD_GLOB = /^(?:\.?\/)?(?:\*\*?\/)*\*+(?:\.\w+)?$|^(?:\.?\/)?(?:src|lib|app|packages|apps)\/\*\*(?:\/\*+)?$/, TEST_SCRIPT_KEY = /^\s*"(test(?::[\w:.-]+)?)"\s*:/, SWALLOW = /(?:--passWithNoTests\b|--no-error-on-unmatched-pattern\b|\|\|\s*(?:true\b|exit\s+0\b|:(?![\w-])|echo\b)|;\s*(?:true|exit\s+0)\s*(?:["',]|$))/, TRIVIAL_SCRIPT = /^\s*(?:exit\s+0|true|:|echo\b.*)\s*$/, TEST_RUNNER = /\b(?:vitest|jest|mocha|pytest|ava|tap|playwright|cypress|karma|jasmine|rspec|phpunit|tox|nextest|(?:go|cargo|bun|deno|dotnet|mvn|gradle|node\s+--|tsx\s+--)\s*test)\b/, RUN_TESTS = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|t)\b(?![\w:-]*results)|\bnpx\s+(?:vitest|jest|mocha|playwright)\b|(?:^|[\s;&|(])(?:vitest|jest|mocha|pytest|tox|rspec|phpunit|nextest)(?![\w-])|\bplaywright\s+test\b|\bcypress\s+run\b|\bgo\s+test\b|\bcargo\s+(?:nextest\s+run|test)\b|\bmvn\b[^\n]*\btest\b|\bgradlew?\b[^\n]*\btest\b|\bdotnet\s+test\b|\bmake\s+(?:test|check)\b|\bbundle\s+exec\s+rspec\b/, DISABLED_SUFFIX = /(?:\.(?:disabled?|skip|skipped|bak|old|orig|txt)|~)$/i, TEST_BASENAME = /(?:\.(?:test|spec|e2e-spec|e2e)\.[^/.]+$|^test_[^/]*\.py$|_test\.(?:py|go)$|_(?:spec|test)\.rb$|[A-Za-z0-9](?:Tests?|IT)\.(?:java|kt|kts|scala|groovy|cs)$)/;
+function testStem(base) {
+  let s = base.replace(/\.[^.]+$/, "");
+  return s = s.replace(/\.(?:test|spec|e2e-spec|e2e)$/, "").replace(/_(?:test|spec)$/, "").replace(/^test_/, ""), s = s.replace(/(?<=[a-z0-9])(?:Tests?|IT)$/, ""), s;
 }
-function isBenignIgnoreList(strings) {
-  return strings.every((s) => BENIGN_IGNORE.test(s) || /^\.?\/?(?:node_modules|dist|build|coverage)$/.test(s));
+function entryDisablesTests(entry, anyEntry) {
+  return !entry || NOT_A_TEST_ENTRY.test(entry) ? !1 : BROAD_GLOB.test(entry) || TESTISH_ENTRY.test(entry) ? !0 : anyEntry;
 }
-function detectTestsDisabled(path12, hunk, lines) {
-  let hits = [], base = posix.basename(path12);
-  if (hunk.status === "deleted" && isTestFile(path12) && hits.push(`Deletes test file ${base}`), hunk.status === "renamed" && hunk.oldFile && isTestFile(hunk.oldFile)) {
-    let oldBase = posix.basename(hunk.oldFile);
-    (oldBase !== base && (base.startsWith(`${oldBase}.`) || DISABLED_SUFFIX.test(base)) || !isTestFile(path12)) && hits.push(`Renames test file ${oldBase} to ${base}`);
-  }
-  let added = new Set(netAdded(lines));
-  if (RUNNER_CONFIG.test(base)) {
-    let openKey = !1;
-    for (let l of lines) {
-      if (l.type === "del") continue;
-      let keyed = IGNORE_KEY.exec(l.text);
-      if (keyed) {
-        let value = l.text.slice(keyed.index + keyed[0].length);
-        if (openKey = /\[\s*[^\]]*$/.test(value), added.has(l)) {
-          let items = quotedStrings(value);
-          items.length > 0 && !isBenignIgnoreList(items) && hits.push(`Adds ${keyed[1]} entry ${items.join(", ")}`);
-        }
+function configStrings(lines) {
+  let out = [], stack = [], lastKey = null;
+  for (let line of lines) {
+    if (line.type === "del") continue;
+    let t = line.text;
+    for (let i = 0; i < t.length; i++) {
+      let ch = t.charAt(i);
+      if (ch === "/" && t.charAt(i + 1) === "/") break;
+      if (ch === '"' || ch === "'" || ch === "`") {
+        let j = i + 1;
+        for (; j < t.length && t.charAt(j) !== ch; ) j += t.charAt(j) === "\\" ? 2 : 1;
+        let text2 = t.slice(i + 1, j), rest = t.slice(j + 1);
+        /^\s*:/.test(rest) ? lastKey = text2 : out.push({ text: text2, path: [...stack], line }), i = j;
         continue;
       }
-      if (openKey && (/\]/.test(l.text) && (openKey = !1), added.has(l))) {
-        let items = quotedStrings(l.text.replace(/\].*$/, ""));
-        items.length > 0 && !isBenignIgnoreList(items) && hits.push(`Adds ignore entry ${items.join(", ")}`);
+      if (/[\w$]/.test(ch)) {
+        let word = /^[\w$.-]+/.exec(t.slice(i))?.[0] ?? ch;
+        /^\s*:/.test(t.slice(i + word.length)) && (lastKey = word), i += word.length - 1;
+        continue;
+      }
+      if (ch === "{" || ch === "[") {
+        let before = t.slice(0, i).trimEnd();
+        stack.push(before.endsWith(":") ? lastKey : null);
+      } else (ch === "}" || ch === "]") && stack.pop();
+    }
+  }
+  return out;
+}
+function detectConfigIgnores(lines, added, base) {
+  let hits = [];
+  for (let s of configStrings(lines)) {
+    if (!added.has(s.line)) continue;
+    let key = s.path[s.path.length - 1] ?? null;
+    if (key) {
+      if (JEST_IGNORE_KEYS.has(key))
+        entryDisablesTests(s.text, key === "testPathIgnorePatterns") && hits.push(`Adds ${key} entry ${s.text}`);
+      else if (key === "exclude" && base !== "package.json") {
+        let keys = s.path.filter((k) => k !== null);
+        keys.includes("test") && !keys.some((k) => NON_TEST_SCOPES.has(k)) && entryDisablesTests(s.text, !1) && hits.push(`Adds test.exclude entry ${s.text}`);
       }
     }
   }
-  if (base === "package.json")
-    for (let l of added)
-      TEST_SCRIPT_KEY.test(l.text) && SWALLOW.test(l.text) && hits.push(`Test script cannot fail: ${l.text.trim()}`);
-  if (PYTEST_CONFIG.test(base))
-    for (let l of added) {
-      let m = /(?:^|[\s"'=])(-k\s*["']?\s*not\b|--deselect\b|--ignore(?:-glob)?\b)(?:[=\s]+(\S+))?/.exec(l.text);
-      m && (m[1]?.startsWith("--ignore") && isBenignIgnoreList([m[2] ?? ""]) || hits.push(`Pytest option ${m[1]?.replace(/\s+/g, " ")} added`));
+  return hits;
+}
+function detectTestScripts(lines, added) {
+  let hits = [], oldValues = /* @__PURE__ */ new Map();
+  for (let l of lines) {
+    if (l.type !== "del") continue;
+    let k = TEST_SCRIPT_KEY.exec(l.text)?.[1];
+    k && oldValues.set(k, l.text);
+  }
+  for (let l of added) {
+    let key = TEST_SCRIPT_KEY.exec(l.text)?.[1];
+    if (!key) continue;
+    let value = /:\s*"((?:\\.|[^"\\])*)"/.exec(l.text)?.[1] ?? "", old = oldValues.get(key);
+    SWALLOW.test(value) || TRIVIAL_SCRIPT.test(value) ? hits.push(`Test script cannot fail: ${l.text.trim()}`) : old !== void 0 && TEST_RUNNER.test(old) && !TEST_RUNNER.test(value) && !/\b(?:npm|pnpm|yarn|bun)\b/.test(value) && hits.push(`Test script no longer runs a test runner: ${l.text.trim()}`);
+  }
+  return hits;
+}
+function detectPytestOptions(lines, added, base) {
+  let hits = [], OPT = /(?:^|[\s"'=,\[])(-k\s*=?\s*["']?\s*not\b|--deselect\b|--ignore(?:-glob)?\b)(?:[=\s]+([^\s"',\]]+))?/, check = (text2) => {
+    let m = OPT.exec(text2);
+    if (!m) return;
+    let opt = (m[1] ?? "").replace(/\s+/g, " ");
+    opt.startsWith("--ignore") && !entryDisablesTests(m[2] ?? "", !0) || hits.push(`Pytest option ${opt} added`);
+  }, inAddopts = !1;
+  for (let l of lines)
+    if (l.type !== "del") {
+      if (/^\s*addopts\s*[=:]/.test(l.text) ? inAddopts = !0 : inAddopts && /^\S/.test(l.text) && !/^\]/.test(l.text) && (inAddopts = !1), inAddopts && added.has(l)) check(l.text);
+      else if (base === "tox.ini" && added.has(l) && /\bpytest\b/.test(l.text) && /^\s*(?:commands\s*=|\w)/.test(l.text)) {
+        let m = /--ignore(?:-glob)?[=\s]+(\S+)/.exec(l.text);
+        m && entryDisablesTests(m[1] ?? "", !0) && TESTISH_ENTRY.test(m[1] ?? "") && hits.push("Pytest option --ignore added");
+      }
     }
-  return isCiFile(path12) && hits.push(...detectCiSwallowedTests(lines, added)), uniq(hits);
+  return hits;
+}
+function detectTestsDisabled(path12, hunk, lines, scope) {
+  let hits = [], base = posix.basename(path12);
+  if (hunk.status === "deleted" && isTestFile(path12) && !scope.goneSourceStems.has(testStem(base)) && hits.push(`Deletes test file ${base}`), hunk.status === "renamed" && hunk.oldFile && isTestFile(hunk.oldFile)) {
+    let oldBase = posix.basename(hunk.oldFile);
+    if (oldBase !== base && TEST_BASENAME.test(oldBase)) {
+      let suffixed = base.startsWith(oldBase) && DISABLED_SUFFIX.test(base.slice(oldBase.length) || " "), markerDropped = !TEST_BASENAME.test(base) && testStem(base) === testStem(oldBase) && !DISABLED_SUFFIX.test(base);
+      (suffixed || markerDropped) && hits.push(`Renames test file ${oldBase} to ${base}`);
+    }
+  }
+  let added = new Set(netAdded(lines));
+  return RUNNER_CONFIG.test(base) && hits.push(...detectConfigIgnores(lines, added, base)), base === "package.json" && hits.push(...detectTestScripts(lines, added)), PYTEST_CONFIG.test(base) && hits.push(...detectPytestOptions(lines, added, base)), isCiFile(path12) && hits.push(...detectCiSwallowedTests(lines, added)), uniq(hits);
+}
+function goneSourceStems(hunks, repoRoot2) {
+  let out = /* @__PURE__ */ new Set();
+  for (let { hunk } of hunks) {
+    let gone = hunk.status === "deleted" ? toRepoPath(hunk.file, repoRoot2) : hunk.status === "renamed" && hunk.oldFile && hunk.oldFile !== hunk.file ? toRepoPath(hunk.oldFile, repoRoot2) : null;
+    gone && !isTestFile(gone) && out.add(testStem(posix.basename(gone)));
+  }
+  return out;
 }
 function detectCiSwallowedTests(lines, added) {
-  let hits = [], kept = lines.filter((l) => l.type !== "del"), stepStart = /^\s*-\s+\S/, block = [], flush = () => {
-    let text2 = block.map((l) => l.text).join(`
+  let hits = [], indentOf = (t) => t.length - t.trimStart().length, stepStart = /^\s*-\s+[\w-]+:/, block = [], boundary = -1, implicit = !1, flush = () => {
+    let runText = block.map((l) => l.text).filter((t) => !/^\s*(?:-\s+)?(?:name|uses|id|if|with|env|working-directory):/.test(t)).join(`
 `);
-    if (TEST_WORDS.test(text2))
+    if (RUN_TESTS.test(runText))
       for (let l of block)
         added.has(l) && /^\s*(?:-\s+)?continue-on-error:\s*true\b/.test(l.text) && hits.push("continue-on-error: true on a test step");
     block = [];
   };
-  for (let l of kept)
-    stepStart.test(l.text) && /^\s*-\s+(?:name|run|uses|id|if|env|with|working-directory):/.test(l.text) && flush(), block.push(l);
+  for (let l of lines) {
+    if (l.type === "del" || !l.text.trim()) continue;
+    let ind = indentOf(l.text);
+    stepStart.test(l.text) && (block.length === 0 || ind <= boundary || implicit) ? (flush(), boundary = ind, implicit = !1) : block.length === 0 ? (boundary = ind - 1, implicit = !0) : ind <= boundary && (flush(), boundary = ind - 1, implicit = !0), block.push(l);
+  }
   flush();
   for (let l of added)
-    TEST_WORDS.test(l.text) && /\|\|\s*(?:true|exit\s+0|:)(?![\w-])/.test(l.text) && hits.push(`Test command cannot fail: ${l.text.trim()}`);
+    RUN_TESTS.test(l.text) && /\|\|\s*(?:true\b|exit\s+0\b|:(?![\w-])|echo\b)/.test(l.text) && hits.push(`Test command cannot fail: ${l.text.trim()}`);
   return hits;
 }
 var MATCHER_ALIASES = {
@@ -4410,7 +4474,8 @@ function buildScopeIndex(hunks, ctx) {
   return {
     promptText: ctx.prompts.map((p) => p.text).join(`
 `).toLowerCase(),
-    agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot)))
+    agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
+    goneSourceStems: goneSourceStems(hunks, ctx.repoRoot)
   };
 }
 function mentioned(token, text2) {

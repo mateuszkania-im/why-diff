@@ -84,7 +84,7 @@ function computeLabels(h: AttributedHunk, path: string, scope: ScopeIndex): Labe
   const skips = detectTestSkips(path, lines);
   if (skips.length > 0) push('test-skip-added', 'risk', `Adds ${listOf(skips)}`);
 
-  const disabled = detectTestsDisabled(path, h.hunk, lines);
+  const disabled = detectTestsDisabled(path, h.hunk, lines, scope);
   if (disabled.length > 0) push('tests-disabled', 'risk', disabled.join('; '));
 
   const assertions = detectAssertionChanges(path, lines);
@@ -446,107 +446,233 @@ function detectTestSkips(path: string, lines: DiffLine[]): string[] {
  * count, so removing such a setting is never flagged. Excludes that name only
  * build output (node_modules, dist, coverage, ...) are ordinary housekeeping.
  */
-const IGNORE_KEY = /["']?(exclude|testPathIgnorePatterns|modulePathIgnorePatterns|testIgnore|testIgnorePatterns)["']?\s*[:=]/;
-const BENIGN_IGNORE = /(?:^|[/*<>\s])(?:node_modules|dist|build|coverage|out|\.git|\.next|\.nuxt|\.cache|\.turbo|\.venv|venv|__pycache__|target|vendor|tmp|temp)(?:[/*]|$)/;
+/** Jest-only keys: whatever they ignore is a test or a module the tests load. */
+const JEST_IGNORE_KEYS: ReadonlySet<string> = new Set(['testPathIgnorePatterns', 'modulePathIgnorePatterns']);
+/** Ancestors that make an `exclude` something other than test discovery. */
+const NON_TEST_SCOPES: ReadonlySet<string> = new Set(['coverage', 'optimizeDeps', 'ssr', 'deps', 'server', 'build', 'typecheck', 'benchmark', 'nyc']);
 const RUNNER_CONFIG = /^(?:(?:vitest|jest|vite)\.config\.\w+|vitest\.workspace\.\w+|package\.json)$/;
 const PYTEST_CONFIG = /^(?:pytest\.ini|pyproject\.toml|setup\.cfg|tox\.ini)$/;
-const TEST_SCRIPT_KEY = /^\s*"test(?::[\w:.-]+)?"\s*:/;
-const SWALLOW = /(?:--passWithNoTests\b|--no-error-on-unmatched-pattern\b|\|\|\s*(?:true|exit\s+0|:)(?![\w-])|;\s*(?:true|exit\s+0)\s*(?:["',]|$))/;
-const TEST_WORDS = /\b(?:tests?|pytest|jest|vitest|mocha|rspec|phpunit|tox|nextest)\b|go\s+test|cargo\s+test|\bspec\b/i;
-const DISABLED_SUFFIX = /\.(?:disabled?|bak|off|old|orig|skip|skipped|tmp|txt|hidden|ignore)$/i;
+/** Entries that are never tests: build output, fixtures, mocks, typings, stories, generated code. */
+const NOT_A_TEST_ENTRY = /(?:^|[/*<>\s])(?:node_modules|dist|build|coverage|out|\.git|\.next|\.nuxt|\.cache|\.turbo|\.venv|venv|__pycache__|target|vendor|tmp|temp|fixtures?|__fixtures__|__mocks__|mocks?|generated|__generated__|docs?)(?:[/*]|$)|\.d\.ts$|\.stories\.|\.generated\./;
+const TESTISH_ENTRY = /\.(?:test|spec)(?:\.|\b)|(?:^|[/>}\s])(?:__tests__|tests?|specs?)(?:[/*]|$)|(?:^|\/)test_[^/]*|_test\./;
+const BROAD_GLOB = /^(?:\.?\/)?(?:\*\*?\/)*\*+(?:\.\w+)?$|^(?:\.?\/)?(?:src|lib|app|packages|apps)\/\*\*(?:\/\*+)?$/;
+const TEST_SCRIPT_KEY = /^\s*"(test(?::[\w:.-]+)?)"\s*:/;
+const SWALLOW = /(?:--passWithNoTests\b|--no-error-on-unmatched-pattern\b|\|\|\s*(?:true\b|exit\s+0\b|:(?![\w-])|echo\b)|;\s*(?:true|exit\s+0)\s*(?:["',]|$))/;
+const TRIVIAL_SCRIPT = /^\s*(?:exit\s+0|true|:|echo\b.*)\s*$/;
+const TEST_RUNNER = /\b(?:vitest|jest|mocha|pytest|ava|tap|playwright|cypress|karma|jasmine|rspec|phpunit|tox|nextest|(?:go|cargo|bun|deno|dotnet|mvn|gradle|node\s+--|tsx\s+--)\s*test)\b/;
+/** A command that actually runs tests (CI `run:` lines). */
+const RUN_TESTS = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|t)\b(?![\w:-]*results)|\bnpx\s+(?:vitest|jest|mocha|playwright)\b|(?:^|[\s;&|(])(?:vitest|jest|mocha|pytest|tox|rspec|phpunit|nextest)(?![\w-])|\bplaywright\s+test\b|\bcypress\s+run\b|\bgo\s+test\b|\bcargo\s+(?:nextest\s+run|test)\b|\bmvn\b[^\n]*\btest\b|\bgradlew?\b[^\n]*\btest\b|\bdotnet\s+test\b|\bmake\s+(?:test|check)\b|\bbundle\s+exec\s+rspec\b/;
+const DISABLED_SUFFIX = /(?:\.(?:disabled?|skip|skipped|bak|old|orig|txt)|~)$/i;
+const TEST_BASENAME = /(?:\.(?:test|spec|e2e-spec|e2e)\.[^/.]+$|^test_[^/]*\.py$|_test\.(?:py|go)$|_(?:spec|test)\.rb$|[A-Za-z0-9](?:Tests?|IT)\.(?:java|kt|kts|scala|groovy|cs)$)/;
+
+/** File name without extension and without test markers, so `a.test.js`, `a_test.go` and `a.js` share the stem `a`. */
+function testStem(base: string): string {
+  let s = base.replace(/\.[^.]+$/, '');
+  s = s.replace(/\.(?:test|spec|e2e-spec|e2e)$/, '').replace(/_(?:test|spec)$/, '').replace(/^test_/, '');
+  s = s.replace(/(?<=[a-z0-9])(?:Tests?|IT)$/, '');
+  return s;
+}
 
 function quotedStrings(text: string): string[] {
   return [...text.matchAll(/(["'`])((?:\\.|(?!\1).)*)\1/g)].map((m) => m[2] ?? '');
 }
 
-function isBenignIgnoreList(strings: string[]): boolean {
-  return strings.every((s) => BENIGN_IGNORE.test(s) || /^\.?\/?(?:node_modules|dist|build|coverage)$/.test(s));
+/** Does an ignore entry take tests out of the run? `anyEntry`: the key itself is test-specific (jest). */
+function entryDisablesTests(entry: string, anyEntry: boolean): boolean {
+  if (!entry || NOT_A_TEST_ENTRY.test(entry)) return false;
+  if (BROAD_GLOB.test(entry) || TESTISH_ENTRY.test(entry)) return true;
+  return anyEntry;
 }
 
-function detectTestsDisabled(path: string, hunk: AttributedHunk['hunk'], lines: DiffLine[]): string[] {
+interface ConfigString {
+  text: string;
+  /** Keys of the enclosing objects/arrays, outermost first, as far as the hunk shows them. */
+  path: Array<string | null>;
+  line: DiffLine;
+}
+
+/**
+ * Walk the visible (context and added) lines as one JS/JSON token stream and
+ * report every string value together with the keys that enclose it.
+ */
+function configStrings(lines: DiffLine[]): ConfigString[] {
+  const out: ConfigString[] = [];
+  const stack: Array<string | null> = [];
+  let lastKey: string | null = null;
+  for (const line of lines) {
+    if (line.type === 'del') continue;
+    const t = line.text;
+    for (let i = 0; i < t.length; i++) {
+      const ch = t.charAt(i);
+      if (ch === '/' && t.charAt(i + 1) === '/') break;
+      if (ch === '"' || ch === "'" || ch === '`') {
+        let j = i + 1;
+        while (j < t.length && t.charAt(j) !== ch) j += t.charAt(j) === '\\' ? 2 : 1;
+        const text = t.slice(i + 1, j);
+        const rest = t.slice(j + 1);
+        if (/^\s*:/.test(rest)) lastKey = text;
+        else out.push({ text, path: [...stack], line });
+        i = j;
+        continue;
+      }
+      if (/[\w$]/.test(ch)) {
+        const m = /^[\w$.-]+/.exec(t.slice(i));
+        const word = m?.[0] ?? ch;
+        if (/^\s*:/.test(t.slice(i + word.length))) lastKey = word;
+        i += word.length - 1;
+        continue;
+      }
+      if (ch === '{' || ch === '[') {
+        const before = t.slice(0, i).trimEnd();
+        stack.push(before.endsWith(':') ? lastKey : null);
+      } else if (ch === '}' || ch === ']') {
+        stack.pop();
+      }
+    }
+  }
+  return out;
+}
+
+function detectConfigIgnores(lines: DiffLine[], added: Set<DiffLine>, base: string): string[] {
+  const hits: string[] = [];
+  for (const s of configStrings(lines)) {
+    if (!added.has(s.line)) continue;
+    const key = s.path[s.path.length - 1] ?? null;
+    if (!key) continue;
+    if (JEST_IGNORE_KEYS.has(key)) {
+      if (entryDisablesTests(s.text, key === 'testPathIgnorePatterns')) hits.push(`Adds ${key} entry ${s.text}`);
+    } else if (key === 'exclude' && base !== 'package.json') {
+      const keys = s.path.filter((k): k is string => k !== null);
+      if (keys.includes('test') && !keys.some((k) => NON_TEST_SCOPES.has(k)) && entryDisablesTests(s.text, false)) {
+        hits.push(`Adds test.exclude entry ${s.text}`);
+      }
+    }
+  }
+  return hits;
+}
+
+/** package.json `test` scripts that can no longer fail or no longer run a test runner. */
+function detectTestScripts(lines: DiffLine[], added: Set<DiffLine>): string[] {
+  const hits: string[] = [];
+  const oldValues = new Map<string, string>();
+  for (const l of lines) {
+    if (l.type !== 'del') continue;
+    const k = TEST_SCRIPT_KEY.exec(l.text)?.[1];
+    if (k) oldValues.set(k, l.text);
+  }
+  for (const l of added) {
+    const key = TEST_SCRIPT_KEY.exec(l.text)?.[1];
+    if (!key) continue;
+    const value = /:\s*"((?:\\.|[^"\\])*)"/.exec(l.text)?.[1] ?? '';
+    const old = oldValues.get(key);
+    if (SWALLOW.test(value) || TRIVIAL_SCRIPT.test(value)) hits.push(`Test script cannot fail: ${l.text.trim()}`);
+    else if (old !== undefined && TEST_RUNNER.test(old) && !TEST_RUNNER.test(value) && !/\b(?:npm|pnpm|yarn|bun)\b/.test(value)) {
+      hits.push(`Test script no longer runs a test runner: ${l.text.trim()}`);
+    }
+  }
+  return hits;
+}
+
+/** pytest options that deselect tests, only inside `addopts` (or a tox `pytest` command). */
+function detectPytestOptions(lines: DiffLine[], added: Set<DiffLine>, base: string): string[] {
+  const hits: string[] = [];
+  const OPT = /(?:^|[\s"'=,\[])(-k\s*=?\s*["']?\s*not\b|--deselect\b|--ignore(?:-glob)?\b)(?:[=\s]+([^\s"',\]]+))?/;
+  const check = (text: string): void => {
+    const m = OPT.exec(text);
+    if (!m) return;
+    const opt = (m[1] ?? '').replace(/\s+/g, ' ');
+    if (opt.startsWith('--ignore') && !entryDisablesTests(m[2] ?? '', true)) return;
+    hits.push(`Pytest option ${opt} added`);
+  };
+  let inAddopts = false;
+  for (const l of lines) {
+    if (l.type === 'del') continue;
+    if (/^\s*addopts\s*[=:]/.test(l.text)) inAddopts = true;
+    else if (inAddopts && /^\S/.test(l.text) && !/^\]/.test(l.text)) inAddopts = false;
+    if (inAddopts && added.has(l)) check(l.text);
+    else if (base === 'tox.ini' && added.has(l) && /\bpytest\b/.test(l.text) && /^\s*(?:commands\s*=|\w)/.test(l.text)) {
+      const m = /--ignore(?:-glob)?[=\s]+(\S+)/.exec(l.text);
+      if (m && entryDisablesTests(m[1] ?? '', true) && TESTISH_ENTRY.test(m[1] ?? '')) hits.push('Pytest option --ignore added');
+    }
+  }
+  return hits;
+}
+
+function detectTestsDisabled(path: string, hunk: AttributedHunk['hunk'], lines: DiffLine[], scope: ScopeIndex): string[] {
   const hits: string[] = [];
   const base = posix.basename(path);
 
-  // Renamed away from a test name, or a test file deleted outright.
-  if (hunk.status === 'deleted' && isTestFile(path)) hits.push(`Deletes test file ${base}`);
+  // A test file deleted outright (unless the code it tests is deleted or moved in the same diff).
+  if (hunk.status === 'deleted' && isTestFile(path) && !scope.goneSourceStems.has(testStem(base))) {
+    hits.push(`Deletes test file ${base}`);
+  }
+  // A test file renamed so the runner no longer finds it.
   if (hunk.status === 'renamed' && hunk.oldFile && isTestFile(hunk.oldFile)) {
     const oldBase = posix.basename(hunk.oldFile);
-    const moved = oldBase !== base && (base.startsWith(`${oldBase}.`) || DISABLED_SUFFIX.test(base));
-    if (moved || !isTestFile(path)) hits.push(`Renames test file ${oldBase} to ${base}`);
+    if (oldBase !== base && TEST_BASENAME.test(oldBase)) {
+      const suffixed = base.startsWith(oldBase) && DISABLED_SUFFIX.test(base.slice(oldBase.length) || ' ');
+      const markerDropped = !TEST_BASENAME.test(base) && testStem(base) === testStem(oldBase) && !DISABLED_SUFFIX.test(base);
+      if (suffixed || markerDropped) hits.push(`Renames test file ${oldBase} to ${base}`);
+    }
   }
 
   const added = new Set(netAdded(lines));
-
-  // Ignore lists in runner config (key on the line, or an item under an open list).
-  if (RUNNER_CONFIG.test(base)) {
-    let openKey = false;
-    for (const l of lines) {
-      if (l.type === 'del') continue;
-      const keyed = IGNORE_KEY.exec(l.text);
-      if (keyed) {
-        const value = l.text.slice(keyed.index + keyed[0].length);
-        openKey = /\[\s*[^\]]*$/.test(value);
-        if (added.has(l)) {
-          const items = quotedStrings(value);
-          if (items.length > 0 && !isBenignIgnoreList(items)) hits.push(`Adds ${keyed[1]} entry ${items.join(', ')}`);
-        }
-        continue;
-      }
-      if (openKey) {
-        if (/\]/.test(l.text)) openKey = false;
-        if (added.has(l)) {
-          const items = quotedStrings(l.text.replace(/\].*$/, ''));
-          if (items.length > 0 && !isBenignIgnoreList(items)) hits.push(`Adds ignore entry ${items.join(', ')}`);
-        }
-      }
-    }
-  }
-
-  // package.json "test" scripts that can no longer fail.
-  if (base === 'package.json') {
-    for (const l of added) {
-      if (TEST_SCRIPT_KEY.test(l.text) && SWALLOW.test(l.text)) hits.push(`Test script cannot fail: ${l.text.trim()}`);
-    }
-  }
-
-  // pytest options that skip tests.
-  if (PYTEST_CONFIG.test(base)) {
-    for (const l of added) {
-      const m = /(?:^|[\s"'=])(-k\s*["']?\s*not\b|--deselect\b|--ignore(?:-glob)?\b)(?:[=\s]+(\S+))?/.exec(l.text);
-      if (!m) continue;
-      if (m[1]?.startsWith('--ignore') && isBenignIgnoreList([m[2] ?? ''])) continue;
-      hits.push(`Pytest option ${m[1]?.replace(/\s+/g, ' ')} added`);
-    }
-  }
-
-  // CI: failures swallowed on a test step.
+  if (RUNNER_CONFIG.test(base)) hits.push(...detectConfigIgnores(lines, added, base));
+  if (base === 'package.json') hits.push(...detectTestScripts(lines, added));
+  if (PYTEST_CONFIG.test(base)) hits.push(...detectPytestOptions(lines, added, base));
   if (isCiFile(path)) hits.push(...detectCiSwallowedTests(lines, added));
-
   return uniq(hits);
+}
+
+/** Stems of non-test source files deleted or renamed away anywhere in the diff. */
+function goneSourceStems(hunks: AttributedHunk[], repoRoot: string): Set<string> {
+  const out = new Set<string>();
+  for (const { hunk } of hunks) {
+    const gone = hunk.status === 'deleted' ? toRepoPath(hunk.file, repoRoot) : hunk.status === 'renamed' && hunk.oldFile && hunk.oldFile !== hunk.file ? toRepoPath(hunk.oldFile, repoRoot) : null;
+    if (gone && !isTestFile(gone)) out.add(testStem(posix.basename(gone)));
+  }
+  return out;
 }
 
 function detectCiSwallowedTests(lines: DiffLine[], added: Set<DiffLine>): string[] {
   const hits: string[] = [];
-  const kept = lines.filter((l) => l.type !== 'del');
-  const stepStart = /^\s*-\s+\S/;
+  const indentOf = (t: string): number => t.length - t.trimStart().length;
+  const stepStart = /^\s*-\s+[\w-]+:/;
   let block: DiffLine[] = [];
+  let boundary = -1; // content must be indented deeper than this
+  let implicit = false;
   const flush = (): void => {
-    const text = block.map((l) => l.text).join('\n');
-    if (TEST_WORDS.test(text)) {
+    // Only `run:` content decides whether the step runs tests; names and `uses:` do not.
+    const runText = block.map((l) => l.text).filter((t) => !/^\s*(?:-\s+)?(?:name|uses|id|if|with|env|working-directory):/.test(t)).join('\n');
+    if (RUN_TESTS.test(runText)) {
       for (const l of block) {
-        if (!added.has(l)) continue;
-        if (/^\s*(?:-\s+)?continue-on-error:\s*true\b/.test(l.text)) hits.push('continue-on-error: true on a test step');
+        if (added.has(l) && /^\s*(?:-\s+)?continue-on-error:\s*true\b/.test(l.text)) hits.push('continue-on-error: true on a test step');
       }
     }
     block = [];
   };
-  for (const l of kept) {
-    if (stepStart.test(l.text) && /^\s*-\s+(?:name|run|uses|id|if|env|with|working-directory):/.test(l.text)) flush();
+  for (const l of lines) {
+    if (l.type === 'del') continue;
+    if (!l.text.trim()) continue;
+    const ind = indentOf(l.text);
+    if (stepStart.test(l.text) && (block.length === 0 || ind <= boundary || implicit)) {
+      flush();
+      boundary = ind;
+      implicit = false;
+    } else if (block.length === 0) {
+      // Hunk starts mid-step: content at this indent or deeper belongs to it.
+      boundary = ind - 1;
+      implicit = true;
+    } else if (ind <= boundary) {
+      flush();
+      boundary = ind - 1;
+      implicit = true;
+    }
     block.push(l);
   }
   flush();
   for (const l of added) {
-    if (TEST_WORDS.test(l.text) && /\|\|\s*(?:true|exit\s+0|:)(?![\w-])/.test(l.text)) hits.push(`Test command cannot fail: ${l.text.trim()}`);
+    if (RUN_TESTS.test(l.text) && /\|\|\s*(?:true\b|exit\s+0\b|:(?![\w-])|echo\b)/.test(l.text)) hits.push(`Test command cannot fail: ${l.text.trim()}`);
   }
   return hits;
 }
@@ -1281,12 +1407,15 @@ interface ScopeIndex {
   promptText: string;
   /** Distinct repo paths of agent-attributed hunks. */
   agentFiles: string[];
+  /** Stems of source files deleted or renamed away anywhere in the diff. */
+  goneSourceStems: Set<string>;
 }
 
 function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex {
   return {
     promptText: ctx.prompts.map((p) => p.text).join('\n').toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
+    goneSourceStems: goneSourceStems(hunks, ctx.repoRoot),
   };
 }
 

@@ -309,3 +309,21 @@ describe('untracked size cap', () => {
     expect(diff).not.toContain('big.txt');
   });
 });
+
+describe('tests-disabled end to end', () => {
+  it('flags a test file removed with git rm', async () => {
+    const repo = freshRepo();
+    put(repo, 'src/a.js', 'export const a = 1;\n');
+    put(repo, 'test/a.test.js', 'import { a } from "../src/a.js";\nit("works", () => { expect(a).toBe(1); });\n');
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-q', '-m', 'init');
+    sh(repo, 'rm', '-q', 'test/a.test.js');
+    const home = tempDir('why-diff-home-');
+    dirs.push(home);
+    const report = await buildReport({ cwd: repo, workingTree: true, home, harnesses: ['claude-code'] });
+    const h = report.hunks.find((x) => x.hunk.file === 'test/a.test.js');
+    expect(h?.hunk.status).toBe('deleted');
+    expect(h?.labels.map((l) => l.kind)).toEqual(expect.arrayContaining(['tests-disabled', 'test-modified']));
+  });
+});
+
