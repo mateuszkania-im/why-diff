@@ -1459,10 +1459,10 @@ interface ScopeIndex {
   agentFiles: string[];
   /** Stems of source files deleted or renamed away anywhere in the diff. */
   goneSourceStems: Set<string>;
-  /** Directories the agent worked in or was pointed at, per prompt id (created files, files and paths the prompt mentions). */
+  /** Directories each prompt points at: dirs of touched files it names by basename/stem, and dirs of path-like tokens in it. */
   promptDirs: Map<string, Set<string>>;
-  /** Repo paths of files an agent `write` created or the diff adds, per hunk path. */
-  createdFiles: Set<string>;
+  /** Distinct repo paths of the agent-attributed hunks each prompt produced. */
+  promptFiles: Map<string, string[]>;
   fileText?: LabelContext['fileText'];
 }
 
@@ -1472,8 +1472,8 @@ function hunkPromptIds(h: AttributedHunk): string[] {
 
 function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex {
   const agent = hunks.filter(isAgentAttributed);
-  const createdFiles = new Set<string>();
   const promptDirs = new Map<string, Set<string>>();
+  const promptFiles = new Map<string, string[]>();
   const dirsOf = (id: string): Set<string> => {
     let d = promptDirs.get(id);
     if (!d) promptDirs.set(id, (d = new Set()));
@@ -1481,23 +1481,25 @@ function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex
   };
   for (const h of agent) {
     const path = toRepoPath(h.hunk.file, ctx.repoRoot);
-    const created = h.hunk.status === 'added' || h.edits.some((e) => e.kind === 'write' && e.failed !== true);
-    if (created) createdFiles.add(path);
     for (const id of hunkPromptIds(h)) {
+      promptFiles.set(id, uniq([...(promptFiles.get(id) ?? []), path]));
       const text = ctx.prompts.find((p) => p.id === id)?.text.toLowerCase() ?? '';
-      if (created || fileMentioned(path, text)) dirsOf(id).add(posix.dirname(path));
+      if (fileMentioned(path, text)) dirsOf(id).add(posix.dirname(path));
     }
   }
   for (const p of ctx.prompts) {
-    // Path-like tokens ("src/cart.js") name their directory directly.
-    for (const m of p.text.matchAll(/[\w@.-]+(?:\/[\w@.-]+)+/g)) {
-      const dir = posix.dirname(m[0].replace(/^\.\//, ''));
+    // Path-like tokens ("src/cart.js") name their directory directly. URLs and domain-like tokens are not paths.
+    const text = p.text.replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, ' ');
+    for (const m of text.matchAll(/[\w@.-]+(?:\/[\w@.-]+)+/g)) {
+      const token = m[0].replace(/^\.\//, '');
+      if (/^[\w-]+\.[a-z]{2,}\//i.test(token)) continue;
+      const dir = posix.dirname(token);
       if (dir !== '.') dirsOf(p.id).add(dir);
     }
   }
   return {
     promptDirs,
-    createdFiles,
+    promptFiles,
     promptText: ctx.prompts.map((p) => p.text).join('\n').toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
     goneSourceStems: goneSourceStems(hunks, ctx.repoRoot),
@@ -1524,6 +1526,14 @@ function mentioned(token: string, text: string): boolean {
   return false;
 }
 
+/** Same directory, or both at least two levels deep and sharing the first two segments (src/parser vs src/parser/ast). */
+function sameArea(a: string, b: string): boolean {
+  if (a === b) return true;
+  const ka = a.split('/').slice(0, 2);
+  const kb = b.split('/').slice(0, 2);
+  return ka.length === 2 && kb.length === 2 && ka.join('/') === kb.join('/');
+}
+
 /** True when one directory equals or contains the other (repo root contains nothing). */
 function related(a: string, b: string): boolean {
   if (a === b) return true;
@@ -1532,13 +1542,17 @@ function related(a: string, b: string): boolean {
 }
 
 /**
- * Heuristic, agent-attributed hunks only. A file is out of scope when BOTH:
+ * Heuristic, agent-attributed hunks only. Creating a file does not put it in
+ * scope. A file is in scope when ANY of:
  *
- * - no prompt mentions it: neither its basename, its basename without the
- *   extension (>= 4 chars), nor any directory segment of >= 4 chars appears as
- *   a whole word in any prompt; and
- * - it sits away from the agent's other work: fewer than half of the other
- *   agent-touched files live in the same directory or an ancestor/descendant.
+ * - a prompt mentions it: its basename, its basename without the extension
+ *   (>= 4 chars), or a directory segment of >= 4 chars appears as a whole word
+ *   in any prompt;
+ * - the prompt that produced it points at its area: it shares a directory (or
+ *   the first two path segments) with a file or path that prompt mentions;
+ * - it sits with the rest of that prompt's work: more than half of the other
+ *   files the same prompt touched live in the same directory or an
+ *   ancestor/descendant.
  *
  * Skipped when there are no prompts or the agent touched a single file, and
  * for lockfiles and snapshots (derived artefacts of an in-scope change).
@@ -1547,17 +1561,19 @@ function outOfScopeReason(path: string, scope: ScopeIndex, ids: string[]): strin
   if (!scope.promptText || isLockfile(path) || isSnapshotFile(path)) return null;
   const base = posix.basename(path);
   const stem = base.replace(/\.[^.]+$/, '');
-  const segments = posix.dirname(path).split('/').filter((s) => s.length >= 4 && s !== '.');
+  const dir = posix.dirname(path);
+  const segments = dir.split('/').filter((s) => s.length >= 4 && s !== '.');
   const tokens = [base, ...(stem.length >= 4 ? [stem] : []), ...segments];
   if (tokens.some((t) => mentioned(t, scope.promptText))) return null;
-  if (scope.createdFiles.has(path)) return null;
-  const dirOfFile = posix.dirname(path);
-  for (const id of ids) if (scope.promptDirs.get(id)?.has(dirOfFile)) return null;
+  for (const id of ids) {
+    for (const d of scope.promptDirs.get(id) ?? []) if (d !== '.' && sameArea(d, dir)) return null;
+  }
 
-  const others = scope.agentFiles.filter((f) => f !== path);
-  if (others.length === 0) return null;
-  const dir = posix.dirname(path);
-  const near = others.filter((f) => related(posix.dirname(f), dir)).length;
-  if (near / others.length >= 0.5) return null;
+  if (scope.agentFiles.every((f) => f === path)) return null;
+  const others = uniq(ids.flatMap((id) => scope.promptFiles.get(id) ?? [])).filter((f) => f !== path);
+  if (others.length > 0) {
+    const near = others.filter((f) => related(posix.dirname(f), dir)).length;
+    if (near / others.length > 0.5) return null;
+  }
   return `Not mentioned in any prompt and away from the agent's other edits (${dir === '.' ? 'repo root' : `${dir}/`})`;
 }

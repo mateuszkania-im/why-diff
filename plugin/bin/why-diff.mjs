@@ -4504,26 +4504,30 @@ function hunkPromptIds(h) {
   return uniq([...h.prompt ? [h.prompt.id] : [], ...h.edits.filter((e) => e.failed !== !0).map((e) => e.promptId)]);
 }
 function buildScopeIndex(hunks, ctx) {
-  let agent = hunks.filter(isAgentAttributed), createdFiles = /* @__PURE__ */ new Set(), promptDirs = /* @__PURE__ */ new Map(), dirsOf = (id) => {
+  let agent = hunks.filter(isAgentAttributed), promptDirs = /* @__PURE__ */ new Map(), promptFiles = /* @__PURE__ */ new Map(), dirsOf = (id) => {
     let d = promptDirs.get(id);
     return d || promptDirs.set(id, d = /* @__PURE__ */ new Set()), d;
   };
   for (let h of agent) {
-    let path12 = toRepoPath(h.hunk.file, ctx.repoRoot), created = h.hunk.status === "added" || h.edits.some((e) => e.kind === "write" && e.failed !== !0);
-    created && createdFiles.add(path12);
+    let path12 = toRepoPath(h.hunk.file, ctx.repoRoot);
     for (let id of hunkPromptIds(h)) {
+      promptFiles.set(id, uniq([...promptFiles.get(id) ?? [], path12]));
       let text2 = ctx.prompts.find((p) => p.id === id)?.text.toLowerCase() ?? "";
-      (created || fileMentioned(path12, text2)) && dirsOf(id).add(posix.dirname(path12));
+      fileMentioned(path12, text2) && dirsOf(id).add(posix.dirname(path12));
     }
   }
-  for (let p of ctx.prompts)
-    for (let m of p.text.matchAll(/[\w@.-]+(?:\/[\w@.-]+)+/g)) {
-      let dir = posix.dirname(m[0].replace(/^\.\//, ""));
+  for (let p of ctx.prompts) {
+    let text2 = p.text.replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, " ");
+    for (let m of text2.matchAll(/[\w@.-]+(?:\/[\w@.-]+)+/g)) {
+      let token = m[0].replace(/^\.\//, "");
+      if (/^[\w-]+\.[a-z]{2,}\//i.test(token)) continue;
+      let dir = posix.dirname(token);
       dir !== "." && dirsOf(p.id).add(dir);
     }
+  }
   return {
     promptDirs,
-    createdFiles,
+    promptFiles,
     promptText: ctx.prompts.map((p) => p.text).join(`
 `).toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
@@ -4544,19 +4548,23 @@ function mentioned(token, text2) {
   }
   return !1;
 }
+function sameArea(a, b) {
+  if (a === b) return !0;
+  let ka = a.split("/").slice(0, 2), kb = b.split("/").slice(0, 2);
+  return ka.length === 2 && kb.length === 2 && ka.join("/") === kb.join("/");
+}
 function related(a, b) {
   return a === b ? !0 : a === "." || b === "." ? !1 : a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 function outOfScopeReason(path12, scope, ids) {
   if (!scope.promptText || isLockfile(path12) || isSnapshotFile(path12)) return null;
-  let base = posix.basename(path12), stem = base.replace(/\.[^.]+$/, ""), segments = posix.dirname(path12).split("/").filter((s) => s.length >= 4 && s !== ".");
-  if ([base, ...stem.length >= 4 ? [stem] : [], ...segments].some((t) => mentioned(t, scope.promptText)) || scope.createdFiles.has(path12)) return null;
-  let dirOfFile = posix.dirname(path12);
-  for (let id of ids) if (scope.promptDirs.get(id)?.has(dirOfFile)) return null;
-  let others = scope.agentFiles.filter((f) => f !== path12);
-  if (others.length === 0) return null;
-  let dir = posix.dirname(path12);
-  return others.filter((f) => related(posix.dirname(f), dir)).length / others.length >= 0.5 ? null : `Not mentioned in any prompt and away from the agent's other edits (${dir === "." ? "repo root" : `${dir}/`})`;
+  let base = posix.basename(path12), stem = base.replace(/\.[^.]+$/, ""), dir = posix.dirname(path12), segments = dir.split("/").filter((s) => s.length >= 4 && s !== ".");
+  if ([base, ...stem.length >= 4 ? [stem] : [], ...segments].some((t) => mentioned(t, scope.promptText))) return null;
+  for (let id of ids)
+    for (let d of scope.promptDirs.get(id) ?? []) if (d !== "." && sameArea(d, dir)) return null;
+  if (scope.agentFiles.every((f) => f === path12)) return null;
+  let others = uniq(ids.flatMap((id) => scope.promptFiles.get(id) ?? [])).filter((f) => f !== path12);
+  return others.length > 0 && others.filter((f) => related(posix.dirname(f), dir)).length / others.length > 0.5 ? null : `Not mentioned in any prompt and away from the agent's other edits (${dir === "." ? "repo root" : `${dir}/`})`;
 }
 
 // src/types.ts

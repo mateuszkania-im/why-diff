@@ -734,6 +734,36 @@ describe('out-of-scope', () => {
     const far = hunk('lib/other/x.ts', ['+z']);
     const out = labelHunks([a, b, far, hunk('docs/guide/readme.md', ['+q'])], { repoRoot: '/repo', prompts: [prompt('fix src/cart.js')] });
     expect(out[1]?.labels.map((l) => l.kind)).not.toContain('out-of-scope');
+    expect(out[2]?.labels.map((l) => l.kind)).toContain('out-of-scope');
+  });
+
+  const written = (file: string): AttributedHunk => {
+    const h = hunk(file, ['+x']);
+    h.hunk.status = 'added';
+    h.edits = h.edits.map((e) => ({ ...e, kind: 'write', tool: 'Write' }));
+    return h;
+  };
+  const flagged = (h: AttributedHunk | undefined): boolean => !!h?.labels.some((l) => l.kind === 'out-of-scope');
+
+  it('flags files the agent creates in unrelated areas while working on src/cart.js', () => {
+    const out = labelHunks([hunk('src/cart.js', ['+x']), written('infra/terraform/main.tf')], { repoRoot: '/repo', prompts: [prompt('fix src/cart.js')] });
+    expect(flagged(out[1])).toBe(true);
+    const two = labelHunks(
+      [hunk('src/cart.js', ['+x']), written('infra/terraform/main.tf'), hunk('infra/terraform/other.tf', ['+y'])],
+      { repoRoot: '/repo', prompts: [prompt('fix src/cart.js')] },
+    );
+    expect(flagged(two[1])).toBe(true);
+    expect(flagged(two[2])).toBe(true);
+    const ci = labelHunks([hunk('src/cart.js', ['+x']), written('.github/workflows/deploy.yml')], { repoRoot: '/repo', prompts: [prompt('fix src/cart.js')] });
+    expect(flagged(ci[1])).toBe(true);
+  });
+
+  it('does not treat URLs in a prompt as paths', () => {
+    const out = labelHunks([hunk('src/cart.js', ['+x']), hunk('ab/cd/ref.md', ['+y'])], {
+      repoRoot: '/repo',
+      prompts: [prompt('fix src/cart.js, see https://example.com/ab/cd/z and example.com/ab/cd/y')],
+    });
+    expect(flagged(out[1])).toBe(true);
   });
 
   it('still flags an unrelated infra file when the prompt is about src/cart.js', () => {
