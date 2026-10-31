@@ -1,10 +1,10 @@
 {
-  "description": "why-diff guard: stop the agent from finishing silently after skipping, weakening or deleting tests, or touching CI and secrets.",
+  "description": "why-diff guard: stop the agent from finishing silently after skipping, weakening or deleting tests, or touching CI and secrets. Runs the bundled CLI locally (no network, ~0.1 s).",
   "hooks": {
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "npx -y github:mateuszkania-im/why-diff guard", "timeout": 60 }
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/why-diff.mjs\" guard", "timeout": 30 }
         ]
       }
     ]

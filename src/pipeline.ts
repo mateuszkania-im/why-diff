@@ -49,7 +49,11 @@ export interface BuildOptions {
   onProgress?: (msg: string) => void;
 }
 
+/** Injected by the standalone build (scripts/build.mjs); absent under tsx/vitest. */
+declare const __WHY_DIFF_VERSION__: string | undefined;
+
 async function readVersion(): Promise<string> {
+  if (typeof __WHY_DIFF_VERSION__ === 'string') return __WHY_DIFF_VERSION__;
   try {
     const here = path.dirname(new URL(import.meta.url).pathname);
     for (const p of [path.join(here, '..', 'package.json'), path.join(here, '..', '..', 'package.json')]) {

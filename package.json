@@ -4,7 +4,7 @@
   "description": "Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it. Flags unrequested changes and test tampering.",
   "type": "module",
   "bin": {
-    "why-diff": "dist/cli.js"
+    "why-diff": "plugin/bin/why-diff.mjs"
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -18,13 +18,14 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsup src/cli.ts src/index.ts --format esm --clean --target node20 && tsc -p tsconfig.build.json --emitDeclarationOnly --declaration",
+    "build": "node scripts/build.mjs",
     "dev": "tsx src/cli.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "eval": "npx -y promptfoo@0.120.19 eval -c evals/promptfooconfig.yaml -o evals/results.json --no-cache && node evals/score.mjs",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build",
-    "prepare": "npm run build"
+    "prepublishOnly": "npm run typecheck && npm test && npm run build && npm run build:lib",
+    "build:lib": "tsup && tsc -p tsconfig.build.json --emitDeclarationOnly --declaration",
+    "check:bundle": "node scripts/build.mjs --check"
   },
   "keywords": [
     "claude-code",
@@ -43,12 +44,11 @@
     "type": "git",
     "url": "https://github.com/mateuszkania-im/why-diff"
   },
-  "dependencies": {
-    "commander": "^15.0.0",
-    "picocolors": "^1.1.1"
-  },
   "devDependencies": {
     "@types/node": "^26.6.6",
+    "commander": "^15.0.0",
+    "esbuild": "^0.27.7",
+    "picocolors": "^1.1.1",
     "tsup": "^8.5.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",

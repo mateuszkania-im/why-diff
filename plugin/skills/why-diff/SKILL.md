@@ -8,7 +8,8 @@ description: Use before committing, opening a PR, or when the user asks what cha
 When the user is about to commit or open a pull request after agent work, or asks "what did you change", "why did this change", "did you touch the tests", run:
 
 ```bash
-npx -y github:mateuszkania-im/why-diff --format md --no-open
+node "${CLAUDE_PLUGIN_ROOT}/bin/why-diff.mjs" --format md --no-open -q
+# if that file is missing: npx -y github:mateuszkania-im/why-diff --format md --no-open -q
 ```
 
 Read the output and report back:

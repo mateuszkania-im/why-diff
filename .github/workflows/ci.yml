@@ -15,6 +15,11 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      - run: npm run build
-      - name: smoke
-        run: node dist/cli.js --help
+      - name: standalone bundle is committed and up to date
+        run: npm run check:bundle
+      - run: npm run build:lib
+      - name: smoke (bundle has no runtime dependencies)
+        run: |
+          mkdir -p /tmp/smoke && cp plugin/bin/why-diff.mjs /tmp/smoke/
+          node /tmp/smoke/why-diff.mjs --version
+          node /tmp/smoke/why-diff.mjs --help

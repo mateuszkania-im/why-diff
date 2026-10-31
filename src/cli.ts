@@ -18,10 +18,15 @@ import type { ClassifierKind } from './classify/index.js';
 
 const HARNESSES: Harness[] = ['claude-code', 'codex', 'opencode'];
 
+/** Injected at build time (scripts/build.mjs, tsup.config.ts); 'dev' under tsx. */
+declare const __WHY_DIFF_VERSION__: string | undefined;
+const VERSION = typeof __WHY_DIFF_VERSION__ === 'string' ? __WHY_DIFF_VERSION__ : 'dev';
+
 const program = new Command();
 
 program
   .name('why-diff')
+  .version(VERSION, '-V, --version')
   .description('Trace every hunk of an AI agent\'s diff back to the prompt and tool call that wrote it.')
   .argument('[range]', 'git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree')
   .option('-w, --working-tree', 'only uncommitted changes vs HEAD')
