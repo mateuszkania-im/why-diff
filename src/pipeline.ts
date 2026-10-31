@@ -1,6 +1,7 @@
 /**
  * The why-diff pipeline: git diff + agent transcripts -> attributed, labelled, (optionally) intent-checked report.
  */
+import os from 'node:os';
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import type { Harness, Report, Session, SessionAdapter } from './types.js';
@@ -151,19 +152,28 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
 
   const usedPromptIds = new Set(attributed.map((h) => h.prompt?.id).filter(Boolean));
   const contributing = contributingSessionIds(attributed);
+  const home = opts.home ?? os.homedir();
   return redactReport({
+    schemaVersion: 1,
     version: await readVersion(),
     generatedAt: new Date().toISOString(),
     repo: { root, name: await repoName(root), branch: await currentBranch(root) },
     range: rangeLabel,
     sessions: sessions
       .filter((s) => contributing.has(s.id))
-      .map(({ id, harness, path: p, startedAt, endedAt, title }) => ({ id, harness, path: p, startedAt, endedAt, title })),
+      .map(({ id, harness, path: p, startedAt, endedAt, title }) => ({ id, harness, path: tildify(p, home), startedAt, endedAt, title })),
     prompts: prompts.filter((p) => usedPromptIds.has(p.id)),
     edits: editTable(attributed, sessions),
     hunks: compactHunks(attributed),
     summary,
   }, 'secrets');
+}
+
+/** Replace a leading home directory with `~` so reports do not leak the user name. */
+export function tildify(p: string, home: string): string {
+  if (!home) return p;
+  const h = home.replace(/[\\/]+$/, '');
+  return p === h ? '~' : p.startsWith(h + '/') || p.startsWith(h + '\\') ? '~' + p.slice(h.length) : p;
 }
 
 function guessAdapter(file: string): SessionAdapter {

@@ -2629,6 +2629,7 @@ import path11 from "node:path";
 import { spawn } from "node:child_process";
 
 // src/pipeline.ts
+import os5 from "node:os";
 import path9 from "node:path";
 import { readFile as readFile5 } from "node:fs/promises";
 
@@ -2753,7 +2754,14 @@ async function syntheticAddedFileDiff(root, rel) {
   } catch {
     return null;
   }
-  if (looksBinary(buf)) return null;
+  if (looksBinary(buf)) {
+    let side = quotePathIfNeeded(`b/${rel}`);
+    return `diff --git ${quotePathIfNeeded(`a/${rel}`)} ${side}
+new file mode 100644
+index 0000000..0000000
+Binary files /dev/null and ${side} differ
+`;
+  }
   let content = buf.toString("utf8"), oldSide = quotePathIfNeeded(`a/${rel}`), newSide = quotePathIfNeeded(`b/${rel}`), header = `diff --git ${oldSide} ${newSide}
 new file mode 100644
 index 0000000..0000000
@@ -2866,11 +2874,6 @@ async function commitTimes(cwd, target) {
   return { since, until, commits };
 }
 async function repoName(cwd) {
-  try {
-    let url = await git(cwd, ["remote", "get-url", "origin"]), m = /([^/:]+?)(?:\.git)?\/?$/.exec(url);
-    if (m?.[1]) return m[1];
-  } catch {
-  }
   return path2.basename(await repoRoot(cwd));
 }
 
@@ -2887,7 +2890,7 @@ function parseUnifiedDiff(diff) {
     binary: !1,
     emittedHunk: !1
   }), finishFile = () => {
-    file && !file.binary && !file.emittedHunk && isModeOnlyChange(file) ? hunks.push(modeChangeHunk(file, hunks.length + 1)) : file && !file.binary && !file.emittedHunk && isContentlessMove(file) && hunks.push(contentlessHunk(file, hunks.length + 1)), file = null, open = null;
+    file && file.binary && !file.emittedHunk ? hunks.push(binaryHunk(file, hunks.length + 1)) : file && !file.binary && !file.emittedHunk && isModeOnlyChange(file) ? hunks.push(modeChangeHunk(file, hunks.length + 1)) : file && !file.binary && !file.emittedHunk && isContentlessMove(file) && hunks.push(contentlessHunk(file, hunks.length + 1)), file = null, open = null;
   };
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i] ?? "";
@@ -2986,6 +2989,21 @@ function contentlessHunk(file, n) {
     newStart: 0,
     newLines: 0,
     header: file.status === "deleted" ? `deleted file ${path12}` : `rename ${file.oldPath ?? "?"} => ${path12}`,
+    lines: []
+  };
+}
+function binaryHunk(file, n) {
+  let path12 = displayPath(file);
+  return {
+    id: `h${n}`,
+    file: path12,
+    ...file.oldPath && file.oldPath !== path12 ? { oldFile: file.oldPath } : {},
+    status: file.status,
+    oldStart: 0,
+    oldLines: 0,
+    newStart: 0,
+    newLines: 0,
+    header: "Binary file changed",
     lines: []
   };
 }
@@ -7257,18 +7275,24 @@ async function buildReport(opts = {}) {
   }
   let summary = summarize(attributed, sessions);
   attributed.some((h) => h.intent) && (summary.intent = summarizeIntent(attributed));
-  let usedPromptIds = new Set(attributed.map((h) => h.prompt?.id).filter(Boolean)), contributing = contributingSessionIds(attributed);
+  let usedPromptIds = new Set(attributed.map((h) => h.prompt?.id).filter(Boolean)), contributing = contributingSessionIds(attributed), home = opts.home ?? os5.homedir();
   return redactReport({
+    schemaVersion: 1,
     version: await readVersion(),
     generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
     repo: { root, name: await repoName(root), branch: await currentBranch(root) },
     range: rangeLabel,
-    sessions: sessions.filter((s) => contributing.has(s.id)).map(({ id, harness, path: p, startedAt, endedAt, title }) => ({ id, harness, path: p, startedAt, endedAt, title })),
+    sessions: sessions.filter((s) => contributing.has(s.id)).map(({ id, harness, path: p, startedAt, endedAt, title }) => ({ id, harness, path: tildify(p, home), startedAt, endedAt, title })),
     prompts: prompts.filter((p) => usedPromptIds.has(p.id)),
     edits: editTable(attributed, sessions),
     hunks: compactHunks(attributed),
     summary
   }, "secrets");
+}
+function tildify(p, home) {
+  if (!home) return p;
+  let h = home.replace(/[\\/]+$/, "");
+  return p === h ? "~" : p.startsWith(h + "/") || p.startsWith(h + "\\") ? "~" + p.slice(h.length) : p;
 }
 function guessAdapter(file) {
   return file.includes(".codex") || /rollout-.*\.jsonl$/.test(file) ? codexAdapter : file.includes("opencode") ? opencodeAdapter : claudeCodeAdapter;
@@ -8661,8 +8685,8 @@ async function writeState(dir, file, state) {
 }
 
 // src/cli.ts
-var HARNESSES = ["claude-code", "codex", "opencode"], VERSION = "0.1.0", program2 = new Command();
-program2.name("why-diff").version(VERSION, "-V, --version").description("Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it.").argument("[range]", "git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree").option("--base <ref>", "branch or ref to compare against (default: auto-detected, incl. CI pull request targets)").option("-w, --working-tree", "only uncommitted changes vs HEAD").addOption(new Option("-f, --format <format>", "output format").choices(["terminal", "md", "html", "json"])).option("--html", "shortcut for --format html (writes .why-diff/report.html and opens it)").option("-o, --out <file>", "write output to a file instead of stdout").option("--no-open", "do not open the HTML report in a browser").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo (sibling folders, workspace roots) that edited files in it; slower").option("-v, --verbose", "show rationale, commands and label details").option("--fail-on <what>", "exit 1 if: risk | unrequested | tests | unattributed (comma list) \u2014 for CI and hooks").option("--redact-prompts", "omit prompt text and agent rationales from the output (secrets are always masked)").option("-q, --quiet", "no progress output").action(async (range, o) => {
+var HARNESSES = ["claude-code", "codex", "opencode"], CLASSIFIERS = ["auto", "claude-cli", "anthropic", "openai"], FAIL_ON = ["risk", "unrequested", "tests", "unattributed"], VERSION = "0.1.0", program2 = new Command();
+program2.name("why-diff").version(VERSION, "-V, --version").description("Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it.").argument("[range]", "git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree").argument("[paths...]", "limit to these paths (give them after --, e.g. why-diff -- src)").option("--base <ref>", "branch or ref to compare against (default: auto-detected, incl. CI pull request targets)").option("-w, --working-tree", "only uncommitted changes vs HEAD").addOption(new Option("-f, --format <format>", "output format").choices(["terminal", "md", "html", "json"])).option("--html", "shortcut for --format html (writes .why-diff/report.html and opens it)").option("-o, --out <file>", "write output to a file instead of stdout").option("--no-open", "do not open the HTML report in a browser").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo (sibling folders, workspace roots) that edited files in it; slower").option("-v, --verbose", "show rationale, commands and label details").option("--fail-on <what>", "exit 1 if: risk | unrequested | tests | unattributed (comma list) \u2014 for CI and hooks").option("--redact-prompts", "omit prompt text and agent rationales from the output (secrets are always masked)").option("-q, --quiet", "no progress output").action(async (rangeArg, pathArgs, o) => {
   let progress = (msg) => {
     o.quiet || process.stderr.write(import_picocolors2.default.dim(`\xB7 ${msg}
 `));
@@ -8670,13 +8694,32 @@ program2.name("why-diff").version(VERSION, "-V, --version").description("Trace e
   if (!isReportFormat(format)) throw new Error(`unknown format ${format}`);
   let harnesses = o.harness ? String(o.harness).split(",").map((s) => s.trim()).filter(Boolean) : void 0, unknownHarness = harnesses?.find((h) => !HARNESSES.includes(h));
   if (unknownHarness) throw new Error(`unknown harness "${unknownHarness}" (use ${HARNESSES.join(", ")})`);
-  let classify = o.classify === !1 || o.classify === void 0 ? "none" : o.classify === !0 ? "auto" : o.classify, built = await buildReport({
+  let dd = process.argv.indexOf("--"), paths = dd >= 0 ? process.argv.slice(dd + 1) : [], range = rangeArg;
+  if (paths.length)
+    pathArgs.length + (rangeArg === void 0 ? 0 : 1) > paths.length ? range = rangeArg : range = void 0;
+  else if (pathArgs.length)
+    throw new Error("extra arguments: put paths after -- (why-diff [range] -- <paths>)");
+  let classify;
+  if (o.classify === !1 || o.classify === void 0) classify = "none";
+  else if (o.classify === !0) classify = "auto";
+  else if (CLASSIFIERS.includes(o.classify)) classify = o.classify;
+  else if (range === void 0)
+    range = String(o.classify), classify = "auto";
+  else throw new Error(`unknown --classify backend "${String(o.classify)}" (use ${CLASSIFIERS.join(", ")})`);
+  let failChecks = o.failOn ? String(o.failOn).split(",").map((x) => x.trim()).filter(Boolean) : [], badCheck = failChecks.find((c) => !FAIL_ON.includes(c));
+  if (badCheck) throw new Error(`unknown --fail-on value "${badCheck}" (use ${FAIL_ON.join(", ")})`);
+  if (failChecks.includes("unrequested") && classify === "none") throw new Error("--fail-on unrequested needs --classify");
+  let since;
+  if (o.since && (since = new Date(String(o.since)), Number.isNaN(since.getTime())))
+    throw new Error(`invalid --since date "${String(o.since)}" (use ISO, e.g. 2026-10-31 or 2026-10-31T09:00)`);
+  let built = await buildReport({
     range,
     base: o.base,
     workingTree: !!o.workingTree,
     harnesses,
     sessionFiles: o.session,
-    since: o.since ? new Date(String(o.since)) : void 0,
+    since,
+    paths: paths.length ? paths : void 0,
     scanAll: !!o.scanAll,
     classify,
     model: o.model,
@@ -8692,8 +8735,8 @@ program2.name("why-diff").version(VERSION, "-V, --version").description("Trace e
     process.stdout.write(out.endsWith(`
 `) ? out : out + `
 `);
-  if (o.failOn) {
-    let s = report.summary, failed = String(o.failOn).split(",").map((x) => x.trim()).filter((c) => c === "risk" && report.hunks.some((h) => h.labels.some((l) => l.severity === "risk")) || c === "unrequested" && (s.intent?.unrequested ?? 0) > 0 || c === "tests" && s.touchedTests || c === "unattributed" && s.unattributedLines > 0);
+  if (failChecks.length) {
+    let s = report.summary, failed = failChecks.filter((c) => c === "risk" && report.hunks.some((h) => h.labels.some((l) => l.severity === "risk")) || c === "unrequested" && (s.intent?.unrequested ?? 0) > 0 || c === "tests" && s.touchedTests || c === "unattributed" && s.unattributedLines > 0);
     failed.length && (process.stderr.write(import_picocolors2.default.red(`why-diff: failing on ${failed.join(", ")}
 `)), process.exitCode = 1);
   }

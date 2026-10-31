@@ -210,6 +210,8 @@ export const FILE_LEVEL_LABELS: ReadonlySet<LabelKind> = new Set<LabelKind>([
 ]);
 
 export interface Report {
+  /** JSON shape version; bumped on breaking changes */
+  schemaVersion: 1;
   /** Tool version */
   version: string;
   generatedAt: string;

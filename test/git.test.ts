@@ -67,9 +67,10 @@ describe('git helpers', () => {
     expect(diff).toContain('\\ No newline at end of file');
     const hunks = parseUnifiedDiff(diff);
     const files = hunks.map((h) => h.file).sort();
-    expect(files).toEqual(['.gitignore', 'docs/my notes.md', 'no-newline.txt', 'weird "name".txt'].sort());
+    expect(files).toEqual(['.gitignore', 'docs/my notes.md', 'image.bin', 'no-newline.txt', 'weird "name".txt'].sort());
     expect(hunks.find((h) => h.file === 'no-newline.txt')?.lines).toEqual([{ type: 'add', text: 'last line without newline', newNo: 1 }]);
-    // Binary and empty files add no hunks; the index was never touched.
+    expect(hunks.find((h) => h.file === 'image.bin')).toMatchObject({ header: 'Binary file changed', lines: [] });
+    // The index was never touched; the index was never touched.
     expect(sh(repo, 'diff', '--cached', '--name-only')).toBe('');
 
     const withoutUntracked = parseUnifiedDiff(await getDiff(repo, { workingTree: true, includeUntracked: false }));
@@ -112,7 +113,7 @@ describe('git helpers', () => {
     expect(await repoRoot(path.join(repo, 'nested/deeper'))).toBe(sh(repo, 'rev-parse', '--show-toplevel'));
     expect(await repoName(repo)).toBe(path.basename(await repoRoot(repo)));
     sh(repo, 'remote', 'add', 'origin', 'git@github.com:someone/why-diff-demo.git');
-    expect(await repoName(repo)).toBe('why-diff-demo');
+    expect(await repoName(repo)).toBe(path.basename(await repoRoot(repo)));
 
     const err = await getDiff(repo, 'definitely-not-a-ref..HEAD').catch((e: unknown) => e);
     expect(err).toBeInstanceOf(GitError);

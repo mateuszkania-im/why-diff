@@ -19,6 +19,8 @@ import { runGuard, type GuardPayload } from './guard.js';
 import type { ClassifierKind } from './classify/index.js';
 
 const HARNESSES: Harness[] = ['claude-code', 'codex', 'opencode'];
+const CLASSIFIERS: ClassifierKind[] = ['auto', 'claude-cli', 'anthropic', 'openai'];
+const FAIL_ON = ['risk', 'unrequested', 'tests', 'unattributed'];
 
 /** Injected at build time (scripts/build.mjs, tsup.config.ts); 'dev' under tsx. */
 declare const __WHY_DIFF_VERSION__: string | undefined;
@@ -31,6 +33,7 @@ program
   .version(VERSION, '-V, --version')
   .description('Trace every hunk of an AI agent\'s diff back to the prompt and tool call that wrote it.')
   .argument('[range]', 'git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree')
+  .argument('[paths...]', 'limit to these paths (give them after --, e.g. why-diff -- src)')
   .option('--base <ref>', 'branch or ref to compare against (default: auto-detected, incl. CI pull request targets)')
   .option('-w, --working-tree', 'only uncommitted changes vs HEAD')
   .addOption(new Option('-f, --format <format>', 'output format').choices(['terminal', 'md', 'html', 'json']))
@@ -47,7 +50,7 @@ program
   .option('--fail-on <what>', 'exit 1 if: risk | unrequested | tests | unattributed (comma list) — for CI and hooks')
   .option('--redact-prompts', 'omit prompt text and agent rationales from the output (secrets are always masked)')
   .option('-q, --quiet', 'no progress output')
-  .action(async (range: string | undefined, o: Record<string, unknown>) => {
+  .action(async (rangeArg: string | undefined, pathArgs: string[], o: Record<string, unknown>) => {
     const progress = (msg: string) => { if (!o.quiet) process.stderr.write(pc.dim(`· ${msg}\n`)); };
     const format: ReportFormat = o.html ? 'html' : (o.format as ReportFormat | undefined) ?? (o.out && String(o.out).endsWith('.html') ? 'html' : 'terminal');
     if (!isReportFormat(format)) throw new Error(`unknown format ${format}`);
@@ -56,14 +59,42 @@ program
     const unknownHarness = harnesses?.find((h) => !HARNESSES.includes(h));
     if (unknownHarness) throw new Error(`unknown harness "${unknownHarness}" (use ${HARNESSES.join(', ')})`);
 
-    const classify: ClassifierKind = o.classify === false || o.classify === undefined ? 'none' : o.classify === true ? 'auto' : (o.classify as ClassifierKind);
+    // Everything after a literal `--` is a pathspec; the optional range must come before it.
+    const dd = process.argv.indexOf('--');
+    const paths = dd >= 0 ? process.argv.slice(dd + 1) : [];
+    let range: string | undefined = rangeArg;
+    if (paths.length) {
+      if (pathArgs.length + (rangeArg === undefined ? 0 : 1) > paths.length) range = rangeArg;
+      else range = undefined;
+    } else if (pathArgs.length) {
+      throw new Error('extra arguments: put paths after -- (why-diff [range] -- <paths>)');
+    }
+
+    let classify: ClassifierKind;
+    if (o.classify === false || o.classify === undefined) classify = 'none';
+    else if (o.classify === true) classify = 'auto';
+    else if (CLASSIFIERS.includes(o.classify as ClassifierKind)) classify = o.classify as ClassifierKind;
+    else if (range === undefined) { range = String(o.classify); classify = 'auto'; }
+    else throw new Error(`unknown --classify backend "${String(o.classify)}" (use ${CLASSIFIERS.join(', ')})`);
+
+    const failChecks = o.failOn ? String(o.failOn).split(',').map((x) => x.trim()).filter(Boolean) : [];
+    const badCheck = failChecks.find((c) => !FAIL_ON.includes(c));
+    if (badCheck) throw new Error(`unknown --fail-on value "${badCheck}" (use ${FAIL_ON.join(', ')})`);
+    if (failChecks.includes('unrequested') && classify === 'none') throw new Error('--fail-on unrequested needs --classify');
+
+    let since: Date | undefined;
+    if (o.since) {
+      since = new Date(String(o.since));
+      if (Number.isNaN(since.getTime())) throw new Error(`invalid --since date "${String(o.since)}" (use ISO, e.g. 2026-10-31 or 2026-10-31T09:00)`);
+    }
     const built = await buildReport({
       range,
       base: o.base as string | undefined,
       workingTree: Boolean(o.workingTree),
       harnesses,
       sessionFiles: o.session as string[] | undefined,
-      since: o.since ? new Date(String(o.since)) : undefined,
+      since,
+      paths: paths.length ? paths : undefined,
       scanAll: Boolean(o.scanAll),
       classify,
       model: o.model as string | undefined,
@@ -87,10 +118,9 @@ program
       process.stdout.write(out.endsWith('\n') ? out : out + '\n');
     }
 
-    if (o.failOn) {
+    if (failChecks.length) {
       const s = report.summary;
-      const checks = String(o.failOn).split(',').map((x) => x.trim());
-      const failed = checks.filter((c) =>
+      const failed = failChecks.filter((c) =>
         (c === 'risk' && report.hunks.some((h) => h.labels.some((l) => l.severity === 'risk'))) ||
         (c === 'unrequested' && (s.intent?.unrequested ?? 0) > 0) ||
         (c === 'tests' && s.touchedTests) ||

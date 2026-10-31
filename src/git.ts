@@ -249,7 +249,10 @@ async function syntheticAddedFileDiff(root: string, rel: string): Promise<string
   } catch {
     return null;
   }
-  if (looksBinary(buf)) return null;
+  if (looksBinary(buf)) {
+    const side = quotePathIfNeeded(`b/${rel}`);
+    return `diff --git ${quotePathIfNeeded(`a/${rel}`)} ${side}\nnew file mode 100644\nindex 0000000..0000000\nBinary files /dev/null and ${side} differ\n`;
+  }
   const content = buf.toString('utf8');
   // git quotes the whole prefixed path: `"a/weird \"name\".txt"`.
   const oldSide = quotePathIfNeeded(`a/${rel}`);
@@ -421,14 +424,7 @@ export async function commitTimes(cwd: string, target: DiffTarget): Promise<Time
   return { since, until, commits };
 }
 
-/** Repository name: basename of the root (or of the origin URL when available). */
+/** Repository name: basename of the repo root. */
 export async function repoName(cwd: string): Promise<string> {
-  try {
-    const url = await git(cwd, ['remote', 'get-url', 'origin']);
-    const m = /([^/:]+?)(?:\.git)?\/?$/.exec(url);
-    if (m?.[1]) return m[1];
-  } catch {
-    // no origin
-  }
   return path.basename(await repoRoot(cwd));
 }

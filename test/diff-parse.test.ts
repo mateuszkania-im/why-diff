@@ -107,7 +107,7 @@ index e69de29..0000000
     expect(hunks[0]).toMatchObject({ file: 'test/empty.test.js', status: 'deleted', lines: [], newLines: 0 });
   });
 
-  it('skips binary files and emits an empty hunk for mode-only changes', () => {
+  it('emits an empty hunk for binary files and for mode-only changes', () => {
     const diff = `diff --git a/logo.png b/logo.png
 new file mode 100644
 index 0000000..89abcde
@@ -124,9 +124,10 @@ index 1..2 100644
 +b
 `;
     const hunks = parseUnifiedDiff(diff);
-    expect(hunks.map((h) => h.file)).toEqual(['scripts/run.sh', 'src/x.ts']);
-    expect(hunks[0]).toMatchObject({ header: 'mode change 100644 => 100755', lines: [] });
-    expect(hunks[1]?.id).toBe('h2');
+    expect(hunks.map((h) => h.file)).toEqual(['logo.png', 'scripts/run.sh', 'src/x.ts']);
+    expect(hunks[0]).toMatchObject({ header: 'Binary file changed', status: 'added', lines: [] });
+    expect(hunks[1]).toMatchObject({ header: 'mode change 100644 => 100755', lines: [] });
+    expect(hunks[2]?.id).toBe('h3');
   });
 
   it('understands "\\ No newline at end of file" and hunk headers without counts', () => {

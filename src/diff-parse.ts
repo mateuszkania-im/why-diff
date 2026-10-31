@@ -75,7 +75,9 @@ export function parseUnifiedDiff(diff: string): Hunk[] {
   });
 
   const finishFile = (): void => {
-    if (file && !file.binary && !file.emittedHunk && isModeOnlyChange(file)) {
+    if (file && file.binary && !file.emittedHunk) {
+      hunks.push(binaryHunk(file, hunks.length + 1));
+    } else if (file && !file.binary && !file.emittedHunk && isModeOnlyChange(file)) {
       hunks.push(modeChangeHunk(file, hunks.length + 1));
     } else if (file && !file.binary && !file.emittedHunk && isContentlessMove(file)) {
       hunks.push(contentlessHunk(file, hunks.length + 1));
@@ -247,6 +249,22 @@ function contentlessHunk(file: FileHeader, n: number): Hunk {
     newStart: 0,
     newLines: 0,
     header: file.status === 'deleted' ? `deleted file ${path}` : `rename ${file.oldPath ?? '?'} => ${path}`,
+    lines: [],
+  };
+}
+
+function binaryHunk(file: FileHeader, n: number): Hunk {
+  const path = displayPath(file);
+  return {
+    id: `h${n}`,
+    file: path,
+    ...(file.oldPath && file.oldPath !== path ? { oldFile: file.oldPath } : {}),
+    status: file.status,
+    oldStart: 0,
+    oldLines: 0,
+    newStart: 0,
+    newLines: 0,
+    header: 'Binary file changed',
     lines: [],
   };
 }
