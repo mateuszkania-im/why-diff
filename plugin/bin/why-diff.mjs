@@ -4859,18 +4859,21 @@ import os from "node:os";
 import path4 from "node:path";
 var PATH_LIKE = /[\\/.]|^[A-Za-z0-9_-]+$/;
 function detectBashMutations(command, cwd) {
-  return detect(command, cwd, 0);
+  return detect(command, cwd, 0, { words: MAX_TOTAL_WORDS, bytes: MAX_TOTAL_BYTES, scriptLimit: Math.max(4096, command.length * 4) });
 }
-var MAX_DEPTH = 4, MAX_EXPANSIONS = 256, ASSIGNMENT2 = /^([A-Za-z_][A-Za-z0-9_]*)=/, DECLARE = /* @__PURE__ */ new Set(["export", "declare", "local", "readonly", "typeset"]), KEYWORDS = /* @__PURE__ */ new Set(["do", "then", "else", "elif", "if", "while", "until", "!", "{", "done", "fi", "}", "esac"]);
-function detect(command, cwd, depth) {
+var MAX_DEPTH = 4, MAX_EXPANSIONS = 256, MAX_TOTAL_WORDS = 1e4, MAX_TOTAL_BYTES = 1 << 20, ASSIGNMENT2 = /^([A-Za-z_][A-Za-z0-9_]*)=/, DECLARE = /* @__PURE__ */ new Set(["export", "declare", "local", "readonly", "typeset"]), KEYWORDS = /* @__PURE__ */ new Set(["do", "then", "else", "elif", "if", "while", "until", "!", "{", "done", "fi", "}", "esac"]);
+function detect(command, cwd, depth, budget) {
   let commands = splitSimpleCommands(tokenize(command)), out = [], dir = cwd, seen = /* @__PURE__ */ new Set(), vars = /* @__PURE__ */ new Map(), expanded = /* @__PURE__ */ new Map(), push = (p, op, content) => {
     if (!p || p === "-" || p === "/dev/null" || p.startsWith("/dev/")) return;
     let abs = resolvePath(dir, p), key = `${op}\0${abs}`;
     seen.has(key) || (seen.add(key), out.push(content === void 0 ? { path: abs, op } : { path: abs, op, content }));
   }, nested = (script) => {
-    if (!(depth >= MAX_DEPTH))
-      for (let m of detect(script, dir, depth + 1)) push(m.path, m.op, m.content);
-  }, run = (words, redirects, pipeFrom) => {
+    if (!(depth >= MAX_DEPTH || script.length > budget.scriptLimit || budget.words <= 0))
+      for (let m of detect(script, dir, depth + 1, budget)) push(m.path, m.op, m.content);
+  }, substitute = (words, placeholder, targets) => {
+    let safe = targets.filter((t) => !t.includes("{}") && !t.includes(placeholder));
+    return words.flatMap((w) => w === placeholder ? safe : [w]).slice(0, MAX_EXPANSIONS);
+  }, run = (words, redirects, pipeFrom, level = 0) => {
     let prog = path4.basename(words[0] ?? ""), args = words.slice(1);
     switch (prog) {
       case "tee": {
@@ -4949,15 +4952,15 @@ function detect(command, cwd, depth) {
         break;
       case "find": {
         let f = findCommand(args);
-        if (f.del) for (let t of f.targets) push(t, "delete");
-        f.exec && run(f.exec.flatMap((w) => w === "{}" ? f.targets : [w]), []);
+        if (f.del) for (let t of f.targets) t.includes("{}") || push(t, "delete");
+        f.exec && level < MAX_DEPTH && run(substitute(f.exec, "{}", f.targets), [], void 0, level + 1);
         break;
       }
       case "xargs": {
         let x = xargsCommand(args, redirects), producer = pipeFrom ? stripWrappers(expanded.get(pipeFrom) ?? pipeFrom.words) : [], pprog = path4.basename(producer[0] ?? ""), listed = pprog === "ls" ? positional(producer.slice(1), /* @__PURE__ */ new Set(["-I", "--ignore", "-w", "--width"])) : pprog === "find" ? findCommand(producer.slice(1)).targets : [];
-        if (!x || !listed.length || !x.cmd.length) break;
-        let cmdWords = x.replace !== void 0 && x.cmd.includes(x.replace) ? x.cmd.flatMap((w) => w === x.replace ? listed : [w]) : [...x.cmd, ...listed];
-        run(cmdWords, []);
+        if (!x || !listed.length || !x.cmd.length || level >= MAX_DEPTH) break;
+        let cmdWords = x.replace !== void 0 && x.cmd.includes(x.replace) ? substitute(x.cmd, x.replace, listed) : substitute([...x.cmd, "\0targets"], "\0targets", listed);
+        run(cmdWords, [], void 0, level + 1);
         break;
       }
       case "rimraf":
@@ -4993,18 +4996,18 @@ function detect(command, cwd, depth) {
     let head = pairs[0]?.[0];
     if (head === "for" && pairs[2]?.[0] === "in" && pairs[1]) {
       let name = pairs[1][0], list = pairs.slice(3);
-      list.length && !list.some(([w, m]) => computed(w, m)) ? vars.set(name, list.flatMap(([w, m]) => expandBraces(w, m)).map(([w]) => w)) : vars.delete(name);
+      list.length && !list.some(([w, m]) => computed(w, m)) ? vars.set(name, expandWords(list, /* @__PURE__ */ new Map(), budget)) : vars.delete(name);
       continue;
     }
     let declStart = head !== void 0 && DECLARE.has(head) ? 1 : 0, assigns = pairs.slice(declStart);
     if (assigns.length && assigns.every(([w]) => ASSIGNMENT2.test(w)) && !cmd.redirects.length) {
       for (let [w, m] of assigns) {
         let name = ASSIGNMENT2.exec(w)?.[1] ?? "", eq = name.length + 1, value = w.slice(eq);
-        computed(value, m.slice(eq)) ? vars.delete(name) : vars.set(name, [expandVars(value, m.slice(eq), vars)[0] ?? value]);
+        computed(value, m.slice(eq)) ? vars.delete(name) : vars.set(name, [value]);
       }
       continue;
     }
-    let words = expandWords(pairs, vars);
+    let words = expandWords(pairs, vars, budget);
     expanded.set(cmd, words);
     let stripped = stripWrappers(words), prog = path4.basename(stripped[0] ?? ""), args = stripped.slice(1);
     if (prog === "cd" || prog === "pushd") {
@@ -5025,18 +5028,25 @@ function computed(word, mask2) {
   }
   return !1;
 }
-function expandWords(pairs, vars) {
+function expandWords(pairs, vars, budget) {
   let out = [];
-  for (let [w, m] of pairs)
-    for (let [bw, bm] of expandBraces(w, m))
-      for (let v of expandVars(bw, bm, vars)) {
-        if (out.length >= MAX_EXPANSIONS) return out;
-        out.push(v);
-      }
+  for (let [w, m] of pairs) {
+    let results = [];
+    if (budget.words > 0 && budget.bytes > 0)
+      for (let [bw, bm] of expandBraces(w, m))
+        for (let v of expandVars(bw, bm, vars)) {
+          if (results.length >= MAX_EXPANSIONS || budget.words <= 0 || budget.bytes < v.length) break;
+          budget.words--, budget.bytes -= v.length, results.push(v);
+        }
+    for (let v of results.length ? results : [w]) {
+      if (out.length >= MAX_EXPANSIONS) return out;
+      out.push(v);
+    }
+  }
   return out;
 }
 function expandBraces(word, mask2, budget = { n: MAX_EXPANSIONS }) {
-  if (word.length > 4096 || !word.includes("{")) return [[word, mask2]];
+  if (budget.n <= 0 || word.length > 4096 || !word.includes("{")) return [[word, mask2]];
   for (let open = word.indexOf("{"); open !== -1; open = word.indexOf("{", open + 1)) {
     if (mask2[open] !== "u") continue;
     let depth = 0, commas = [], close = -1;
@@ -5075,7 +5085,8 @@ function expandVars(word, mask2, vars) {
       let m = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/.exec(word.slice(i, i + 130)), name = m?.[1] ?? m?.[2], values = name !== void 0 ? vars.get(name) : void 0;
       if (m && values) {
         let next = [];
-        for (let r of results) for (let v of values) next.length < MAX_EXPANSIONS && next.push(r + v);
+        for (let r of results) for (let v of values) next.length < MAX_EXPANSIONS && r.length + v.length <= 65536 && next.push(r + v);
+        if (!next.length) return [word];
         results = next, i += m[0].length;
         continue;
       }

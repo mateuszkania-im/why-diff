@@ -71,17 +71,30 @@ const PATH_LIKE = /[\\/.]|^[A-Za-z0-9_-]+$/;
  * computed values (`$(...)`, backticks), and scripts that compute paths.
  */
 export function detectBashMutations(command: string, cwd: string): BashMutation[] {
-  return detect(command, cwd, 0);
+  return detect(command, cwd, 0, { words: MAX_TOTAL_WORDS, bytes: MAX_TOTAL_BYTES, scriptLimit: Math.max(4096, command.length * 4) });
 }
 
 const MAX_DEPTH = 4;
 const MAX_EXPANSIONS = 256;
+const MAX_TOTAL_WORDS = 10_000;
+const MAX_TOTAL_BYTES = 1 << 20;
+
+/**
+ * Work left for one top-level command, shared by every nesting level (`eval`, `bash -c`,
+ * `find -exec`, `xargs`): expanded words and their bytes. Once spent, words stay unexpanded
+ * (unresolved). Nested scripts longer than `scriptLimit` are not followed.
+ */
+interface Budget {
+  words: number;
+  bytes: number;
+  scriptLimit: number;
+}
 const ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=/;
 const DECLARE = new Set(['export', 'declare', 'local', 'readonly', 'typeset']);
 /** Reserved words that may start a simple command in a compound one (`do rm "$f"`, `then ...`). */
 const KEYWORDS = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '!', '{', 'done', 'fi', '}', 'esac']);
 
-function detect(command: string, cwd: string, depth: number): BashMutation[] {
+function detect(command: string, cwd: string, depth: number, budget: Budget): BashMutation[] {
   const commands = splitSimpleCommands(tokenize(command));
   const out: BashMutation[] = [];
   let dir = cwd;
@@ -99,11 +112,17 @@ function detect(command: string, cwd: string, depth: number): BashMutation[] {
   };
 
   const nested = (script: string): void => {
-    if (depth >= MAX_DEPTH) return;
-    for (const m of detect(script, dir, depth + 1)) push(m.path, m.op, m.content);
+    if (depth >= MAX_DEPTH || script.length > budget.scriptLimit || budget.words <= 0) return;
+    for (const m of detect(script, dir, depth + 1, budget)) push(m.path, m.op, m.content);
   };
 
-  const run = (words: string[], redirects: Redirect[], pipeFrom?: SimpleCommand): void => {
+  /** Substitute `{}`/the xargs placeholder with targets: never a target holding `{}`, at most MAX_EXPANSIONS words. */
+  const substitute = (words: string[], placeholder: string, targets: string[]): string[] => {
+    const safe = targets.filter((t) => !t.includes('{}') && !t.includes(placeholder));
+    return words.flatMap((w) => (w === placeholder ? safe : [w])).slice(0, MAX_EXPANSIONS);
+  };
+
+  const run = (words: string[], redirects: Redirect[], pipeFrom?: SimpleCommand, level = 0): void => {
     const prog = path.basename(words[0] ?? '');
     const args = words.slice(1);
     switch (prog) {
@@ -191,8 +210,8 @@ function detect(command: string, cwd: string, depth: number): BashMutation[] {
         break;
       case 'find': {
         const f = findCommand(args);
-        if (f.del) for (const t of f.targets) push(t, 'delete');
-        if (f.exec) run(f.exec.flatMap((w) => (w === '{}' ? f.targets : [w])), []);
+        if (f.del) for (const t of f.targets) if (!t.includes('{}')) push(t, 'delete');
+        if (f.exec && level < MAX_DEPTH) run(substitute(f.exec, '{}', f.targets), [], undefined, level + 1);
         break;
       }
       case 'xargs': {
@@ -200,11 +219,11 @@ function detect(command: string, cwd: string, depth: number): BashMutation[] {
         const producer = pipeFrom ? stripWrappers(expanded.get(pipeFrom) ?? pipeFrom.words) : [];
         const pprog = path.basename(producer[0] ?? '');
         const listed = pprog === 'ls' ? positional(producer.slice(1), new Set(['-I', '--ignore', '-w', '--width'])) : pprog === 'find' ? findCommand(producer.slice(1)).targets : [];
-        if (!x || !listed.length || !x.cmd.length) break;
+        if (!x || !listed.length || !x.cmd.length || level >= MAX_DEPTH) break;
         const cmdWords = x.replace !== undefined && x.cmd.includes(x.replace)
-          ? x.cmd.flatMap((w) => (w === x.replace ? listed : [w]))
-          : [...x.cmd, ...listed];
-        run(cmdWords, []);
+          ? substitute(x.cmd, x.replace, listed)
+          : substitute([...x.cmd, '\0targets'], '\0targets', listed);
+        run(cmdWords, [], undefined, level + 1);
         break;
       }
       case 'rimraf':
@@ -245,7 +264,7 @@ function detect(command: string, cwd: string, depth: number): BashMutation[] {
     if (head === 'for' && pairs[2]?.[0] === 'in' && pairs[1]) {
       const name = pairs[1][0];
       const list = pairs.slice(3);
-      if (list.length && !list.some(([w, m]) => computed(w, m))) vars.set(name, list.flatMap(([w, m]) => expandBraces(w, m)).map(([w]) => w));
+      if (list.length && !list.some(([w, m]) => computed(w, m))) vars.set(name, expandWords(list, new Map(), budget));
       else vars.delete(name);
       continue;
     }
@@ -258,12 +277,12 @@ function detect(command: string, cwd: string, depth: number): BashMutation[] {
         const eq = name.length + 1;
         const value = w.slice(eq);
         if (computed(value, m.slice(eq))) vars.delete(name);
-        else vars.set(name, [expandVars(value, m.slice(eq), vars)[0] ?? value]);
+        else vars.set(name, [value]);
       }
       continue;
     }
 
-    const words = expandWords(pairs, vars);
+    const words = expandWords(pairs, vars, budget);
     expanded.set(cmd, words);
     const stripped = stripWrappers(words);
     const prog = path.basename(stripped[0] ?? '');
@@ -295,15 +314,27 @@ function computed(word: string, mask: string): boolean {
   return false;
 }
 
-/** Brace lists, then known variables, for each word; at most {@link MAX_EXPANSIONS} words in all. */
-function expandWords(pairs: Array<[string, string]>, vars: Map<string, string[]>): string[] {
+/**
+ * Brace lists, then known variables, for each word: at most {@link MAX_EXPANSIONS} words per
+ * command, and within the shared budget. A word that does not fit stays as written (unresolved).
+ */
+function expandWords(pairs: Array<[string, string]>, vars: Map<string, string[]>, budget: Budget): string[] {
   const out: string[] = [];
   for (const [w, m] of pairs) {
-    for (const [bw, bm] of expandBraces(w, m)) {
-      for (const v of expandVars(bw, bm, vars)) {
-        if (out.length >= MAX_EXPANSIONS) return out;
-        out.push(v);
+    const results: string[] = [];
+    if (budget.words > 0 && budget.bytes > 0) {
+      for (const [bw, bm] of expandBraces(w, m)) {
+        for (const v of expandVars(bw, bm, vars)) {
+          if (results.length >= MAX_EXPANSIONS || budget.words <= 0 || budget.bytes < v.length) break;
+          budget.words--;
+          budget.bytes -= v.length;
+          results.push(v);
+        }
       }
+    }
+    for (const v of results.length ? results : [w]) {
+      if (out.length >= MAX_EXPANSIONS) return out;
+      out.push(v);
     }
   }
   return out;
@@ -311,7 +342,7 @@ function expandWords(pairs: Array<[string, string]>, vars: Map<string, string[]>
 
 /** `pre{a,b}post` -> `preapost`, `prebpost` (unquoted braces with a top-level comma; nested lists too). */
 function expandBraces(word: string, mask: string, budget = { n: MAX_EXPANSIONS }): Array<[string, string]> {
-  if (word.length > 4096 || !word.includes('{')) return [[word, mask]];
+  if (budget.n <= 0 || word.length > 4096 || !word.includes('{')) return [[word, mask]];
   for (let open = word.indexOf('{'); open !== -1; open = word.indexOf('{', open + 1)) {
     if (mask[open] !== 'u') continue;
     let depth = 0;
@@ -361,7 +392,8 @@ function expandVars(word: string, mask: string, vars: Map<string, string[]>): st
       const values = name !== undefined ? vars.get(name) : undefined;
       if (m && values) {
         const next: string[] = [];
-        for (const r of results) for (const v of values) if (next.length < MAX_EXPANSIONS) next.push(r + v);
+        for (const r of results) for (const v of values) if (next.length < MAX_EXPANSIONS && r.length + v.length <= 65_536) next.push(r + v);
+        if (!next.length) return [word];
         results = next;
         i += m[0].length;
         continue;

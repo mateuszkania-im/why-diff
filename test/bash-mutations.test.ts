@@ -174,3 +174,40 @@ describe('detectBashMutations: audit 2 shell forms', () => {
     }
   });
 });
+
+describe('detectBashMutations: adversarial input stays bounded', () => {
+  const nestEval = (n: number): string => {
+    let s = 'rm a.js';
+    for (let i = 0; i < n; i++) s = `eval ${JSON.stringify(s)}`;
+    return s;
+  };
+  const nestFind = (n: number): string => {
+    let s = 'rm {} \;';
+    for (let i = 0; i < n; i++) s = `find . -name "*.js" -exec ${s.replace(/\{\}/g, '{}')} \;`;
+    return s;
+  };
+  const cases: Array<[string, string]> = [
+    ['nested eval', nestEval(12)],
+    ['nested bash -c with braces', `bash -c ${JSON.stringify(`bash -c ${JSON.stringify(`eval "rm ${'{a,b}'.repeat(12)}"`)}`)}`],
+    ['brace bomb', `rm ${'{a,b}'.repeat(30)}`],
+    ['brace bomb in many words', `rm ${Array.from({ length: 50 }, () => '{a,b}'.repeat(30)).join(' ')}`],
+    ['doubling chain', `X=a; ${'X=$X$X; '.repeat(40)}rm $X`],
+    ['doubling chain quoted', `X=ab; ${'X="$X$X"; '.repeat(40)}rm "$X"`],
+    ['loop list bomb', `for f in ${'{a,b}'.repeat(20)}; do rm "$f$f$f"; done`],
+    ['nested find -exec', nestFind(10)],
+    ['find -exec with xargs', 'find . -name "*.js" | xargs -I {} find {} -exec rm {} +'],
+    ['placeholder targets', 'find "{}" -name "{}" -exec rm {} +'],
+  ];
+  for (const [name, cmd] of cases) {
+    it(`${name}: under 100 ms with a bounded result`, () => {
+      let out: unknown[] = [];
+      const ms = bestOf(() => { out = detectBashMutations(cmd, CWD); }, 3);
+      expect(ms).toBeLessThan(100);
+      expect(out.length).toBeLessThanOrEqual(10_000);
+      expect(JSON.stringify(out).length).toBeLessThanOrEqual(2_000_000);
+    });
+  }
+  it('never reports a {} placeholder as a path', () => {
+    expect(paths('find "{}" -name "{}" -exec rm {} +').some((p) => p.includes('{}'))).toBe(false);
+  });
+});
