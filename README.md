@@ -90,7 +90,7 @@ UNATTRIBUTED (1)  no agent edit explains these
     src/cart.js:L18-20  +1
       none · ✗ unrequested · ▲ unattributed
 
-why-diff v0.2.0 · generated 31 Oct 2026, 21:47 UTC
+why-diff v0.2.1 · generated 31 Oct 2026, 21:47 UTC
 ```
 
 - **Per-line provenance.** Each added line is owned by the edit that *introduced* it (not the one that merely had it as context). Hunks that mix several prompts, or your own manual edits, are split into segments.
@@ -141,7 +141,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # required: a shallow clone has no merge base
-      - uses: mateuszkania-im/why-diff@v0.2.0
+      - uses: mateuszkania-im/why-diff@v0.2.1
         with:
           fail-on: risk    # optional
 ```
@@ -173,7 +173,7 @@ npx -y github:mateuszkania-im/why-diff --version
 That runs the committed standalone file `plugin/bin/why-diff.mjs` (one file, zero dependencies, nothing to build). From v0.2.0 each release also has a tarball, which skips the git clone and is faster:
 
 ```bash
-npx -y https://github.com/mateuszkania-im/why-diff/releases/download/v0.2.0/why-diff.tgz --version
+npx -y https://github.com/mateuszkania-im/why-diff/releases/download/v0.2.1/why-diff.tgz --version
 ```
 
 Tip: `alias why-diff="npx -y github:mateuszkania-im/why-diff"`.
@@ -231,7 +231,7 @@ why-diff pr [options]    put the report into the current branch's PR description
 why-diff guard [--on k]  Claude Code Stop hook (reads the hook payload from stdin)
 ```
 
-Invalid values for `--fail-on`, `--since`, `--classify` and `--format` are rejected with an error instead of being ignored. Binary files are listed but not diffed. Home directory paths in reports are shortened to `~`. JSON output carries `schemaVersion: 1` and `mode` (`provenance` or `risk-scan`).
+Invalid values for `--fail-on`, `--since`, `--classify` and `--format` are rejected with an error instead of being ignored. Binary files are listed but not diffed: the summary counts them (`summary.binaryFiles`, and `summary.unattributedBinaryFiles` for those no agent edit names), and `--fail-on unattributed` also fails on a changed binary file that no agent Write or shell command explains. Home directory paths in reports are shortened to `~`. JSON output carries `schemaVersion: 1` and `mode` (`provenance` or `risk-scan`).
 
 Secrets are masked everywhere they could leak: prompts, agent rationales, edit bodies, intent-check reasons, and key-shaped secrets in diff lines. `--redact-prompts` goes further and leaves prompt text and rationales out entirely, for reports you share.
 
@@ -272,6 +272,8 @@ Reports stay small on big diffs: every edit a hunk references is stored once in 
 - The intent check judges whole hunks: a requested 17-line function next to an accidental one-line change can be marked `unrequested` as a whole. Its verdicts also vary between runs on borderline cases. Use it to point your attention, not as a score.
 - Transcript formats are not public contracts. Adapters are tested against current Claude Code (2.1.x) and Codex (0.16x) files and will need updates.
 - Lines written by scripts the agent ran (`node fix.js`, codegen, formatters) can't be traced line by line, and show as `file-only` matches.
+- Binary files are attributed by path only: an agent Write or shell command that names the file (`cp logo.png assets/`) counts as explaining it, whatever bytes it wrote.
+- The guard credits a shell command only for a pure rename or a whole-file deletion of a path it names (literal paths and globs with `*`, `?`, `**`). Paths built from variables or brace expansion (`rm $DIR/*.test.js`, `rm test/{a,b}.test.js`) are not resolved, so such deletions are not blocked live; the CLI and the Action still label them.
 - Sessions started in another folder (a sibling project, a workspace root) that edited the repo by absolute path are found only with `--scan-all`, which byte-scans every transcript modified in the window.
 - Sessions run in a `git worktree` are found while that worktree still exists (`git worktree list`), or when it was nested under the repo. Once a worktree outside the repo is removed, its transcripts are generally not found (`--scan-all` only matches edits by absolute path under the repo root), so review before pruning worktrees.
 - If an agent edited a file earlier and those edits were later reverted, a line you then type by hand in that file can show as a `file-only` match to that old prompt. It still carries the `unattributed` label, so it doesn't pass as agent work.

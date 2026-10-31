@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.1
+
+### Changed
+
+- `why-diff pr --working-tree` is now `why-diff pr --include-uncommitted` (no alias). The main command keeps `-w, --working-tree`.
+- The JSON summary has two new fields: `binaryFiles` and `unattributedBinaryFiles`.
+
+### Fixed
+
+- Guard: a shell `mv` or `rm` from the session is credited only when the hunk is exactly that operation (a rename with no changed lines, or a whole-file deletion), so a human's later edit in a renamed test no longer blocks the agent.
+- Guard: globbed and target-directory shell forms are understood: `rm test/*.test.js`, `rm -f tests/**/*.spec.ts`, `mv -t old a.test.js`, `mv --target-directory=old`, `git mv -k`, `rm -- file`.
+- Guard: parallel sessions no longer overwrite each other's entries in `guard-state.json` (lock file, merge with the latest state, atomic rename). The lock always gives up by its deadline, so a broken or foreign lock file can never hang a session; it only skips the dedupe write.
+- `why-diff pr` warns about uncommitted changes only when they are actually left out (on the base branch the working tree is reported).
+- A literal `--` given as an option value (`-m --`) is no longer taken as the pathspec separator.
+- Changed binary files are counted in the summary (terminal and Markdown) and `--fail-on unattributed` fails on one no agent edit explains.
+- `-o .why-diff/<file>` creates `.why-diff/.gitignore` only when it is missing, and keeps your own.
+- In a shallow clone, the `fetch-depth: 0` hint is added only to missing-revision errors; other git errors pass through unchanged.
+- The session time window counts commits correctly when the guard diffs against a session-start revision.
+- Action: an invalid `comment-author` prints a warning and the default identity is used.
+- Redaction: `password: value` lines with very deep indentation, `password=foo.bar` dotted literals after an exact secret name, and bare `Basic <base64>` credentials without digits (when they decode to `user:pass`) are masked. Code such as `password = config.db.password` or `password = user.password` is left alone.
+- `tests-disabled`: a nested `- key:` list inside a CI step (`with:`, `strategy.matrix.include`) no longer ends the step, so `continue-on-error: true` after it is still caught.
+- `tests-disabled`: deleting a test together with a same-stem source file is exempt only when the source sits in a related directory (same directory, or a mirrored `test/` and `src/` tree).
+- `out-of-scope` labelling no longer grows quadratically with the number of files a prompt touched.
+
 ## 0.2.0
 
 ### Install and runtime
