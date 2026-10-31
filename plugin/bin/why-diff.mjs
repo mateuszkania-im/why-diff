@@ -2775,30 +2775,44 @@ async function resolveDefaultTarget(cwd, env = process.env, explicitBase) {
     label: "working tree"
   };
   if (!await hasHead(cwd)) return workingTree;
-  let branch = await currentBranch(cwd), head = await git(cwd, ["rev-parse", "HEAD"]), candidates = [], named = [explicitBase, env.GITHUB_BASE_REF, env.CI_MERGE_REQUEST_TARGET_BRANCH_NAME, env.BITBUCKET_PR_DESTINATION_BRANCH];
-  for (let x of named)
-    x && candidates.push(`origin/${x}`, x);
-  try {
-    candidates.push(await git(cwd, ["rev-parse", "--abbrev-ref", "refs/remotes/origin/HEAD"]));
-  } catch {
+  let branch = await currentBranch(cwd), head = await git(cwd, ["rev-parse", "HEAD"]);
+  if (explicitBase?.startsWith("-")) throw new Error(`invalid base "${explicitBase}"`);
+  let candidates = [];
+  if (explicitBase)
+    candidates.push(`origin/${explicitBase}`, explicitBase);
+  else {
+    for (let x of [env.GITHUB_BASE_REF, env.CI_MERGE_REQUEST_TARGET_BRANCH_NAME, env.BITBUCKET_PR_DESTINATION_BRANCH])
+      x && !x.startsWith("-") && candidates.push(`origin/${x}`, x);
+    try {
+      candidates.push(await git(cwd, ["rev-parse", "--abbrev-ref", "refs/remotes/origin/HEAD"]));
+    } catch {
+    }
+    candidates.push("origin/main", "origin/master", "main", "master", "origin/develop", "develop", "origin/trunk", "trunk");
   }
-  candidates.push("origin/main", "origin/master", "main", "master", "origin/develop", "develop", "origin/trunk", "trunk");
+  let onBase = !1;
   for (let base of candidates) {
-    if (base === branch || !await revExists(cwd, base)) continue;
+    if (base === branch || base === `origin/${branch}`) {
+      onBase = !0;
+      continue;
+    }
+    if (!await revExists(cwd, base)) continue;
     let mb;
     try {
       mb = await git(cwd, ["merge-base", base, "HEAD"]);
     } catch {
       continue;
     }
-    if (mb !== head)
-      return {
-        target: { workingTree: !0, includeUntracked: !0, base },
-        label: `${base}...HEAD + working tree`,
-        base
-      };
+    if (mb === head) {
+      onBase = !0;
+      continue;
+    }
+    return {
+      target: { workingTree: !0, includeUntracked: !0, base },
+      label: `${base}...HEAD + working tree`,
+      base
+    };
   }
-  return workingTree;
+  return { ...workingTree, onBase };
 }
 async function commitTimes(cwd, target) {
   let until = /* @__PURE__ */ new Date();
@@ -6888,8 +6902,8 @@ async function buildReport(opts = {}) {
     target = opts.range, rangeLabel = opts.range;
   else {
     let resolved = await resolveDefaultTarget(root, process.env, opts.base);
-    if (!resolved.base && await isShallow(root)) throw new Error(SHALLOW_HINT);
     if (opts.base && !resolved.base) throw new Error(`cannot compare against --base ${opts.base}: ref not found or no commits beyond it`);
+    if (!resolved.base && !resolved.onBase && await isShallow(root)) throw new Error(SHALLOW_HINT);
     target = resolved.target, rangeLabel = resolved.label;
   }
   log(`diffing ${rangeLabel}`);
@@ -7451,7 +7465,7 @@ kbd{display:inline-block;min-width:18px;padding:0 5px;border-radius:4px;border:1
   });
   var allHunks = R.hunks;
   var S = R.summary;
-  var tracedPct = S.addedLines > 0 ? Math.round(S.agentLines / S.addedLines * 100) : 100;
+  var tracedPct = S.addedLines > 0 ? Math.round(S.agentLines / S.addedLines * 100) : 0;
   var intentRan = !!S.intent || allHunks.some(function (a) { return a.intent; });
   var classifierModel = (function () { for (var i = 0; i < allHunks.length; i++) if (allHunks[i].intent) return allHunks[i].intent.model; return null; })();
   var verdictCounts = { requested: 0, implied: 0, unrequested: 0, unclear: 0 };

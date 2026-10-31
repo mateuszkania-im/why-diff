@@ -188,6 +188,40 @@ describe('base and window resolution', () => {
     expect(await listUntracked(repo)).toEqual(['x.js']);
   });
 
+  it('explicit --base that does not exist rejects instead of falling back', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'base');
+    sh(repo, 'checkout', '-q', '-b', 'feat');
+    commitFile(repo, 'a.txt', 'one\ntwo\n', 'two');
+    await expect(buildReport({ cwd: repo, base: 'release/2', home: repo })).rejects.toThrow('cannot compare against --base release/2');
+    // An existing base still works.
+    const ok = await buildReport({ cwd: repo, base: 'main', home: repo });
+    expect(ok.range).toBe('main...HEAD + working tree');
+  });
+
+  it('rejects --base and ignores CI env values that look like options', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'base');
+    sh(repo, 'checkout', '-q', '-b', 'feat');
+    commitFile(repo, 'a.txt', 'one\ntwo\n', 'two');
+    await expect(resolveDefaultTarget(repo, {}, '--output=x')).rejects.toThrow(/invalid base/);
+    const r = await resolveDefaultTarget(repo, { GITHUB_BASE_REF: '--output=x' });
+    expect(r.base).toBe('main');
+  });
+
+  it('shallow clone on a base branch falls back to the working tree', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'base');
+    const parent = tempDir('why-diff-shallow-');
+    dirs.push(parent);
+    const clone = path.join(parent, 'clone');
+    execFileSync('git', ['clone', '-q', '--depth', '1', `file://${repo}`, clone], { env: ENV });
+    put(clone, 'a.txt', 'one\nchanged\n');
+    const report = await buildReport({ cwd: clone, home: parent });
+    expect(report.range).toBe('working tree');
+    expect(report.hunks).toHaveLength(1);
+  });
+
   it('shallow clone gives a fetch-depth hint', async () => {
     const repo = freshRepo();
     commitFile(repo, 'a.txt', 'one\n', 'base');

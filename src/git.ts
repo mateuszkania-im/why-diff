@@ -56,6 +56,8 @@ export interface ResolvedTarget {
   label: string;
   /** Base ref the branch was compared against, when one was found. */
   base?: string;
+  /** True when HEAD is on (or equal to) a base candidate, so there is no branch to compare. */
+  onBase?: boolean;
 }
 
 /** Time window covered by a diff target. */
@@ -274,20 +276,29 @@ export async function resolveDefaultTarget(
   const branch = await currentBranch(cwd);
   const head = await git(cwd, ['rev-parse', 'HEAD']);
 
+  if (explicitBase?.startsWith('-')) throw new Error(`invalid base "${explicitBase}"`);
   const candidates: string[] = [];
-  const named = [explicitBase, env.GITHUB_BASE_REF, env.CI_MERGE_REQUEST_TARGET_BRANCH_NAME, env.BITBUCKET_PR_DESTINATION_BRANCH];
-  for (const x of named) {
-    if (x) candidates.push(`origin/${x}`, x);
+  if (explicitBase) {
+    candidates.push(`origin/${explicitBase}`, explicitBase);
+  } else {
+    // A ref is never an option (same rule as ranges in getDiff).
+    for (const x of [env.GITHUB_BASE_REF, env.CI_MERGE_REQUEST_TARGET_BRANCH_NAME, env.BITBUCKET_PR_DESTINATION_BRANCH]) {
+      if (x && !x.startsWith('-')) candidates.push(`origin/${x}`, x);
+    }
+    try {
+      candidates.push(await git(cwd, ['rev-parse', '--abbrev-ref', 'refs/remotes/origin/HEAD']));
+    } catch {
+      // no origin/HEAD
+    }
+    candidates.push('origin/main', 'origin/master', 'main', 'master', 'origin/develop', 'develop', 'origin/trunk', 'trunk');
   }
-  try {
-    candidates.push(await git(cwd, ['rev-parse', '--abbrev-ref', 'refs/remotes/origin/HEAD']));
-  } catch {
-    // no origin/HEAD
-  }
-  candidates.push('origin/main', 'origin/master', 'main', 'master', 'origin/develop', 'develop', 'origin/trunk', 'trunk');
 
+  let onBase = false;
   for (const base of candidates) {
-    if (base === branch) continue;
+    if (base === branch || base === `origin/${branch}`) {
+      onBase = true;
+      continue;
+    }
     if (!(await revExists(cwd, base))) continue;
     let mb: string;
     try {
@@ -295,14 +306,17 @@ export async function resolveDefaultTarget(
     } catch {
       continue;
     }
-    if (mb === head) continue; // nothing on this branch beyond the base
+    if (mb === head) {
+      onBase = true; // nothing on this branch beyond the base
+      continue;
+    }
     return {
       target: { workingTree: true, includeUntracked: true, base },
       label: `${base}...HEAD + working tree`,
       base,
     };
   }
-  return workingTree;
+  return { ...workingTree, onBase };
 }
 
 /**

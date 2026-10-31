@@ -422,7 +422,7 @@ const APP_JS = `
   });
   var allHunks = R.hunks;
   var S = R.summary;
-  var tracedPct = S.addedLines > 0 ? Math.round(S.agentLines / S.addedLines * 100) : 100;
+  var tracedPct = S.addedLines > 0 ? Math.round(S.agentLines / S.addedLines * 100) : 0;
   var intentRan = !!S.intent || allHunks.some(function (a) { return a.intent; });
   var classifierModel = (function () { for (var i = 0; i < allHunks.length; i++) if (allHunks[i].intent) return allHunks[i].intent.model; return null; })();
   var verdictCounts = { requested: 0, implied: 0, unrequested: 0, unclear: 0 };

@@ -292,6 +292,13 @@ describe('headline with no added lines', () => {
   });
 });
 
+describe('html with no added lines', () => {
+  it('in-page tracedPct does not fall back to 100', async () => {
+    const { renderHtml } = await import('../src/report/html.js');
+    expect(renderHtml(sample)).not.toMatch(/\* 100\) : 100;/);
+  });
+});
+
 describe('renderMarkdown', () => {
   it('has a Provenance section with risks first, a summary table and collapsible prompts', () => {
     const md = renderMarkdown(sample);

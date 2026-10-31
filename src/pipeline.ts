@@ -83,8 +83,8 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
     rangeLabel = opts.range;
   } else {
     const resolved = await resolveDefaultTarget(root, process.env, opts.base);
-    if (!resolved.base && (await isShallow(root))) throw new Error(SHALLOW_HINT);
     if (opts.base && !resolved.base) throw new Error(`cannot compare against --base ${opts.base}: ref not found or no commits beyond it`);
+    if (!resolved.base && !resolved.onBase && (await isShallow(root))) throw new Error(SHALLOW_HINT);
     target = resolved.target;
     rangeLabel = resolved.label;
   }
