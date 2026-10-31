@@ -4570,14 +4570,15 @@ function hunkPromptIds(h) {
   return uniq([...h.prompt ? [h.prompt.id] : [], ...h.edits.filter((e) => e.failed !== !0).map((e) => e.promptId)]);
 }
 function buildScopeIndex(hunks, ctx) {
-  let agent = hunks.filter(isAgentAttributed), promptDirs = /* @__PURE__ */ new Map(), promptFiles = /* @__PURE__ */ new Map(), dirsOf = (id) => {
+  let agent = hunks.filter(isAgentAttributed), promptDirs = /* @__PURE__ */ new Map(), promptFileSets = /* @__PURE__ */ new Map(), dirsOf = (id) => {
     let d = promptDirs.get(id);
     return d || promptDirs.set(id, d = /* @__PURE__ */ new Set()), d;
   };
   for (let h of agent) {
     let path13 = toRepoPath(h.hunk.file, ctx.repoRoot);
     for (let id of hunkPromptIds(h)) {
-      promptFiles.set(id, uniq([...promptFiles.get(id) ?? [], path13]));
+      let set = promptFileSets.get(id);
+      set || promptFileSets.set(id, set = /* @__PURE__ */ new Set()), set.add(path13);
       let text2 = ctx.prompts.find((p) => p.id === id)?.text.toLowerCase() ?? "";
       fileMentioned(path13, text2) && dirsOf(id).add(posix.dirname(path13));
     }
@@ -4593,8 +4594,9 @@ function buildScopeIndex(hunks, ctx) {
   }
   return {
     promptDirs,
-    promptFiles,
+    promptFiles: new Map([...promptFileSets].map(([id, set]) => [id, [...set]])),
     anchoredFiles: /* @__PURE__ */ new Map(),
+    pools: /* @__PURE__ */ new Map(),
     promptTexts: new Map(ctx.prompts.map((p) => [p.id, p.text.toLowerCase()])),
     promptText: ctx.prompts.map((p) => p.text).join(`
 `).toLowerCase(),
@@ -4621,9 +4623,6 @@ function sameArea(a, b) {
   let ka = a.split("/").slice(0, 2), kb = b.split("/").slice(0, 2);
   return ka.length === 2 && kb.length === 2 && ka.join("/") === kb.join("/");
 }
-function related(a, b) {
-  return a === b ? !0 : a === "." || b === "." ? !1 : a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
-}
 function pathTokens(path13) {
   let base = posix.basename(path13), stem = base.replace(/\.[^.]+$/, ""), segments = posix.dirname(path13).split("/").filter((s) => s.length >= 4 && s !== ".");
   return [base, ...stem.length >= 4 ? [stem] : [], ...segments];
@@ -4639,12 +4638,41 @@ function anchoredFilesOf(id, scope) {
   let set = scope.anchoredFiles.get(id);
   return set || (set = new Set((scope.promptFiles.get(id) ?? []).filter((f) => anchoredBy(f, id, scope))), scope.anchoredFiles.set(id, set)), set;
 }
+function ancestorsOf(dir) {
+  let out = [];
+  for (let i = dir.lastIndexOf("/"); i > 0; i = dir.lastIndexOf("/", i - 1)) out.push(dir.slice(0, i));
+  return out;
+}
+function dirCounts(files) {
+  let set = new Set(files), inDir = /* @__PURE__ */ new Map(), under = /* @__PURE__ */ new Map();
+  for (let f of set) {
+    let d = posix.dirname(f);
+    if (inDir.set(d, (inDir.get(d) ?? 0) + 1), d !== ".") for (let a of ancestorsOf(d)) under.set(a, (under.get(a) ?? 0) + 1);
+  }
+  return { files: set, inDir, under };
+}
+function relatedCount(c, dir) {
+  if (dir === ".") return c.inDir.get(".") ?? 0;
+  let n = (c.inDir.get(dir) ?? 0) + (c.under.get(dir) ?? 0);
+  for (let a of ancestorsOf(dir)) n += c.inDir.get(a) ?? 0;
+  return n;
+}
+function poolsOf(ids, scope) {
+  let key = ids.join("\0"), pools = scope.pools.get(key);
+  if (!pools) {
+    let all = new Set(ids.flatMap((id) => scope.promptFiles.get(id) ?? [])), anchored = [...all].filter((f) => ids.some((id) => anchoredFilesOf(id, scope).has(f)));
+    pools = { all: dirCounts(all), anchored: dirCounts(anchored) }, scope.pools.set(key, pools);
+  }
+  return pools;
+}
 function outOfScopeReason(path13, scope, ids) {
   if (!scope.promptText || isLockfile(path13) || isSnapshotFile(path13)) return null;
   let dir = posix.dirname(path13);
-  if (pathTokens(path13).some((t) => mentioned(t, scope.promptText)) || ids.some((id) => anchoredBy(path13, id, scope)) || scope.agentFiles.every((f) => f === path13)) return null;
-  let others = uniq(ids.flatMap((id) => scope.promptFiles.get(id) ?? [])).filter((f) => f !== path13), anchored = others.filter((f) => ids.some((id) => anchoredFilesOf(id, scope).has(f))), pool = anchored.length > 0 ? anchored : others;
-  return pool.length > 0 && pool.filter((f) => related(posix.dirname(f), dir)).length / pool.length > 0.5 ? null : `Not mentioned in any prompt and away from the agent's other edits (${dir === "." ? "repo root" : `${dir}/`})`;
+  if (pathTokens(path13).some((t) => mentioned(t, scope.promptText)) || ids.some((id) => anchoredBy(path13, id, scope))) return null;
+  let agentFiles = scope.agentFiles;
+  if (agentFiles.length === 0 || agentFiles.length === 1 && agentFiles[0] === path13) return null;
+  let pools = poolsOf(ids, scope), size = (c) => c.files.size - (c.files.has(path13) ? 1 : 0), pool = size(pools.anchored) > 0 ? pools.anchored : pools.all, poolSize = size(pool);
+  return poolSize > 0 && (relatedCount(pool, dir) - (pool.files.has(path13) ? 1 : 0)) / poolSize > 0.5 ? null : `Not mentioned in any prompt and away from the agent's other edits (${dir === "." ? "repo root" : `${dir}/`})`;
 }
 
 // src/summary.ts

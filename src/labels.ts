@@ -1507,6 +1507,8 @@ interface ScopeIndex {
   promptFiles: Map<string, string[]>;
   /** Per prompt, the subset of its files that it anchors (computed once per prompt, on first use). */
   anchoredFiles: Map<string, Set<string>>;
+  /** Per set of prompt ids, the files they touched and those they anchor, with directory counts. */
+  pools: Map<string, { all: DirCounts; anchored: DirCounts }>;
   /** Lower-cased text of each prompt, by id. */
   promptTexts: Map<string, string>;
   fileText?: LabelContext['fileText'];
@@ -1519,7 +1521,7 @@ function hunkPromptIds(h: AttributedHunk): string[] {
 function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex {
   const agent = hunks.filter(isAgentAttributed);
   const promptDirs = new Map<string, Set<string>>();
-  const promptFiles = new Map<string, string[]>();
+  const promptFileSets = new Map<string, Set<string>>();
   const dirsOf = (id: string): Set<string> => {
     let d = promptDirs.get(id);
     if (!d) promptDirs.set(id, (d = new Set()));
@@ -1528,7 +1530,9 @@ function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex
   for (const h of agent) {
     const path = toRepoPath(h.hunk.file, ctx.repoRoot);
     for (const id of hunkPromptIds(h)) {
-      promptFiles.set(id, uniq([...(promptFiles.get(id) ?? []), path]));
+      let set = promptFileSets.get(id);
+      if (!set) promptFileSets.set(id, (set = new Set()));
+      set.add(path);
       const text = ctx.prompts.find((p) => p.id === id)?.text.toLowerCase() ?? '';
       if (fileMentioned(path, text)) dirsOf(id).add(posix.dirname(path));
     }
@@ -1545,8 +1549,9 @@ function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex
   }
   return {
     promptDirs,
-    promptFiles,
+    promptFiles: new Map([...promptFileSets].map(([id, set]) => [id, [...set]])),
     anchoredFiles: new Map(),
+    pools: new Map(),
     promptTexts: new Map(ctx.prompts.map((p) => [p.id, p.text.toLowerCase()])),
     promptText: ctx.prompts.map((p) => p.text).join('\n').toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
@@ -1633,20 +1638,74 @@ function anchoredFilesOf(id: string, scope: ScopeIndex): Set<string> {
   return set;
 }
 
+/**
+ * A set of files with per-directory counts, so "how many of these files live in `dir`, an
+ * ancestor or a descendant of it" is answered in O(depth) instead of a scan of every file.
+ */
+interface DirCounts {
+  files: Set<string>;
+  /** Files directly in a directory */
+  inDir: Map<string, number>;
+  /** Files strictly below a directory (never counted for the repo root) */
+  under: Map<string, number>;
+}
+
+/** Strict ancestors of a directory, excluding the repo root: `a/b/c` -> `a/b`, `a`. */
+function ancestorsOf(dir: string): string[] {
+  const out: string[] = [];
+  for (let i = dir.lastIndexOf('/'); i > 0; i = dir.lastIndexOf('/', i - 1)) out.push(dir.slice(0, i));
+  return out;
+}
+
+function dirCounts(files: Iterable<string>): DirCounts {
+  const set = new Set(files);
+  const inDir = new Map<string, number>();
+  const under = new Map<string, number>();
+  for (const f of set) {
+    const d = posix.dirname(f);
+    inDir.set(d, (inDir.get(d) ?? 0) + 1);
+    if (d !== '.') for (const a of ancestorsOf(d)) under.set(a, (under.get(a) ?? 0) + 1);
+  }
+  return { files: set, inDir, under };
+}
+
+/** How many files of `c` sit in a directory {@link related} to `dir`. */
+function relatedCount(c: DirCounts, dir: string): number {
+  if (dir === '.') return c.inDir.get('.') ?? 0;
+  let n = (c.inDir.get(dir) ?? 0) + (c.under.get(dir) ?? 0);
+  for (const a of ancestorsOf(dir)) n += c.inDir.get(a) ?? 0;
+  return n;
+}
+
+function poolsOf(ids: string[], scope: ScopeIndex): { all: DirCounts; anchored: DirCounts } {
+  const key = ids.join('\0');
+  let pools = scope.pools.get(key);
+  if (!pools) {
+    const all = new Set(ids.flatMap((id) => scope.promptFiles.get(id) ?? []));
+    // A prompt that names some touched file is anchored: only anchored files vouch for their neighbours.
+    const anchored = [...all].filter((f) => ids.some((id) => anchoredFilesOf(id, scope).has(f)));
+    pools = { all: dirCounts(all), anchored: dirCounts(anchored) };
+    scope.pools.set(key, pools);
+  }
+  return pools;
+}
+
 function outOfScopeReason(path: string, scope: ScopeIndex, ids: string[]): string | null {
   if (!scope.promptText || isLockfile(path) || isSnapshotFile(path)) return null;
   const dir = posix.dirname(path);
   if (pathTokens(path).some((t) => mentioned(t, scope.promptText))) return null;
   if (ids.some((id) => anchoredBy(path, id, scope))) return null;
 
-  if (scope.agentFiles.every((f) => f === path)) return null;
-  const others = uniq(ids.flatMap((id) => scope.promptFiles.get(id) ?? [])).filter((f) => f !== path);
-  // A prompt that names some touched file is anchored: only anchored files vouch for their neighbours.
-  const anchored = others.filter((f) => ids.some((id) => anchoredFilesOf(id, scope).has(f)));
-  const pool = anchored.length > 0 ? anchored : others;
-  if (pool.length > 0) {
-    const near = pool.filter((f) => related(posix.dirname(f), dir)).length;
-    if (near / pool.length > 0.5) return null;
+  const agentFiles = scope.agentFiles;
+  if (agentFiles.length === 0 || (agentFiles.length === 1 && agentFiles[0] === path)) return null;
+  // The other files of the same prompt(s), the file itself left out.
+  const pools = poolsOf(ids, scope);
+  const size = (c: DirCounts): number => c.files.size - (c.files.has(path) ? 1 : 0);
+  const pool = size(pools.anchored) > 0 ? pools.anchored : pools.all;
+  const poolSize = size(pool);
+  if (poolSize > 0) {
+    const near = relatedCount(pool, dir) - (pool.files.has(path) ? 1 : 0);
+    if (near / poolSize > 0.5) return null;
   }
   return `Not mentioned in any prompt and away from the agent's other edits (${dir === '.' ? 'repo root' : `${dir}/`})`;
 }
