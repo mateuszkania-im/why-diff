@@ -1,0 +1,7 @@
+{
+  "id": "prt_020",
+  "sessionID": "ses_01demoA",
+  "messageID": "msg_003",
+  "type": "text",
+  "text": "Rename the helper file to greeting.ts"
+}

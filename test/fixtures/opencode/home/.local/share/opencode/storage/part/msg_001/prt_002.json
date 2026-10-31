@@ -1,0 +1,8 @@
+{
+  "id": "prt_002",
+  "sessionID": "ses_01demoA",
+  "messageID": "msg_001",
+  "type": "text",
+  "synthetic": true,
+  "text": "Called the Read tool with the following input: {\"filePath\":\"/work/demo-repo/src/greet.ts\"}"
+}

@@ -1,0 +1,34 @@
+# why-diff intent classifier eval.
+#
+# Each test is one hand-labelled hunk from dataset.jsonl. The provider runs
+# why-diff's real prompt builder and backend; the output is the verdict string
+# (requested | implied | unrequested | unclear) compared to the gold label.
+#
+#   npx promptfoo@0.120.19 eval -c evals/promptfooconfig.yaml -o evals/results.json --no-cache
+#   node evals/score.mjs evals/results.json   # writes evals/RESULTS.md
+#
+# promptfoo >= 0.120.20 needs Node >= 22.22; 0.120.19 runs on Node 20/22.
+description: why-diff intent classifier (requested / implied / unrequested / unclear)
+
+# The provider builds the real prompt from the `case` var; this template only
+# gives promptfoo something to display.
+prompts:
+  - 'why-diff intent check for {{id}}'
+
+providers:
+  - id: file://provider.mjs
+    label: claude-cli/haiku
+    config:
+      backend: claude-cli
+      model: haiku
+  # Uncomment to compare against the Messages API (needs ANTHROPIC_API_KEY):
+  # - id: file://provider.mjs
+  #   label: anthropic/claude-haiku-4-5
+  #   config:
+  #     backend: anthropic
+  #     model: claude-haiku-4-5
+
+tests: file://tests.mjs
+
+evaluateOptions:
+  maxConcurrency: 4

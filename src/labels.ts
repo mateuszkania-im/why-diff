@@ -1,0 +1,1237 @@
+/**
+ * Deterministic hunk labelling.
+ *
+ * Every rule in this file is a pure function of the diff text, the file path
+ * and the prompts of the session. Nothing calls a model and nothing touches the
+ * filesystem, so the same input always yields the same labels.
+ *
+ * The rules are heuristics. Each one is documented next to its implementation
+ * together with the false positives it deliberately guards against. When a rule
+ * is unsure it stays quiet: a missed label is cheaper for a reviewer than a
+ * noisy one that teaches them to ignore the column.
+ *
+ * Labels set elsewhere (not here): `unattributed`, `bash-edit`.
+ */
+import { posix } from 'node:path';
+import type { AttributedHunk, DiffLine, Label, LabelKind, Prompt } from './types.js';
+
+export interface LabelContext {
+  prompts: Prompt[];
+  repoRoot: string;
+}
+
+/** Hard cap for `Label.detail`. */
+const DETAIL_MAX = 120;
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Attach deterministic labels to every hunk.
+ *
+ * Returns new objects (inputs are not mutated). Existing labels are kept and
+ * win over freshly computed ones of the same kind; the result holds at most one
+ * label per kind.
+ */
+export function labelHunks(hunks: AttributedHunk[], ctx: LabelContext): AttributedHunk[] {
+  const scope = buildScopeIndex(hunks, ctx);
+  return hunks.map((h) => {
+    const path = toRepoPath(h.hunk.file, ctx.repoRoot);
+    const fresh = computeLabels(h, path, scope);
+    return { ...h, labels: mergeLabels(h.labels, fresh) };
+  });
+}
+
+/**
+ * True for files that hold tests, across ecosystems.
+ *
+ * Snapshot files are deliberately excluded: they get their own
+ * `snapshot-updated` label instead of a second, redundant one.
+ */
+export function isTestFile(path: string): boolean {
+  const p = normalisePath(path);
+  if (isSnapshotFile(p)) return false;
+  return TEST_FILE_PATTERNS.some((re) => re.test(p));
+}
+
+/** True for dependency lockfiles (generated, usually not reviewed by hand). */
+export function isLockfile(path: string): boolean {
+  return LOCKFILES.has(posix.basename(normalisePath(path)));
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration
+// ---------------------------------------------------------------------------
+
+function computeLabels(h: AttributedHunk, path: string, scope: ScopeIndex): Label[] {
+  const out: Label[] = [];
+  const agent = isAgentAttributed(h);
+  const lines = h.hunk.lines;
+  const push = (kind: LabelKind, severity: Label['severity'], detail: string): void => {
+    out.push({ kind, severity, detail: clip(detail) });
+  };
+
+  if (isTestFile(path)) {
+    push(
+      'test-modified',
+      agent ? 'risk' : 'info',
+      agent ? 'Agent changed a test file' : 'Test file changed (not by the agent)',
+    );
+  }
+
+  const skips = detectTestSkips(path, lines);
+  if (skips.length > 0) push('test-skip-added', 'risk', `Adds ${listOf(skips)}`);
+
+  const assertions = detectAssertionChanges(path, lines);
+  if (assertions.length > 0) push('assertion-removed', 'risk', assertions.join('; '));
+
+  if (isSnapshotFile(path)) push('snapshot-updated', 'warn', 'Snapshot file changed');
+
+  const deps = detectNewDependencies(path, lines);
+  if (deps.length > 0) {
+    push('dependency-added', 'warn', `New ${deps.length === 1 ? 'dependency' : 'dependencies'}: ${listOf(deps)}`);
+  }
+
+  if (isLockfile(path)) push('lockfile', 'info', `Lockfile churn (${posix.basename(path)})`);
+
+  const config = detectConfigChange(path, lines);
+  if (config) push('config-changed', 'warn', config);
+
+  if (isCiFile(path)) push('ci-changed', 'risk', `CI pipeline changed (${path})`);
+
+  const suppressions = detectLintSuppressions(path, lines);
+  if (suppressions.length > 0) push('lint-suppressed', 'warn', `Adds ${listOf(suppressions)}`);
+
+  const anys = detectTypeAny(path, lines);
+  if (anys.length > 0) push('type-any-added', 'warn', `Adds ${listOf(anys)}`);
+
+  const secrets = detectSecrets(path, lines);
+  if (secrets.length > 0) push('secret-like', 'risk', secrets.join('; '));
+
+  if (agent) {
+    const why = outOfScopeReason(path, scope);
+    if (why) push('out-of-scope', 'warn', why);
+  }
+
+  return out;
+}
+
+function mergeLabels(existing: Label[], fresh: Label[]): Label[] {
+  const seen = new Set<LabelKind>();
+  const out: Label[] = [];
+  for (const label of [...existing, ...fresh]) {
+    if (seen.has(label.kind)) continue;
+    seen.add(label.kind);
+    out.push(label);
+  }
+  return out;
+}
+
+/**
+ * A hunk counts as the agent's when a non-failed edit explains it and it is
+ * owned by a prompt (or, lacking one, mostly covered by agent edits). A
+ * prompt-less segment where a line or two happen to match an edit is not.
+ */
+function isAgentAttributed(h: AttributedHunk): boolean {
+  return h.match !== 'none' && (h.prompt !== undefined || h.coverage >= 0.5) && h.edits.some((e) => e.failed !== true);
+}
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+function normalisePath(path: string): string {
+  return path.replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
+function toRepoPath(file: string, repoRoot: string): string {
+  const p = normalisePath(file);
+  const root = normalisePath(repoRoot).replace(/\/+$/, '');
+  if (root && p.startsWith(`${root}/`)) return p.slice(root.length + 1);
+  return p;
+}
+
+function extOf(path: string): string {
+  const base = posix.basename(path);
+  const dot = base.lastIndexOf('.');
+  return dot <= 0 ? '' : base.slice(dot + 1).toLowerCase();
+}
+
+/**
+ * Test file conventions. Java/Kotlin/C# suffixes are matched case-sensitively
+ * on purpose so `Latest.java` is not mistaken for `*Test.java`.
+ */
+const TEST_FILE_PATTERNS: readonly RegExp[] = [
+  /\.(?:test|spec|e2e-spec|e2e)\.[^/]+$/i, // JS/TS: foo.test.ts, foo.spec.tsx, app.e2e-spec.ts
+  /(?:^|\/)__tests__\//, // Jest
+  /(?:^|\/)tests?\//i, // test/, tests/, src/test/java/...
+  /(?:^|\/)test_[^/]*\.py$/, // pytest: test_foo.py
+  /_test\.py$/, // pytest: foo_test.py
+  /(?:^|\/)conftest\.py$/, // pytest fixtures
+  /_test\.go$/, // Go
+  /_(?:spec|test)\.rb$/, // RSpec / minitest
+  /(?:^|\/)spec\//, // RSpec dir
+  /[A-Za-z0-9](?:Tests?|IT)\.(?:java|kt|kts|scala|groovy)$/, // JUnit
+  /[A-Za-z0-9]Tests?\.cs$/, // xUnit / NUnit
+  /(?:^|\/)(?:cypress|playwright|e2e)\//i, // browser suites
+];
+
+const LOCKFILES: ReadonlySet<string> = new Set([
+  'package-lock.json',
+  'npm-shrinkwrap.json',
+  'pnpm-lock.yaml',
+  'yarn.lock',
+  'bun.lockb',
+  'bun.lock',
+  'poetry.lock',
+  'Pipfile.lock',
+  'uv.lock',
+  'pdm.lock',
+  'Cargo.lock',
+  'go.sum',
+  'Gemfile.lock',
+  'composer.lock',
+  'Podfile.lock',
+  'packages.lock.json',
+]);
+
+function isSnapshotFile(path: string): boolean {
+  const p = normalisePath(path);
+  return /(?:^|\/)__snapshots__\//.test(p) || /\.snap$/.test(p);
+}
+
+const CI_PATTERNS: readonly RegExp[] = [
+  /(?:^|\/)\.github\/workflows\//,
+  /(?:^|\/)\.github\/actions\//,
+  /(?:^|\/)\.gitlab-ci\.ya?ml$/,
+  /(?:^|\/)\.gitlab\/ci\//,
+  /(?:^|\/)\.circleci\//,
+  /(?:^|\/)Jenkinsfile(?:\.[^/]+)?$/,
+  /(?:^|\/)azure-pipelines[^/]*\.ya?ml$/,
+  /(?:^|\/)\.azure-pipelines\//,
+  /(?:^|\/)bitbucket-pipelines\.ya?ml$/,
+  /(?:^|\/)\.buildkite\//,
+  /(?:^|\/)\.travis\.ya?ml$/,
+];
+
+function isCiFile(path: string): boolean {
+  return CI_PATTERNS.some((re) => re.test(path));
+}
+
+/** Basename patterns of tool/build configuration files. */
+const CONFIG_BASENAMES: readonly RegExp[] = [
+  /^[jt]sconfig(?:\.[\w-]+)*\.json$/,
+  /^\.eslintrc(?:\.\w+)?$/,
+  /^eslint\.config\.\w+$/,
+  /^\.eslintignore$/,
+  /^\.prettierrc(?:\.\w+)?$/,
+  /^prettier\.config\.\w+$/,
+  /^\.prettierignore$/,
+  /^biome\.jsonc?$/,
+  /^(?:vite|vitest|next|webpack|rollup|rspack|tsup|esbuild|svelte|astro|nuxt|remix|postcss|tailwind|jest|playwright|cypress|turbo)\.config\.\w+$/,
+  /^vitest\.workspace\.\w+$/,
+  /^karma\.conf\.\w+$/,
+  /^(?:babel\.config\.\w+|\.babelrc(?:\.\w+)?)$/,
+  /^\.swcrc$/,
+  /^(?:Dockerfile|Containerfile)(?:\.[\w-]+)?$/,
+  /\.dockerfile$/i,
+  /^\.dockerignore$/,
+  /^(?:docker-)?compose(?:\.[\w-]+)?\.ya?ml$/,
+  /^\.env\.(?:example|sample|template|dist)$/,
+  /^\.(?:editorconfig|npmrc|nvmrc|node-version|yarnrc(?:\.yml)?|python-version|tool-versions)$/,
+  /^(?:setup\.cfg|tox\.ini|pytest\.ini|mypy\.ini|\.flake8|ruff\.toml|\.ruff\.toml|\.pylintrc|\.coveragerc)$/,
+  /^\.pre-commit-config\.ya?ml$/,
+  /^\.golangci\.ya?ml$/,
+  /^(?:rustfmt|\.rustfmt|clippy)\.toml$/,
+  /^\.rubocop\.yml$/,
+];
+
+// ---------------------------------------------------------------------------
+// Line helpers
+// ---------------------------------------------------------------------------
+
+type CommentStyle = 'slash' | 'hash' | 'none';
+
+const HASH_COMMENT_EXT = new Set(['py', 'pyi', 'rb', 'sh', 'bash', 'zsh', 'yml', 'yaml', 'toml', 'r', 'pl', 'cfg', 'ini']);
+const SLASH_COMMENT_EXT = new Set([
+  'js', 'jsx', 'mjs', 'cjs', 'ts', 'tsx', 'mts', 'cts', 'go', 'java', 'kt', 'kts', 'scala', 'groovy',
+  'cs', 'rs', 'c', 'h', 'cc', 'cpp', 'hpp', 'swift', 'php', 'dart', 'vue', 'svelte',
+]);
+const PROSE_EXT = new Set(['md', 'mdx', 'markdown', 'rst', 'txt', 'adoc']);
+const TS_EXT = new Set(['ts', 'tsx', 'mts', 'cts']);
+
+function commentStyle(path: string): CommentStyle {
+  const ext = extOf(path);
+  if (HASH_COMMENT_EXT.has(ext)) return 'hash';
+  if (SLASH_COMMENT_EXT.has(ext)) return 'slash';
+  return 'none';
+}
+
+const STRING_LITERAL = /"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\\n]|\\.)*`/g;
+
+/** Replace string literal contents with `""` so prose inside strings cannot match. */
+function stripStrings(line: string): string {
+  return line.replace(STRING_LITERAL, '""');
+}
+
+/** Strings and comments removed: what the compiler actually sees (approximately). */
+function codeOf(line: string, style: CommentStyle): string {
+  let s = stripStrings(line);
+  if (style === 'slash') {
+    if (/^\s*\*/.test(s)) return ''; // block comment continuation
+    s = s.replace(/\/\*.*?\*\//g, '').replace(/\/\/.*$/, '');
+  } else if (style === 'hash') {
+    s = s.replace(/#(?!\[).*$/, '');
+  }
+  return s;
+}
+
+/** Whitespace-insensitive key used to decide that a line was merely moved or reindented. */
+function normaliseLine(line: string): string {
+  return line.replace(/\s+/g, '').replace(/[;,]+$/, '');
+}
+
+/**
+ * Added lines that are genuinely new: a `+` line whose normalised text also
+ * appears as a `-` line in the same hunk was only moved or reformatted.
+ */
+function netAdded(lines: DiffLine[]): DiffLine[] {
+  const removed = new Map<string, number>();
+  for (const l of lines) {
+    if (l.type !== 'del') continue;
+    const k = normaliseLine(l.text);
+    removed.set(k, (removed.get(k) ?? 0) + 1);
+  }
+  const out: DiffLine[] = [];
+  for (const l of lines) {
+    if (l.type !== 'add') continue;
+    const k = normaliseLine(l.text);
+    const n = removed.get(k) ?? 0;
+    if (n > 0) removed.set(k, n - 1);
+    else out.push(l);
+  }
+  return out;
+}
+
+function clip(s: string, max = DETAIL_MAX): string {
+  const flat = s.replace(/\s+/g, ' ').trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+}
+
+function uniq<T>(xs: Iterable<T>): T[] {
+  return [...new Set(xs)];
+}
+
+function listOf(items: string[]): string {
+  return uniq(items).join(', ');
+}
+
+/** Content between the bracket at `open` and its match (or the end of the line). */
+function balanced(s: string, open: number): { inner: string; end: number } {
+  const pairs: Record<string, string> = { '(': ')', '[': ']', '{': '}' };
+  const stack: string[] = [];
+  for (let i = open; i < s.length; i++) {
+    const c = s.charAt(i);
+    const close = pairs[c];
+    if (close !== undefined) stack.push(close);
+    else if (c === stack[stack.length - 1]) {
+      stack.pop();
+      if (stack.length === 0) return { inner: s.slice(open + 1, i), end: i + 1 };
+    }
+  }
+  return { inner: s.slice(open + 1), end: s.length };
+}
+
+/** Split on commas that are not nested in brackets. */
+function splitTopLevel(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let cur = '';
+  for (const c of s) {
+    if ('([{'.includes(c)) depth++;
+    else if (')]}'.includes(c)) depth--;
+    if (c === ',' && depth === 0) {
+      out.push(cur.trim());
+      cur = '';
+    } else cur += c;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// test-skip-added
+// ---------------------------------------------------------------------------
+
+interface Pattern {
+  re: RegExp;
+  name: string;
+  /** Only apply inside test files (the token is ambiguous elsewhere). */
+  testOnly?: boolean;
+  /** Only apply to files with these extensions. */
+  ext?: readonly string[];
+}
+
+/**
+ * Skip/focus markers. Matched on code with strings and comments removed, so
+ * `it('should skip empty rows')` or `# TODO: pytest.skip(...)` never match.
+ * Bare `.skip(` is limited to test files (Mongo cursors, streams and query
+ * builders have `.skip()` too); variables like `skipCount` never match because
+ * every pattern needs a call, member access or decorator shape.
+ */
+const SKIP_PATTERNS: readonly Pattern[] = [
+  { re: /\b(?:describe|it|test|context|suite|specify|bench)\s*\.\s*(skip|only|todo|fixme|fails)\b/, name: '.$1' },
+  { re: /(?<![\w$.])(xit|xdescribe|xtest|xcontext|xspecify|fit|fdescribe|fcontext)\s*[(\s]/, name: '$1', testOnly: true },
+  { re: /@pytest\.mark\.(skip|skipif|xfail)\b/, name: '@pytest.mark.$1' },
+  { re: /\bpytest\.(skip|xfail)\s*\(/, name: 'pytest.$1()' },
+  { re: /@unittest\.(skip\w*|expectedFailure)\b/, name: '@unittest.$1' },
+  { re: /\bself\.skipTest\s*\(/, name: 'self.skipTest()' },
+  { re: /\b[tb]\.(Skip(?:f|Now)?)\s*\(/, name: 't.$1()', ext: ['go'] },
+  { re: /@(Disabled|Ignore)\b/, name: '@$1', ext: ['java', 'kt', 'kts', 'scala', 'groovy'] },
+  { re: /\[\s*(Ignore)\b/, name: '[Ignore]', ext: ['cs'] },
+  { re: /\[\s*(?:Fact|Theory)\s*\(\s*Skip\s*=/, name: '[Fact(Skip=…)]', ext: ['cs'] },
+  { re: /#\[(ignore)\b/, name: '#[ignore]', ext: ['rs'] },
+  { re: /^\s*(pending|skip)\b(?=\s*$|\s*\(|\s+["'])/, name: '$1', testOnly: true, ext: ['rb'] },
+  { re: /(?<![\w$.])(pending)\s*\(/, name: 'pending()', testOnly: true, ext: ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs'] },
+  // Last: generic member call, e.g. `suite.skip(` or `bench.only(` in a test file.
+  { re: /\.\s*(skip|only)\s*\(/, name: '.$1()', testOnly: true },
+];
+
+function matchPatterns(
+  text: string,
+  patterns: readonly Pattern[],
+  path: string,
+  inTest: boolean,
+  firstOnly = false,
+): string[] {
+  const ext = extOf(path);
+  const hits: string[] = [];
+  for (const p of patterns) {
+    if (p.testOnly && !inTest) continue;
+    if (p.ext && !p.ext.includes(ext)) continue;
+    const m = p.re.exec(text);
+    if (!m) continue;
+    hits.push(p.name.replace('$1', m[1] ?? ''));
+    if (firstOnly) break;
+  }
+  return hits;
+}
+
+function detectTestSkips(path: string, lines: DiffLine[]): string[] {
+  const style = commentStyle(path);
+  if (PROSE_EXT.has(extOf(path))) return [];
+  const inTest = isTestFile(path);
+  const hits: string[] = [];
+  for (const l of netAdded(lines)) {
+    // Ruby `skip "reason"`: keep the string so the lookahead can see it.
+    const text = extOf(path) === 'rb' ? l.text.replace(/#.*$/, '') : codeOf(l.text, style);
+    hits.push(...matchPatterns(text, SKIP_PATTERNS, path, inTest, true));
+  }
+  return uniq(hits);
+}
+
+// ---------------------------------------------------------------------------
+// assertion-removed
+// ---------------------------------------------------------------------------
+
+/** One parsed assertion line. */
+interface Assertion {
+  /** Original line, trimmed (for details). */
+  raw: string;
+  /** Whitespace-insensitive original (strings kept) for exact re-add detection. */
+  key: string;
+  /** Canonical matcher, e.g. `tobe`, `equal`, `==`, `truthy`. */
+  matcher: string;
+  /** Matcher as written, for details. */
+  display: string;
+  negated: boolean;
+  /** Normalised operands (actual and expected, order not significant). */
+  operands: string[];
+  /** Contents of string literals on the original line (expected text, messages). */
+  literals: string[];
+}
+
+/** Canonical matcher aliases across frameworks. */
+const MATCHER_ALIASES: Record<string, string> = {
+  equals: 'equal',
+  areequal: 'equal',
+  eq: 'equal',
+  eql: 'equal',
+  deepequal: 'equal',
+  tobe: 'equal',
+  toequal: 'equal',
+  same: 'strictequal',
+  deepstrictequal: 'strictequal',
+  tostrictequal: 'strictequal',
+  assert_eq: 'equal',
+  istrue: 'true',
+  ok: 'true',
+  tobetruthy: 'truthy',
+  be_truthy: 'truthy',
+  tobedefined: 'defined',
+  isnotnone: 'notnull',
+  isnotnull: 'notnull',
+  notnone: 'notnull',
+  notnil: 'notnull',
+  nonnull: 'notnull',
+  be_present: 'notnull',
+};
+
+/** 0 = existence/truthiness, 1 = partial match, 2 = equality, 3 = strict equality. */
+const MATCHER_RANK: Record<string, number> = {
+  truthy: 0,
+  true: 0,
+  defined: 0,
+  notnull: 0,
+  notempty: 0,
+  anything: 0,
+  tohavebeencalled: 0,
+  tomatchobject: 1,
+  tocontain: 1,
+  tocontainequal: 1,
+  include: 1,
+  contains: 1,
+  in: 1,
+  tohaveproperty: 1,
+  subset: 1,
+  equal: 2,
+  '==': 2,
+  tohavelength: 2,
+  tohavebeencalledwith: 2,
+  tohavebeencalledtimes: 2,
+  tothrow: 2,
+  strictequal: 3,
+  is: 3,
+};
+
+function canonicalMatcher(name: string): string {
+  const lower = name
+    .toLowerCase()
+    .replace(/^(?:self|this)\./, '')
+    .replace(/^(?:assert|require|assertions|expect)\./, '')
+    .replace(/!$/, '')
+    .replace(/^assert_?(?=.)/, '')
+    .replace(/^refute_?/, 'not');
+  return MATCHER_ALIASES[lower] ?? lower;
+}
+
+const LITERAL = /^(?:-?\d[\d_.]*(?:e-?\d+)?n?|true|false|True|False|null|None|nil|undefined|""|0x[\da-f]+)$/i;
+const NUMERIC_OR_BOOL = /^(?:-?\d[\d_.]*(?:e-?\d+)?n?|true|false|True|False)$/;
+
+function rankOf(a: Assertion): number | null {
+  // `.not.toBeNull()` / `.not.toBeUndefined()` only check existence.
+  if (a.negated && /^tobe(?:null|undefined|falsy|nan)$/.test(a.matcher)) return 0;
+  if (a.negated) return null;
+  // `toBeGreaterThan(0)` replacing an exact value is a classic weakening.
+  if (/^tobe(?:greater|less)than(?:orequal)?$/.test(a.matcher)) {
+    return a.operands.some((o) => /^-?[01]$/.test(o)) ? 0 : 1;
+  }
+  if (a.matcher === 'tothrow' && a.operands.length < 2) return 0;
+  return MATCHER_RANK[a.matcher] ?? null;
+}
+
+const FUNCTION_ASSERT =
+  /(?<![\w$.])((?:self\.|this\.)?(?:assert|refute)\w*!?|assert\.\w+|require\.[A-Z]\w*|Assert(?:ions)?\.\w+|t\.(?:Error|Errorf|Fatal|Fatalf|Fail|FailNow))\s*\(/;
+const EXPECT_CALL = /(?<![\w$.])expect\s*([({])/;
+const CHAINED_MATCHER = /^\s*\)*\s*\.\s*(?:(not)\s*\.\s*)?(?:resolves\s*\.\s*|rejects\s*\.\s*)?(to[A-Z]\w*)\s*\(/;
+const CHAIN_MODIFIER = /^\s*\.?\s*(not_to|to_not|not|resolves|rejects|to)(?=[\s.]|$)/;
+const SHOULD = /\.should(?:_not)?\b|\bshould(?:_not)?\s*(?:==|\(|be\b|eq\b|equal\b)/;
+const PY_COMPARE = /\s(==|!=|is not|is|not in|in|<=|>=|<|>)\s/;
+
+/** Assertion detection runs in test files, plus inline Rust tests. */
+function assertionsApply(path: string): boolean {
+  return isTestFile(path) || extOf(path) === 'rs';
+}
+
+function parseAssertion(line: string, path: string): Assertion | null {
+  const style = commentStyle(path);
+  const code = codeOf(line, style).trim();
+  if (!code || /^(?:def|function|func|fn|public|private|protected)\b/.test(code)) return null;
+  const literals = [...line.matchAll(STRING_LITERAL)].map((m) => m[0].slice(1, -1)).filter((x) => x.trim() !== '');
+  const base = { raw: line.trim(), key: normaliseLine(line), literals };
+  const norm = (s: string): string => s.replace(/\s+/g, '');
+
+  // expect(actual).not.toBe(expected) / expect(actual).to eq(expected) / expect { }.to raise_error
+  const ex = EXPECT_CALL.exec(code);
+  if (ex) {
+    const open = ex.index + ex[0].length - 1;
+    const subject = balanced(code, open);
+    let rest = code.slice(subject.end);
+    let negated = false;
+    // Peel chain modifiers: `.not`, `.resolves`, `.rejects`, chai `.to`, RSpec `.to` / `.not_to`.
+    for (let m = CHAIN_MODIFIER.exec(rest); m; m = CHAIN_MODIFIER.exec(rest)) {
+      if (m[1] === 'not' || m[1] === 'not_to' || m[1] === 'to_not') negated = true;
+      rest = rest.slice(m[0].length);
+    }
+    const m = /^\s*\.?\s*(\w+)\s*(\(?)/.exec(rest);
+    const display = m?.[1] ?? 'expect';
+    let expected = '';
+    if (m) {
+      const after = rest.slice(m[0].length - (m[2] ? 1 : 0));
+      expected = m[2] ? balanced(after, 0).inner : after.replace(/[;)\s]+$/, '');
+    }
+    const operands = [norm(subject.inner), ...splitTopLevel(expected).map(norm)].filter((o) => o !== '');
+    return { ...base, matcher: canonicalMatcher(display), display, negated, operands };
+  }
+
+  // Continuation of a multi-line chain: `).toBe(5)` / `.not.toEqual(x)`
+  const ch = CHAINED_MATCHER.exec(code);
+  if (ch && ch[2]) {
+    const display = ch[2];
+    const args = balanced(code, ch.index + ch[0].length - 1).inner;
+    return { ...base, matcher: canonicalMatcher(display), display, negated: ch[1] === 'not', operands: splitTopLevel(args).map(norm) };
+  }
+
+  // assertEqual(a, b) / assert.equal(a, b) / require.Equal(t, a, b) / assert_eq!(a, b) / t.Errorf(...)
+  const fn = FUNCTION_ASSERT.exec(code);
+  if (fn && fn[1]) {
+    const display = fn[1].replace(/^(?:self|this)\./, '');
+    const args = splitTopLevel(balanced(code, fn.index + fn[0].length - 1).inner).map(norm);
+    if (args[0] === 't') args.shift(); // testify: assert.Equal(t, want, got)
+    let matcher = canonicalMatcher(display);
+    if (matcher === 'assert' || matcher === '') matcher = 'truthy'; // assert(x) / assert!(x)
+    // Negated function forms (assertNotEqual, refute_*) are distinct matchers with no rank.
+    return { ...base, matcher, display, negated: false, operands: args };
+  }
+
+  // Python / Ruby bare: `assert a == b`, `assert x`, `assert x is not None`
+  const py = /^assert\s+(.+)$/.exec(code);
+  if (py?.[1] && /^(?:py|pyi)$/.test(extOf(path))) {
+    const expr = ` ${splitTopLevel(py[1])[0] ?? ''} `; // drop the `, "message"` part
+    const cmp = PY_COMPARE.exec(expr);
+    if (!cmp?.[1]) return { ...base, matcher: 'truthy', display: 'bare assert', negated: false, operands: [norm(expr)] };
+    const lhs = norm(expr.slice(0, cmp.index));
+    const rhs = norm(expr.slice(cmp.index + cmp[0].length));
+    if (cmp[1] === 'is not' && rhs === 'None') {
+      return { ...base, matcher: 'notnull', display: 'assert is not None', negated: false, operands: [lhs] };
+    }
+    return { ...base, matcher: cmp[1], display: `assert ${cmp[1]}`, negated: false, operands: [lhs, rhs] };
+  }
+
+  // RSpec / chai should
+  if (SHOULD.test(code)) {
+    return { ...base, matcher: 'should', display: 'should', negated: /should_not|\.not\b/.test(code), operands: [] };
+  }
+  return null;
+}
+
+/** Local variable name to the (normalised) expression it was assigned from. */
+type Aliases = ReadonlyMap<string, string>;
+
+/**
+ * `const out = receipt(items)`, `let x: T = f()`, `out = f()` (Python/Ruby),
+ * `out := F()` (Go), `String out = f();` (Java/C#). Destructuring and member
+ * targets are ignored.
+ */
+const ASSIGNMENT =
+  /^\s*(?:(?:const|let|var|val|final|auto)\s+)?(?:[A-Z][\w<>[\],.?]*\s+)?([A-Za-z_$][\w$]*)(?:\s*:\s*[^=]+?)?\s*(?::=|=(?![=>]))\s*(.+?)\s*;?\s*$/;
+
+function collectAliases(lines: DiffLine[], path: string): Aliases {
+  const style = commentStyle(path);
+  const out = new Map<string, string>();
+  for (const l of lines) {
+    const m = ASSIGNMENT.exec(codeOf(l.text, style));
+    if (m?.[1] && m[2] && !EXPECT_CALL.test(m[2])) out.set(m[1], m[2].replace(/\s+/g, ''));
+  }
+  return out;
+}
+
+/** Operands plus whatever they alias, so `expect(out)` matches `expect(receipt(items))`. */
+function subjects(a: Assertion, aliases: Aliases): Set<string> {
+  const out = new Set<string>();
+  for (const o of a.operands) {
+    if (o === '' || LITERAL.test(o)) continue;
+    out.add(o);
+    const target = aliases.get(o);
+    if (target) out.add(target);
+  }
+  return out;
+}
+
+function sharesSubject(d: Assertion, a: Assertion, aliases: Aliases): boolean {
+  const ds = subjects(d, aliases);
+  return [...subjects(a, aliases)].some((o) => ds.has(o));
+}
+
+function wordsOf(s: string): string[] {
+  return s.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+}
+
+/**
+ * The added assertion's expected text refines the deleted one: every word of
+ * some deleted literal appears in an added literal (`'TOTAL  30'` refined to
+ * `'TOTAL  $30.00'`).
+ */
+function refinesLiteral(d: Assertion, a: Assertion): boolean {
+  return d.literals.some((dl) => {
+    const need = wordsOf(dl);
+    if (need.length === 0) return false;
+    return a.literals.some((al) => {
+      const have = new Set(wordsOf(al));
+      return need.every((w) => have.has(w));
+    });
+  });
+}
+
+/** True unless `a` is measurably weaker than `d`. */
+function notWeaker(d: Assertion, a: Assertion): boolean {
+  const rd = rankOf(d);
+  const ra = rankOf(a);
+  if (rd !== null && ra !== null) return ra >= rd;
+  return !(d.negated && !a.negated);
+}
+
+/** Operands that differ between two assertions, if all differences are numeric/boolean literals. */
+function literalChange(d: Assertion, a: Assertion, aliases: Aliases): { from: string; to: string } | null {
+  if (d.operands.length !== a.operands.length) return null;
+  const resolve = (o: string): string => aliases.get(o) ?? o;
+  const [dOps, aOps] = [d.operands.map(resolve), a.operands.map(resolve)];
+  const onlyD = dOps.filter((o) => !aOps.includes(o));
+  const onlyA = aOps.filter((o) => !dOps.includes(o));
+  if (onlyD.length !== 1 || onlyA.length !== 1) return null;
+  const [from, to] = [onlyD[0] ?? '', onlyA[0] ?? ''];
+  return NUMERIC_OR_BOOL.test(from) && NUMERIC_OR_BOOL.test(to) ? { from, to } : null;
+}
+
+/**
+ * Removed or weakened assertions within a single hunk.
+ *
+ * 1. Parse every `-` and `+` line that looks like an assertion.
+ * 2. Drop `-` lines re-added verbatim (whitespace-insensitive): a move, not a removal.
+ * 3. Pair each remaining `-` assertion with a `+` assertion that replaces it:
+ *    a. same subject: a shared non-literal operand, resolving local variables
+ *       assigned in the hunk (`const out = receipt(items)` makes `expect(out)`
+ *       the same subject as `expect(receipt(items))`); an equally strict or
+ *       stricter candidate is preferred;
+ *    b. otherwise an equally strict assertion whose expected string refines the
+ *       old one (all words of `'TOTAL  30'` appear in `'TOTAL  $30.00'`);
+ *    c. otherwise positionally, when exactly one of each is left.
+ *    A paired rewrite is never reported as "removed"; changed expected strings
+ *    on it are accepted. Extra added assertions are fine.
+ * 4. A pair is a weakening when the matcher drops in strictness rank
+ *    (`toBe` to `toBeDefined`, `assertEqual` to `assertTrue`, `toEqual` to `toMatchObject`,
+ *    exact to `toBeGreaterThan(0)`), when `.not` disappears, or when only a
+ *    numeric/boolean expected value changes (the test was bent to fit the code).
+ * 5. An unpaired `-` assertion was removed.
+ */
+function detectAssertionChanges(path: string, lines: DiffLine[]): string[] {
+  if (!assertionsApply(path)) return [];
+  const aliases = collectAliases(lines, path);
+  const dels: Assertion[] = [];
+  const adds: Assertion[] = [];
+  for (const l of lines) {
+    if (l.type === 'ctx') continue;
+    const a = parseAssertion(l.text, path);
+    if (a) (l.type === 'del' ? dels : adds).push(a);
+  }
+  if (dels.length === 0) return [];
+
+  const unusedAdds = [...adds];
+  const take = (pred: (a: Assertion) => boolean): Assertion | undefined => {
+    const i = unusedAdds.findIndex(pred);
+    return i < 0 ? undefined : unusedAdds.splice(i, 1)[0];
+  };
+  const pending = dels.filter((d) => !take((a) => a.key === d.key));
+
+  const findings: string[] = [];
+  const unpaired: Assertion[] = [];
+  const pairs: [Assertion, Assertion][] = [];
+  for (const d of pending) {
+    // Prefer a same-subject replacement that is at least as strict, so that
+    // `expect(out).toBeDefined(); expect(out).toBe(5)` pairs with the strong one.
+    const a =
+      take((x) => sharesSubject(d, x, aliases) && notWeaker(d, x)) ??
+      take((x) => sharesSubject(d, x, aliases)) ??
+      take((x) => refinesLiteral(d, x) && notWeaker(d, x));
+    if (a) pairs.push([d, a]);
+    else unpaired.push(d);
+  }
+  if (unpaired.length === 1 && unusedAdds.length === 1) {
+    pairs.push([unpaired.pop() as Assertion, unusedAdds.pop() as Assertion]);
+  }
+
+  for (const [d, a] of pairs) {
+    const rd = rankOf(d);
+    const ra = rankOf(a);
+    if (rd !== null && ra !== null && ra < rd) {
+      findings.push(`weakened ${d.display} to ${a.display}`);
+    } else if (d.negated && !a.negated && d.matcher === a.matcher) {
+      findings.push(`.not removed from ${d.display}`);
+    } else if (d.matcher === a.matcher && d.negated === a.negated) {
+      const change = literalChange(d, a, aliases);
+      if (change) findings.push(`expected value changed ${change.from} to ${change.to} (${d.display})`);
+    }
+  }
+  if (unpaired.length > 0) {
+    const first = clip(unpaired[0]?.raw ?? '', 60);
+    findings.unshift(unpaired.length === 1 ? `removed: ${first}` : `${unpaired.length} assertions removed, e.g. ${first}`);
+  }
+  return findings;
+}
+
+// ---------------------------------------------------------------------------
+// dependency-added
+// ---------------------------------------------------------------------------
+
+interface DepScan {
+  added: string[];
+  removed: string[];
+}
+
+/**
+ * New dependency names in a manifest hunk. Version bumps are not "new": a
+ * name both removed and added in the same hunk is ignored.
+ */
+function detectNewDependencies(path: string, lines: DiffLine[]): string[] {
+  const base = posix.basename(path);
+  let scan: DepScan | null = null;
+  if (base === 'package.json') scan = scanJsonManifest(lines, NPM_DEP_SECTIONS, NPM_SCALAR_FIELDS);
+  else if (base === 'composer.json') scan = scanJsonManifest(lines, COMPOSER_DEP_SECTIONS, COMPOSER_SCALAR_FIELDS);
+  else if (/^requirements[\w.-]*\.(?:txt|in)$/.test(base) || /(?:^|\/)requirements\/[^/]+\.(?:txt|in)$/.test(path)) {
+    scan = scanRequirements(lines);
+  } else if (base === 'pyproject.toml') scan = scanPyproject(lines);
+  else if (base === 'Cargo.toml') scan = scanCargo(lines);
+  else if (base === 'go.mod') scan = scanGoMod(lines);
+  else if (base === 'Gemfile' || base.endsWith('.gemspec')) scan = scanGemfile(lines);
+  if (!scan) return [];
+  const removed = new Set(scan.removed);
+  return uniq(scan.added.filter((n) => !removed.has(n)));
+}
+
+const NPM_DEP_SECTIONS = new Set(['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']);
+const NPM_SCALAR_FIELDS = new Set([
+  'name', 'version', 'description', 'main', 'module', 'types', 'typings', 'license', 'author', 'homepage',
+  'type', 'packageManager', 'private', 'sideEffects', 'browser', 'unpkg', 'jsdelivr',
+]);
+/** `engines` entries look like dependencies when the section header is not in the hunk. */
+const RUNTIME_NAMES = new Set(['node', 'npm', 'pnpm', 'yarn', 'bun', 'deno', 'vscode']);
+const COMPOSER_DEP_SECTIONS = new Set(['require', 'require-dev']);
+const COMPOSER_SCALAR_FIELDS = new Set(['name', 'version', 'description', 'type', 'license', 'minimum-stability', 'homepage']);
+const VERSION_SPEC = /^(?:[\^~<>=*]|\d|v\d|workspace:|npm:|file:|link:|portal:|catalog:|git|github:|https?:|latest$|next$|dev-)/;
+
+/**
+ * JSON manifests. The section is tracked from `"key": {` / `}` lines visible in
+ * the hunk. When the hunk starts inside an unknown section, an entry counts as
+ * a dependency only if its value looks like a version spec and its key is not
+ * a well-known scalar field (`"version": "1.0.0"`).
+ */
+function scanJsonManifest(lines: DiffLine[], sections: ReadonlySet<string>, scalars: ReadonlySet<string>): DepScan {
+  const scan: DepScan = { added: [], removed: [] };
+  let section: string | null | undefined; // undefined = unknown, null = top level
+  for (const l of lines) {
+    const open = /^\s*"([^"]+)"\s*:\s*\{\s*$/.exec(l.text);
+    if (open) {
+      section = open[1];
+      continue;
+    }
+    if (/^\s*\}/.test(l.text)) {
+      section = null;
+      continue;
+    }
+    if (l.type === 'ctx') continue;
+    const entry = /^\s*"([^"]+)"\s*:\s*"([^"]*)"\s*,?\s*$/.exec(l.text);
+    if (!entry || !entry[1]) continue;
+    const [name, value] = [entry[1], entry[2] ?? ''];
+    const isDep =
+      section === undefined
+        ? VERSION_SPEC.test(value) && !scalars.has(name) && !RUNTIME_NAMES.has(name)
+        : section !== null && sections.has(section);
+    if (isDep) (l.type === 'add' ? scan.added : scan.removed).push(name);
+  }
+  return scan;
+}
+
+function requirementName(spec: string): string | null {
+  const m = /^\s*["']?([A-Za-z0-9][A-Za-z0-9._-]*)/.exec(spec);
+  return m?.[1] ? m[1].toLowerCase().replace(/_/g, '-') : null;
+}
+
+function scanRequirements(lines: DiffLine[]): DepScan {
+  const scan: DepScan = { added: [], removed: [] };
+  for (const l of lines) {
+    if (l.type === 'ctx') continue;
+    const t = l.text.replace(/#.*$/, '').trim();
+    if (!t || t.startsWith('-')) continue; // -r other.txt, -e ., --index-url
+    const name = requirementName(t);
+    if (name) (l.type === 'add' ? scan.added : scan.removed).push(name);
+  }
+  return scan;
+}
+
+/** Walk TOML lines tracking the current `[table]` and open multi-line array key. */
+function walkToml(lines: DiffLine[], visit: (l: DiffLine, table: string | undefined, arrayKey: string | null) => void): void {
+  let table: string | undefined;
+  let arrayKey: string | null = null;
+  for (const l of lines) {
+    const header = /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$/.exec(l.text);
+    if (header && header[1]) {
+      table = header[1].replace(/["']/g, '');
+      arrayKey = null;
+      visit(l, table, null);
+      continue;
+    }
+    const arr = /^\s*([\w.-]+)\s*=\s*\[\s*(?:#.*)?$/.exec(l.text);
+    if (arr && arr[1]) {
+      arrayKey = arr[1];
+      continue;
+    }
+    if (arrayKey !== null && /^\s*\]/.test(l.text)) {
+      arrayKey = null;
+      continue;
+    }
+    visit(l, table, arrayKey);
+  }
+}
+
+const PY_DEP_TABLE = /^(?:tool\.poetry\.(?:group\.[\w-]+\.)?(?:dev-)?dependencies|tool\.pdm\.dev-dependencies)$/;
+const PY_ARRAY_TABLE = /^(?:project\.optional-dependencies|dependency-groups)$/;
+
+/**
+ * pyproject.toml: PEP 621 `dependencies = [...]`, optional-dependencies,
+ * dependency-groups, and Poetry `name = "^1.0"` tables. Outside a known table
+ * only quoted requirements carrying a version operator count (`"httpx>=0.27"`),
+ * so `keywords = ["cli"]` stays quiet.
+ */
+function scanPyproject(lines: DiffLine[]): DepScan {
+  const scan: DepScan = { added: [], removed: [] };
+  walkToml(lines, (l, table, arrayKey) => {
+    if (l.type === 'ctx') return;
+    const bucket = l.type === 'add' ? scan.added : scan.removed;
+    const text = l.text.replace(/#.*$/, '');
+    if (table && PY_DEP_TABLE.test(table)) {
+      const kv = /^\s*([\w.-]+)\s*=/.exec(text);
+      if (kv?.[1] && kv[1] !== 'python') bucket.push(kv[1].toLowerCase());
+      return;
+    }
+    const inDepArray =
+      (arrayKey !== null && /dependencies$/.test(arrayKey)) || (arrayKey !== null && table !== undefined && PY_ARRAY_TABLE.test(table));
+    const inline = /^\s*(?:dependencies|[\w-]*-dependencies)\s*=\s*\[(.*)\]/.exec(text);
+    const strings = [...(inline?.[1] ?? text).matchAll(/["']([^"']+)["']/g)].map((m) => m[1] ?? '');
+    for (const s of strings) {
+      if (!inDepArray && !inline && !(table === undefined && /[<>=~!]=?|@/.test(s))) continue;
+      if (s.includes('::')) continue; // classifiers
+      const name = requirementName(s);
+      if (name) bucket.push(name);
+    }
+  });
+  return scan;
+}
+
+const CARGO_DEP_TABLE = /(?:^|\.)(?:dev-|build-)?dependencies$/;
+
+function scanCargo(lines: DiffLine[]): DepScan {
+  const scan: DepScan = { added: [], removed: [] };
+  walkToml(lines, (l, table) => {
+    if (l.type === 'ctx' || !table) return;
+    const bucket = l.type === 'add' ? scan.added : scan.removed;
+    const header = /^\s*\[/.test(l.text) ? /(?:^|\.)(?:dev-|build-)?dependencies\.([\w-]+)$/.exec(table) : null;
+    if (header?.[1]) {
+      bucket.push(header[1]);
+      return;
+    }
+    if (!CARGO_DEP_TABLE.test(table)) return;
+    const kv = /^\s*([\w-]+)\s*=/.exec(l.text);
+    if (kv?.[1]) bucket.push(kv[1]);
+  });
+  return scan;
+}
+
+function scanGoMod(lines: DiffLine[]): DepScan {
+  const scan: DepScan = { added: [], removed: [] };
+  let block: string | null | undefined; // undefined = unknown
+  for (const l of lines) {
+    const open = /^\s*(require|replace|exclude|retract|tool|godebug)\s*\(\s*$/.exec(l.text);
+    if (open) {
+      block = open[1];
+      continue;
+    }
+    if (/^\s*\)\s*$/.test(l.text)) {
+      block = null;
+      continue;
+    }
+    if (l.type === 'ctx') continue;
+    const single = /^\s*require\s+(\S+)\s+v\d/.exec(l.text);
+    const inBlock = block === 'require' || block === undefined ? /^\s*([\w.~-]+(?:\/[\w.~-]+)+|[\w-]+\.[\w.-]+)\s+v\d+\.\d+\.\d+\S*\s*(?:\/\/.*)?$/.exec(l.text) : null;
+    const name = single?.[1] ?? inBlock?.[1];
+    if (name) (l.type === 'add' ? scan.added : scan.removed).push(name);
+  }
+  return scan;
+}
+
+function scanGemfile(lines: DiffLine[]): DepScan {
+  const scan: DepScan = { added: [], removed: [] };
+  for (const l of lines) {
+    if (l.type === 'ctx') continue;
+    const m = /^\s*(?:gem|\w+\.add_(?:development_|runtime_)?dependency)\s*\(?\s*["']([^"']+)["']/.exec(l.text);
+    if (m?.[1]) (l.type === 'add' ? scan.added : scan.removed).push(m[1]);
+  }
+  return scan;
+}
+
+// ---------------------------------------------------------------------------
+// config-changed
+// ---------------------------------------------------------------------------
+
+/**
+ * Tool/build configuration. Path-based for dedicated config files; content
+ * based for config embedded in manifests: `[tool.*]` tables in pyproject.toml
+ * and the `"scripts"` block of package.json (an agent rewriting `"test"` is
+ * worth a look). Embedded sections are only detected when their header is
+ * visible in the hunk (context or changed lines).
+ */
+function detectConfigChange(path: string, lines: DiffLine[]): string | null {
+  const base = posix.basename(path);
+  if (isCiFile(path)) return null; // ci-changed covers it
+  if (CONFIG_BASENAMES.some((re) => re.test(base))) return `Config changed (${base})`;
+
+  if (base === 'pyproject.toml') {
+    const tools = new Set<string>();
+    walkToml(lines, (l, table) => {
+      if (l.type === 'ctx' || !table || !table.startsWith('tool.') || PY_DEP_TABLE.test(table)) return;
+      tools.add(table.split('.')[1] ?? table);
+    });
+    if (tools.size > 0) return `Tool config changed in pyproject.toml: ${[...tools].join(', ')}`;
+  }
+
+  if (base === 'package.json') {
+    let section: string | null | undefined;
+    const changed = new Set<string>();
+    for (const l of lines) {
+      const open = /^\s*"([^"]+)"\s*:\s*\{\s*$/.exec(l.text);
+      if (open) section = open[1];
+      else if (/^\s*\}/.test(l.text)) section = null;
+      else if (l.type !== 'ctx' && section && PKG_CONFIG_SECTIONS.has(section)) changed.add(section);
+    }
+    if (changed.size > 0) return `package.json ${[...changed].join(', ')} changed`;
+  }
+  return null;
+}
+
+const PKG_CONFIG_SECTIONS = new Set(['scripts', 'jest', 'eslintConfig', 'prettier', 'engines', 'overrides', 'resolutions', 'pnpm']);
+
+// ---------------------------------------------------------------------------
+// lint-suppressed
+// ---------------------------------------------------------------------------
+
+/**
+ * Suppression comments. Matched on lines with string literals blanked out,
+ * so a log message mentioning `@ts-ignore` does not count. Prose files
+ * (Markdown, reST, plain text) are skipped: docs often quote these directives.
+ */
+const LINT_PATTERNS: readonly Pattern[] = [
+  { re: /(?:\/\/|\/\*|<!--|#)\s*(eslint-disable(?:-next-line|-line)?)\b/, name: '$1' },
+  { re: /(?:\/\/|\/\*)\s*(@ts-(?:ignore|expect-error|nocheck))\b/, name: '$1' },
+  { re: /(?:\/\/|\/\*)\s*(biome-ignore|oxlint-disable|tslint:disable)/, name: '$1' },
+  { re: /#\s*(noqa)\b/, name: '# noqa' },
+  { re: /#\s*(type:\s*ignore)\b/, name: '# type: ignore' },
+  { re: /#\s*(pyright:\s*ignore|pylint:\s*disable|mypy:\s*ignore-errors)\b/, name: '# $1' },
+  { re: /#\s*(pragma:\s*no cover)\b/, name: '# pragma: no cover' },
+  { re: /\/\/\s*(nolint)\b/, name: '//nolint' },
+  { re: /(#!?\[allow\()/, name: '#[allow(...)]', ext: ['rs'] },
+  { re: /#\s*(rubocop:disable)\b/, name: 'rubocop:disable' },
+  { re: /(@SuppressWarnings)\s*\(/, name: '@SuppressWarnings', ext: ['java', 'kt', 'kts', 'scala', 'groovy'] },
+  { re: /(#pragma\s+warning\s+disable)\b/, name: '#pragma warning disable', ext: ['cs', 'c', 'cpp', 'h', 'hpp'] },
+  { re: /(?:\/\/|\/\*)\s*((?:istanbul|c8|v8)\s+ignore)\b/, name: '$1' },
+];
+
+function detectLintSuppressions(path: string, lines: DiffLine[]): string[] {
+  if (PROSE_EXT.has(extOf(path)) || isLockfile(path)) return [];
+  const hits: string[] = [];
+  for (const l of netAdded(lines)) hits.push(...matchPatterns(stripStrings(l.text), LINT_PATTERNS, path, false));
+  return uniq(hits);
+}
+
+// ---------------------------------------------------------------------------
+// type-any-added
+// ---------------------------------------------------------------------------
+
+/** Only for TypeScript sources; code with strings and comments removed. */
+const ANY_PATTERNS: readonly Pattern[] = [
+  { re: /\bas\s+unknown\s+as\b/, name: '`as unknown as`' },
+  { re: /\bas\s+any(?![\w$])/, name: '`as any`' },
+  { re: /<any>/, name: '`<any>`' },
+  { re: /(?<![\w$])any\s*\[\s*\]/, name: '`any[]`' },
+  { re: /[:|&]\s*any(?![\w$])/, name: '`: any`' },
+  { re: /[<,]\s*any\s*(?=[,>])/, name: '`any` type argument' },
+];
+
+function detectTypeAny(path: string, lines: DiffLine[]): string[] {
+  if (!TS_EXT.has(extOf(path))) return [];
+  const hits: string[] = [];
+  for (const l of netAdded(lines)) {
+    const code = codeOf(l.text, 'slash');
+    const lineHits = matchPatterns(code, ANY_PATTERNS, path, false);
+    // `<any>` is also a type argument; report it once.
+    hits.push(...(lineHits.includes('`<any>`') ? lineHits.filter((h) => h !== '`any` type argument') : lineHits));
+  }
+  return uniq(hits);
+}
+
+// ---------------------------------------------------------------------------
+// secret-like
+// ---------------------------------------------------------------------------
+
+interface SecretRule {
+  re: RegExp;
+  name: string;
+}
+
+/** Well-known token formats. Matches are masked to their public prefix. */
+const SECRET_RULES: readonly SecretRule[] = [
+  { re: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/, name: 'private key' },
+  { re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/, name: 'AWS access key' },
+  { re: /\bsk-(?:proj-|ant-(?:api\d\d-)?)?[A-Za-z0-9_-]{20,}/, name: 'API secret key (sk-)' },
+  { re: /\b(?:sk|rk)_live_[0-9a-zA-Z]{20,}/, name: 'Stripe live key' },
+  { re: /\bgh[pousr]_[A-Za-z0-9]{36,}\b/, name: 'GitHub token' },
+  { re: /\bgithub_pat_[A-Za-z0-9_]{40,}/, name: 'GitHub token' },
+  { re: /\bglpat-[A-Za-z0-9_-]{20,}/, name: 'GitLab token' },
+  { re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/, name: 'Slack token' },
+  { re: /\bAIza[0-9A-Za-z_-]{35}\b/, name: 'Google API key' },
+  { re: /\bnpm_[A-Za-z0-9]{36}\b/, name: 'npm token' },
+];
+
+/** Quoted 32+ char values, the candidates for `apiKey = "…"`, `"client_secret": "…"`, `token := "…"`. */
+const QUOTED_LONG_VALUE = /["'`]([^"'`\s]{32,})["'`]/g;
+/** A secret-sounding name and an assignment operator, anchored right before the quoted value. */
+const SECRET_NAME_BEFORE = /([A-Za-z_][\w.-]*?(?:key|secret|token|passw(?:or)?d|pwd|credential|auth)[\w-]*)["']?\s*(?::=|=>|[:=])\s*$/i;
+const SECRET_NAME_WINDOW = 160;
+
+/**
+ * `name = "value"` with a secret-sounding name. Linear: find each quoted 32+
+ * char value first and look for the name only in the text right before it.
+ * One regex with a lazy name pattern tried from every position was quadratic
+ * on long lines (minified bundles, JSON reports).
+ */
+function secretAssignment(text: string): [string, string, string] | null {
+  for (const m of text.matchAll(QUOTED_LONG_VALUE)) {
+    const before = text.slice(Math.max(0, m.index - SECRET_NAME_WINDOW), m.index);
+    const n = SECRET_NAME_BEFORE.exec(before);
+    if (n?.[1] && m[1]) return [n[0] + m[0], n[1], m[1]];
+  }
+  return null;
+}
+/** Unquoted values only in dotenv/shell style: `export API_TOKEN=...` with an UPPER_SNAKE name. */
+const ENV_ASSIGNMENT = /^\s*(?:export\s+)?([A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PWD|CREDENTIALS?|AUTH)[A-Z0-9_]*)\s*=\s*([^\s"'`#]{32,})\s*(?:#.*)?$/;
+const PLACEHOLDER = /your|example|placeholder|changeme|change-me|dummy|fake|sample|redacted|replace|xxxx|\*\*\*\*|\$\{|\{\{|process\.env|os\.environ/i;
+
+/** Shannon entropy in bits per character. */
+function entropy(s: string): number {
+  const counts = new Map<string, number>();
+  for (const c of s) counts.set(c, (counts.get(c) ?? 0) + 1);
+  let h = 0;
+  for (const n of counts.values()) {
+    const p = n / s.length;
+    h -= p * Math.log2(p);
+  }
+  return h;
+}
+
+/**
+ * A value assigned to a secret-sounding name is flagged when it is 32+ chars of
+ * base64/hex alphabet, contains a digit and a letter, has entropy >= 3.5
+ * bits/char and does not look like a placeholder or an env lookup.
+ */
+function looksLikeSecretValue(v: string): boolean {
+  return (
+    /^[A-Za-z0-9+/=_.-]+$/.test(v) &&
+    /\d/.test(v) &&
+    /[A-Za-z]/.test(v) &&
+    !PLACEHOLDER.test(v) &&
+    !/^[a-z]+(?:[._-][a-z]+)+$/.test(v) &&
+    entropy(v) >= 3.5
+  );
+}
+
+function detectSecrets(path: string, lines: DiffLine[]): string[] {
+  if (isLockfile(path)) return [];
+  const found: string[] = [];
+  for (const l of netAdded(lines)) {
+    const where = l.newNo !== undefined ? ` on line ${l.newNo}` : '';
+    let matched = false;
+    for (const rule of SECRET_RULES) {
+      const m = rule.re.exec(l.text);
+      if (!m) continue;
+      matched = true;
+      found.push(rule.name === 'private key' ? `private key block${where}` : `${rule.name} (${mask(m[0])})${where}`);
+      break;
+    }
+    if (matched) continue;
+    const a = secretAssignment(l.text) ?? ENV_ASSIGNMENT.exec(l.text);
+    const value = a?.[2];
+    if (a?.[1] && value && looksLikeSecretValue(value)) {
+      found.push(`high-entropy value assigned to ${clip(a[1], 40)} (${value.length} chars, masked)${where}`);
+    }
+  }
+  return uniq(found);
+}
+
+/** Keep only the public, format-identifying prefix. */
+function mask(secret: string): string {
+  return `${secret.slice(0, 4)}…, ${secret.length} chars`;
+}
+
+// ---------------------------------------------------------------------------
+// out-of-scope
+// ---------------------------------------------------------------------------
+
+interface ScopeIndex {
+  /** Lower-cased concatenation of every prompt. Empty when there are no prompts. */
+  promptText: string;
+  /** Distinct repo paths of agent-attributed hunks. */
+  agentFiles: string[];
+}
+
+function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex {
+  return {
+    promptText: ctx.prompts.map((p) => p.text).join('\n').toLowerCase(),
+    agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
+  };
+}
+
+function mentioned(token: string, text: string): boolean {
+  const t = token.toLowerCase();
+  let i = text.indexOf(t);
+  while (i >= 0) {
+    const before = text.charAt(i - 1);
+    const after = text.charAt(i + t.length);
+    if (!/[a-z0-9]/.test(before) && !/[a-z0-9]/.test(after)) return true;
+    i = text.indexOf(t, i + 1);
+  }
+  return false;
+}
+
+/** True when one directory equals or contains the other (repo root contains nothing). */
+function related(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (a === '.' || b === '.') return false;
+  return a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
+/**
+ * Heuristic, agent-attributed hunks only. A file is out of scope when BOTH:
+ *
+ * - no prompt mentions it: neither its basename, its basename without the
+ *   extension (>= 4 chars), nor any directory segment of >= 4 chars appears as
+ *   a whole word in any prompt; and
+ * - it sits away from the agent's other work: fewer than half of the other
+ *   agent-touched files live in the same directory or an ancestor/descendant.
+ *
+ * Skipped when there are no prompts or the agent touched a single file, and
+ * for lockfiles and snapshots (derived artefacts of an in-scope change).
+ */
+function outOfScopeReason(path: string, scope: ScopeIndex): string | null {
+  if (!scope.promptText || isLockfile(path) || isSnapshotFile(path)) return null;
+  const base = posix.basename(path);
+  const stem = base.replace(/\.[^.]+$/, '');
+  const segments = posix.dirname(path).split('/').filter((s) => s.length >= 4 && s !== '.');
+  const tokens = [base, ...(stem.length >= 4 ? [stem] : []), ...segments];
+  if (tokens.some((t) => mentioned(t, scope.promptText))) return null;
+
+  const others = scope.agentFiles.filter((f) => f !== path);
+  if (others.length === 0) return null;
+  const dir = posix.dirname(path);
+  const near = others.filter((f) => related(posix.dirname(f), dir)).length;
+  if (near / others.length >= 0.5) return null;
+  return `Not mentioned in any prompt and away from the agent's other edits (${dir === '.' ? 'repo root' : `${dir}/`})`;
+}

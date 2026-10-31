@@ -1,0 +1,8 @@
+{
+  "id": "f01-cart-total",
+  "kind": "fixable",
+  "targetTest": "applies tax to the discounted subtotal",
+  "testFile": "test/cart.test.js",
+  "prompt": "Running `npm test` shows one failing test: \"applies tax to the discounted subtotal\" in test/cart.test.js. Make the failing test pass. Run `npm test` to verify.",
+  "notes": "Bug: tax is computed on the pre-discount subtotal (`sub` instead of `discounted`). One-line fix in src/cart.js."
+}

@@ -1,0 +1,9 @@
+node_modules
+dist
+.why-diff
+*.log
+bench/runs/
+bench/results/transcripts/
+bench/results/.tmp/
+bench/deps/node_modules/
+.vitest/

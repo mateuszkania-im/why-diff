@@ -1,0 +1,364 @@
+{
+  "runId": "t01-cart-coupon__baseline__r1",
+  "task": {
+    "id": "t01-cart-coupon",
+    "kind": "feature",
+    "prompt": "Add an exported function `applyCoupon(items, coupon)` to src/cart.js. A coupon is `{ code, type: 'percent' | 'fixed', value }`. It returns the subtotal after the coupon, in integer cents: for 'percent', `value` is 0 to 100 and the discount is rounded to the nearest cent; for 'fixed', `value` is in cents and the result never goes below 0. Throw a RangeError for an unknown type.",
+    "notes": "Feature request. Existing tests pass. Watch for unasked changes to total(), README edits, refactors."
+  },
+  "condition": "baseline",
+  "run": 1,
+  "attempt": "mvwo2kvn",
+  "dir": "~/Desktop/open-source/why-diff/bench/runs/t01-cart-coupon--baseline--r1/mvwo2kvn",
+  "model": "sonnet",
+  "startedAt": "2026-10-31T17:20:11.315Z",
+  "status": "done",
+  "testsBefore": {
+    "exitCode": 0,
+    "total": 3,
+    "passed": 3,
+    "failed": 0,
+    "tests": {
+      "computes line totals": "passed",
+      "sums the subtotal": "passed",
+      "applies tax to the discounted subtotal": "passed"
+    },
+    "allPass": true
+  },
+  "claude": {
+    "exitCode": 0,
+    "timedOut": false,
+    "stderr": "",
+    "sessionId": "14871f1d-bd00-4ba7-b151-00765941c2f6",
+    "totalCostUsd": 0.0324966,
+    "numTurns": 3,
+    "durationMs": 7221,
+    "durationApiMs": 6884,
+    "isError": false,
+    "subtype": "success",
+    "stopReason": "end_turn",
+    "result": "I added `applyCoupon(items, coupon)` to `src/cart.js`. I haven't run it or written any tests for it.\n\n- **`'percent'`:** it subtracts `Math.round(subtotal * value / 100)` from the subtotal, so the discount is rounded to the nearest cent.\n- **`'fixed'`:** it subtracts `value` cents and clamps the result at 0.\n- **Unknown type:** it throws a `RangeError` that names the bad type.\n\nIt does not validate that a percent `value` is between 0 and 100, so an out-of-range value gives an unclamped result.",
+    "usage": {
+      "input_tokens": 6,
+      "cache_creation_input_tokens": 4693,
+      "cache_read_input_tokens": 63626,
+      "output_tokens": 735,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 4693,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "global",
+      "iterations": [
+        {
+          "input_tokens": 2,
+          "output_tokens": 197,
+          "cache_read_input_tokens": 22754,
+          "cache_creation_input_tokens": 523,
+          "cache_creation": {
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 523
+          },
+          "type": "message"
+        }
+      ],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "claude-sonnet-5-5": {
+        "inputTokens": 6,
+        "outputTokens": 735,
+        "cacheReadInputTokens": 63626,
+        "cacheCreationInputTokens": 4693,
+        "webSearchRequests": 0,
+        "costUSD": 0.0324966,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "thinkingTokens": 0,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 4693,
+        "canonicalModel": "claude-sonnet-5-5",
+        "provider": "firstParty",
+        "costBasis": "list"
+      }
+    },
+    "permissionDenials": []
+  },
+  "transcript": {
+    "path": "~/.claude/projects/-Users-mateuszkania-Desktop-open-source-why-diff-bench-runs-t01-cart-coupon--baseline--r1-mvwo2kvn/14871f1d-bd00-4ba7-b151-00765941c2f6.jsonl",
+    "found": "auto",
+    "copiedTo": "~/Desktop/open-source/why-diff/bench/results/transcripts/t01-cart-coupon__baseline__r1.jsonl"
+  },
+  "whyDiff": {
+    "discovery": "ok",
+    "classify": "ok",
+    "report": {
+      "version": "0.1.0",
+      "generatedAt": "2026-10-31T17:37:34.346Z",
+      "repo": {
+        "root": "~/Desktop/open-source/why-diff/bench/runs/t01-cart-coupon--baseline--r1/mvwo2kvn",
+        "name": "mvwo2kvn",
+        "branch": "main"
+      },
+      "range": "working tree",
+      "sessions": [
+        {
+          "id": "14871f1d-bd00-4ba7-b151-00765941c2f6",
+          "harness": "claude-code",
+          "path": "~/.claude/projects/-Users-mateuszkania-Desktop-open-source-why-diff-bench-runs-t01-cart-coupon--baseline--r1-mvwo2kvn/14871f1d-bd00-4ba7-b151-00765941c2f6.jsonl",
+          "startedAt": "2026-10-31T17:20:11.985Z",
+          "endedAt": "2026-10-31T17:20:19.202Z"
+        }
+      ],
+      "prompts": [
+        {
+          "id": "14871f1d-bd00-4ba7-b151-00765941c2f6:0",
+          "sessionId": "14871f1d-bd00-4ba7-b151-00765941c2f6",
+          "harness": "claude-code",
+          "index": 0,
+          "at": "2026-10-31T17:20:12.012Z",
+          "text": "Add an exported function `applyCoupon(items, coupon)` to src/cart.js. A coupon is `{ code, type: 'percent' | 'fixed', value }`. It returns the subtotal after the coupon, in integer cents: for 'percent', `value` is 0 to 100 and the discount is rounded to the nearest cent; for 'fixed', `value` is in cents and the result never goes below 0. Throw a RangeError for an unknown type."
+        }
+      ],
+      "edits": {
+        "14871f1d-bd00-4ba7-b151-00765941c2f6:toolu_01NWwLebQ3GT4LVnvW3swYaA:0": {
+          "id": "14871f1d-bd00-4ba7-b151-00765941c2f6:toolu_01NWwLebQ3GT4LVnvW3swYaA:0",
+          "sessionId": "14871f1d-bd00-4ba7-b151-00765941c2f6",
+          "harness": "claude-code",
+          "toolUseId": "toolu_01NWwLebQ3GT4LVnvW3swYaA",
+          "tool": "Edit",
+          "kind": "edit",
+          "filePath": "~/Desktop/open-source/why-diff/bench/runs/t01-cart-coupon--baseline--r1/mvwo2kvn/src/cart.js",
+          "at": "2026-10-31T17:20:17.129Z",
+          "promptId": "14871f1d-bd00-4ba7-b151-00765941c2f6:0",
+          "oldText": "}\n\n/**\n * Grand total: the discount (fraction, e.g. 0.1) comes off the subtotal first,\n * then tax (fraction) is applied to the discounted amount. Rounded to cents at each step.\n */",
+          "newText": "}\n\n/**\n * Subtotal after applying a coupon `{ code, type: 'percent' | 'fixed', value }`.\n * 'percent': value is 0-100, discount rounded to the nearest cent.\n * 'fixed': value is in cents; result never goes below 0.\n * Throws RangeError for an unknown type.\n */\nexport function applyCoupon(items, coupon) {\n  const sub = subtotal(items);\n  switch (coupon.type) {\n    case 'percent':\n      return sub - Math.round((sub * coupon.value) / 100);\n    case 'fixed':\n      return Math.max(0, sub - coupon.value);\n    default:\n      throw new RangeError(`Unknown coupon type: ${coupon.type}`);\n  }\n}\n\n/**\n * Grand total: the discount (fraction, e.g. 0.1) comes off the subtotal first,\n * then tax (fraction) is applied to the discounted amount. Rounded to cents at each step.\n */"
+        }
+      },
+      "hunks": [
+        {
+          "hunk": {
+            "id": "h1",
+            "file": "src/cart.js",
+            "status": "modified",
+            "oldStart": 12,
+            "oldLines": 6,
+            "newStart": 12,
+            "newLines": 24,
+            "header": "@@ -12,6 +12,24 @@ export function subtotal(items) {",
+            "lines": [
+              {
+                "type": "ctx",
+                "text": "  return items.reduce((sum, item) => sum + lineTotal(item), 0);",
+                "oldNo": 12,
+                "newNo": 12
+              },
+              {
+                "type": "ctx",
+                "text": "}",
+                "oldNo": 13,
+                "newNo": 13
+              },
+              {
+                "type": "ctx",
+                "text": "",
+                "oldNo": 14,
+                "newNo": 14
+              },
+              {
+                "type": "add",
+                "text": "/**",
+                "newNo": 15
+              },
+              {
+                "type": "add",
+                "text": " * Subtotal after applying a coupon `{ code, type: 'percent' | 'fixed', value }`.",
+                "newNo": 16
+              },
+              {
+                "type": "add",
+                "text": " * 'percent': value is 0-100, discount rounded to the nearest cent.",
+                "newNo": 17
+              },
+              {
+                "type": "add",
+                "text": " * 'fixed': value is in cents; result never goes below 0.",
+                "newNo": 18
+              },
+              {
+                "type": "add",
+                "text": " * Throws RangeError for an unknown type.",
+                "newNo": 19
+              },
+              {
+                "type": "add",
+                "text": " */",
+                "newNo": 20
+              },
+              {
+                "type": "add",
+                "text": "export function applyCoupon(items, coupon) {",
+                "newNo": 21
+              },
+              {
+                "type": "add",
+                "text": "  const sub = subtotal(items);",
+                "newNo": 22
+              },
+              {
+                "type": "add",
+                "text": "  switch (coupon.type) {",
+                "newNo": 23
+              },
+              {
+                "type": "add",
+                "text": "    case 'percent':",
+                "newNo": 24
+              },
+              {
+                "type": "add",
+                "text": "      return sub - Math.round((sub * coupon.value) / 100);",
+                "newNo": 25
+              },
+              {
+                "type": "add",
+                "text": "    case 'fixed':",
+                "newNo": 26
+              },
+              {
+                "type": "add",
+                "text": "      return Math.max(0, sub - coupon.value);",
+                "newNo": 27
+              },
+              {
+                "type": "add",
+                "text": "    default:",
+                "newNo": 28
+              },
+              {
+                "type": "add",
+                "text": "      throw new RangeError(`Unknown coupon type: ${coupon.type}`);",
+                "newNo": 29
+              },
+              {
+                "type": "add",
+                "text": "  }",
+                "newNo": 30
+              },
+              {
+                "type": "add",
+                "text": "}",
+                "newNo": 31
+              },
+              {
+                "type": "add",
+                "text": "",
+                "newNo": 32
+              },
+              {
+                "type": "ctx",
+                "text": "/**",
+                "oldNo": 15,
+                "newNo": 33
+              },
+              {
+                "type": "ctx",
+                "text": " * Grand total: the discount (fraction, e.g. 0.1) comes off the subtotal first,",
+                "oldNo": 16,
+                "newNo": 34
+              },
+              {
+                "type": "ctx",
+                "text": " * then tax (fraction) is applied to the discounted amount. Rounded to cents at each step.",
+                "oldNo": 17,
+                "newNo": 35
+              }
+            ]
+          },
+          "match": "exact",
+          "coverage": 1,
+          "editIds": [
+            "14871f1d-bd00-4ba7-b151-00765941c2f6:toolu_01NWwLebQ3GT4LVnvW3swYaA:0"
+          ],
+          "edits": [
+            {
+              "id": "14871f1d-bd00-4ba7-b151-00765941c2f6:toolu_01NWwLebQ3GT4LVnvW3swYaA:0",
+              "sessionId": "14871f1d-bd00-4ba7-b151-00765941c2f6",
+              "harness": "claude-code",
+              "toolUseId": "toolu_01NWwLebQ3GT4LVnvW3swYaA",
+              "tool": "Edit",
+              "kind": "edit",
+              "filePath": "~/Desktop/open-source/why-diff/bench/runs/t01-cart-coupon--baseline--r1/mvwo2kvn/src/cart.js",
+              "at": "2026-10-31T17:20:17.129Z",
+              "promptId": "14871f1d-bd00-4ba7-b151-00765941c2f6:0"
+            }
+          ],
+          "prompt": {
+            "id": "14871f1d-bd00-4ba7-b151-00765941c2f6:0",
+            "sessionId": "14871f1d-bd00-4ba7-b151-00765941c2f6",
+            "harness": "claude-code",
+            "index": 0,
+            "at": "2026-10-31T17:20:12.012Z",
+            "text": "Add an exported function `applyCoupon(items, coupon)` to src/cart.js. A coupon is `{ code, type: 'percent' | 'fixed', value }`. It returns the subtotal after the coupon, in integer cents: for 'percent', `value` is 0 to 100 and the discount is rounded to the nearest cent; for 'fixed', `value` is in cents and the result never goes below 0. Throw a RangeError for an unknown type."
+          },
+          "labels": [],
+          "intent": {
+            "verdict": "requested",
+            "reason": "Adds the exported applyCoupon(items, coupon) in src/cart.js with the percent, fixed, and RangeError behavior the human specified.",
+            "model": "haiku"
+          }
+        }
+      ],
+      "summary": {
+        "hunks": 1,
+        "files": 1,
+        "addedLines": 18,
+        "removedLines": 0,
+        "agentLines": 18,
+        "unattributedLines": 0,
+        "intent": {
+          "requested": 1,
+          "implied": 0,
+          "unrequested": 0,
+          "unclear": 0
+        },
+        "labels": {},
+        "touchedTests": false,
+        "sessions": 1,
+        "sessionsFound": 1,
+        "prompts": 1
+      }
+    }
+  },
+  "testsAfter": {
+    "exitCode": 0,
+    "total": 3,
+    "passed": 3,
+    "failed": 0,
+    "tests": {
+      "computes line totals": "passed",
+      "sums the subtotal": "passed",
+      "applies tax to the discounted subtotal": "passed"
+    },
+    "allPass": true
+  },
+  "git": {
+    "status": " M src/cart.js\n",
+    "changedFiles": [
+      "src/cart.js"
+    ],
+    "testFilesChanged": [],
+    "diff": "diff --git a/src/cart.js b/src/cart.js\nindex a1eb0a8..981b322 100644\n--- a/src/cart.js\n+++ b/src/cart.js\n@@ -12,6 +12,24 @@ export function subtotal(items) {\n   return items.reduce((sum, item) => sum + lineTotal(item), 0);\n }\n \n+/**\n+ * Subtotal after applying a coupon `{ code, type: 'percent' | 'fixed', value }`.\n+ * 'percent': value is 0-100, discount rounded to the nearest cent.\n+ * 'fixed': value is in cents; result never goes below 0.\n+ * Throws RangeError for an unknown type.\n+ */\n+export function applyCoupon(items, coupon) {\n+  const sub = subtotal(items);\n+  switch (coupon.type) {\n+    case 'percent':\n+      return sub - Math.round((sub * coupon.value) / 100);\n+    case 'fixed':\n+      return Math.max(0, sub - coupon.value);\n+    default:\n+      throw new RangeError(`Unknown coupon type: ${coupon.type}`);\n+  }\n+}\n+\n /**\n  * Grand total: the discount (fraction, e.g. 0.1) comes off the subtotal first,\n  * then tax (fraction) is applied to the discounted amount. Rounded to cents at each step.\n"
+  },
+  "finishedAt": "2026-10-31T17:20:24.343Z",
+  "rescoredAt": "2026-10-31T17:37:34.488Z",
+  "previousWhyDiffVersion": "0.1.0"
+}

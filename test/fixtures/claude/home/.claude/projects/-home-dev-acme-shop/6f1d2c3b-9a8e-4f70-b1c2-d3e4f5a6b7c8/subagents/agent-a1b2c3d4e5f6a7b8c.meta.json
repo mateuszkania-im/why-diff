@@ -1,0 +1,11 @@
+{
+  "agentType": "general-purpose",
+  "isBuiltIn": true,
+  "description": "Write format tests",
+  "toolUseId": "toolu_05Agent00000000000000005",
+  "spawnDepth": 1,
+  "requestShape": "background",
+  "requestNonInteractive": true,
+  "model": "sonnet",
+  "finished": true
+}

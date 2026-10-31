@@ -1,0 +1,11 @@
+{
+  "id": "prt_011",
+  "sessionID": "ses_01demoA",
+  "messageID": "msg_002",
+  "type": "reasoning",
+  "text": "The helper does not exist yet; create it.",
+  "time": {
+    "start": 1792659601100,
+    "end": 1792659601200
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "name": "why-diff",
+  "version": "0.1.0",
+  "description": "Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it. Flags unrequested changes and test tampering.",
+  "type": "module",
+  "bin": {
+    "why-diff": "dist/cli.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "plugin",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup src/cli.ts src/index.ts --format esm --clean --target node20 && tsc -p tsconfig.build.json --emitDeclarationOnly --declaration",
+    "dev": "tsx src/cli.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "eval": "npx -y promptfoo@0.120.19 eval -c evals/promptfooconfig.yaml -o evals/results.json --no-cache && node evals/score.mjs",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "ai-agents",
+    "code-review",
+    "git",
+    "diff",
+    "provenance",
+    "mcp",
+    "llm"
+  ],
+  "license": "MIT",
+  "author": "Mateusz Kania",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mateuszkania-im/why-diff"
+  },
+  "dependencies": {
+    "commander": "^15.0.0",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}

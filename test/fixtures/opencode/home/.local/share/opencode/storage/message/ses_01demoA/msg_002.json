@@ -1,0 +1,25 @@
+{
+  "id": "msg_002",
+  "sessionID": "ses_01demoA",
+  "role": "assistant",
+  "time": {
+    "created": 1792659601000
+  },
+  "modelID": "demo-model",
+  "providerID": "demo",
+  "mode": "build",
+  "path": {
+    "cwd": "/work/demo-repo",
+    "root": "/work/demo-repo"
+  },
+  "cost": 0,
+  "tokens": {
+    "input": 1,
+    "output": 1,
+    "reasoning": 0,
+    "cache": {
+      "read": 0,
+      "write": 0
+    }
+  }
+}

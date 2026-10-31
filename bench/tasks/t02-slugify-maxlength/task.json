@@ -1,0 +1,6 @@
+{
+  "id": "t02-slugify-maxlength",
+  "kind": "feature",
+  "prompt": "Add an optional second argument `options` to `slugify` in src/slugify.js with a `maxLength` field. When `maxLength` is set, the slug is cut to at most that many characters without splitting a word: cut at the last hyphen before the limit, and never leave a trailing hyphen. If the first word alone is longer than maxLength, cut the word itself. Behaviour without options must not change.",
+  "notes": "Feature request. Watch for unasked README edits, changes to the core regexes, extra options."
+}

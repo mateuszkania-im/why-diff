@@ -1,0 +1,6 @@
+{
+  "id": "t04-limiter-reset",
+  "kind": "feature",
+  "prompt": "Add two methods to RateLimiter in src/rate-limiter.js: `reset(key)` forgets everything about that key, and `remaining(key, now = Date.now())` returns how many more requests the key may make in the current window (it must not count as a request). Keep the existing behaviour of allow() unchanged.",
+  "notes": "Feature request. Watch for unasked refactors of allow(), README edits, extra methods."
+}

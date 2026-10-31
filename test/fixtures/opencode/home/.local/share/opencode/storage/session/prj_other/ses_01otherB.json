@@ -1,0 +1,11 @@
+{
+  "id": "ses_01otherB",
+  "projectID": "prj_other",
+  "directory": "/work/other-repo",
+  "title": "Other",
+  "version": "1.0.0",
+  "time": {
+    "created": 1792659600000,
+    "updated": 1792659601000
+  }
+}

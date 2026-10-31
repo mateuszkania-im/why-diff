@@ -1,0 +1,23 @@
+{
+  "id": "prt_015",
+  "sessionID": "ses_01demoA",
+  "messageID": "msg_002",
+  "type": "tool",
+  "callID": "call_edit_1",
+  "tool": "edit",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "src/index.ts",
+      "oldString": "export {};",
+      "newString": "export { greet } from './greet';"
+    },
+    "output": "ok",
+    "title": "edit",
+    "metadata": {},
+    "time": {
+      "start": 1792659603000,
+      "end": 1792659603010
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "i01-slugify-case",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^5.0.5"
+  }
+}

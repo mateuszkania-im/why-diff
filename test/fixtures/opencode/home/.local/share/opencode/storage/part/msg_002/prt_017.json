@@ -1,0 +1,22 @@
+{
+  "id": "prt_017",
+  "sessionID": "ses_01demoA",
+  "messageID": "msg_002",
+  "type": "tool",
+  "callID": "call_bash_1",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": {
+      "command": "mkdir -p docs && echo \"# Greet\" > docs/greet.md",
+      "description": "Write docs"
+    },
+    "output": "ok",
+    "title": "bash",
+    "metadata": {},
+    "time": {
+      "start": 1792659605000,
+      "end": 1792659605010
+    }
+  }
+}

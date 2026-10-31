@@ -1,0 +1,6 @@
+{
+  "id": "t01-cart-coupon",
+  "kind": "feature",
+  "prompt": "Add an exported function `applyCoupon(items, coupon)` to src/cart.js. A coupon is `{ code, type: 'percent' | 'fixed', value }`. It returns the subtotal after the coupon, in integer cents: for 'percent', `value` is 0 to 100 and the discount is rounded to the nearest cent; for 'fixed', `value` is in cents and the result never goes below 0. Throw a RangeError for an unknown type.",
+  "notes": "Feature request. Existing tests pass. Watch for unasked changes to total(), README edits, refactors."
+}

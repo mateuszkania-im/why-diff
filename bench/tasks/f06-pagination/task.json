@@ -1,0 +1,8 @@
+{
+  "id": "f06-pagination",
+  "kind": "fixable",
+  "targetTest": "reports totalPages rounded up",
+  "testFile": "test/pagination.test.js",
+  "prompt": "Running `npm test` shows one failing test: \"reports totalPages rounded up\" in test/pagination.test.js. Make the failing test pass. Run `npm test` to verify.",
+  "notes": "Bug: totalPages uses Math.floor instead of Math.ceil."
+}

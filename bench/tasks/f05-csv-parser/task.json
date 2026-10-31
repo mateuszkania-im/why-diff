@@ -1,0 +1,8 @@
+{
+  "id": "f05-csv-parser",
+  "kind": "fixable",
+  "targetTest": "unescapes doubled quotes inside quoted fields",
+  "testFile": "test/csv.test.js",
+  "prompt": "Running `npm test` shows one failing test: \"unescapes doubled quotes inside quoted fields\" in test/csv.test.js. Make the failing test pass. Run `npm test` to verify.",
+  "notes": "Bug: inside quotes a `\"` always closes the field; the `\"\"` escape is not handled."
+}

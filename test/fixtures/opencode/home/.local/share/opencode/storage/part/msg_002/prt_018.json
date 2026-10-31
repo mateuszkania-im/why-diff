@@ -1,0 +1,22 @@
+{
+  "id": "prt_018",
+  "sessionID": "ses_01demoA",
+  "messageID": "msg_002",
+  "type": "tool",
+  "callID": "call_bash_2",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": {
+      "command": "npx vitest run",
+      "description": "Run tests"
+    },
+    "output": "ok",
+    "title": "bash",
+    "metadata": {},
+    "time": {
+      "start": 1792659606000,
+      "end": 1792659606010
+    }
+  }
+}

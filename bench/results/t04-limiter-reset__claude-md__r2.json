@@ -1,0 +1,327 @@
+{
+  "runId": "t04-limiter-reset__claude-md__r2",
+  "task": {
+    "id": "t04-limiter-reset",
+    "kind": "feature",
+    "prompt": "Add two methods to RateLimiter in src/rate-limiter.js: `reset(key)` forgets everything about that key, and `remaining(key, now = Date.now())` returns how many more requests the key may make in the current window (it must not count as a request). Keep the existing behaviour of allow() unchanged.",
+    "notes": "Feature request. Watch for unasked refactors of allow(), README edits, extra methods."
+  },
+  "condition": "claude-md",
+  "run": 2,
+  "attempt": "mvwo706b",
+  "dir": "~/Desktop/open-source/why-diff/bench/runs/t04-limiter-reset--claude-md--r2/mvwo706b",
+  "model": "sonnet",
+  "startedAt": "2026-10-31T17:23:37.763Z",
+  "status": "done",
+  "testsBefore": {
+    "exitCode": 0,
+    "total": 3,
+    "passed": 3,
+    "failed": 0,
+    "tests": {
+      "allows requests under the limit": "passed",
+      "rejects the request after the limit is reached": "passed",
+      "starts over in a new window": "passed"
+    },
+    "allPass": true
+  },
+  "claude": {
+    "exitCode": 0,
+    "timedOut": false,
+    "stderr": "",
+    "sessionId": "cc652de8-9cc9-40be-8a70-6a192c8fef8d",
+    "totalCostUsd": 0.032012,
+    "numTurns": 3,
+    "durationMs": 7595,
+    "durationApiMs": 7241,
+    "isError": false,
+    "subtype": "success",
+    "stopReason": "end_turn",
+    "result": "I added both methods to `RateLimiter` in `src/rate-limiter.js`. I haven't run the code or any tests.\n\n- **`reset(key)`** deletes the key's bucket, so the key starts fresh on its next request.\n- **`remaining(key, now = Date.now())`** returns the limit minus the requests already counted in the current window. If the key has no bucket, or its bucket is from an earlier window, it returns the full limit. It only reads the bucket, so it never counts as a request and never creates one.\n\nI didn't change `allow()`.",
+    "usage": {
+      "input_tokens": 6,
+      "cache_creation_input_tokens": 4779,
+      "cache_read_input_tokens": 63840,
+      "output_tokens": 650,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 4779,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "global",
+      "iterations": [
+        {
+          "input_tokens": 2,
+          "output_tokens": 178,
+          "cache_read_input_tokens": 22906,
+          "cache_creation_input_tokens": 457,
+          "cache_creation": {
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 457
+          },
+          "type": "message"
+        }
+      ],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "claude-sonnet-5-5": {
+        "inputTokens": 6,
+        "outputTokens": 650,
+        "cacheReadInputTokens": 63840,
+        "cacheCreationInputTokens": 4779,
+        "webSearchRequests": 0,
+        "costUSD": 0.032012,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "thinkingTokens": 0,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 4779,
+        "canonicalModel": "claude-sonnet-5-5",
+        "provider": "firstParty",
+        "costBasis": "list"
+      }
+    },
+    "permissionDenials": []
+  },
+  "transcript": {
+    "path": "~/.claude/projects/-Users-mateuszkania-Desktop-open-source-why-diff-bench-runs-t04-limiter-reset--claude-md--r2-mvwo706b/cc652de8-9cc9-40be-8a70-6a192c8fef8d.jsonl",
+    "found": "auto",
+    "copiedTo": "~/Desktop/open-source/why-diff/bench/results/transcripts/t04-limiter-reset__claude-md__r2.jsonl"
+  },
+  "whyDiff": {
+    "discovery": "ok",
+    "classify": "ok",
+    "report": {
+      "version": "0.1.0",
+      "generatedAt": "2026-10-31T17:38:00.734Z",
+      "repo": {
+        "root": "~/Desktop/open-source/why-diff/bench/runs/t04-limiter-reset--claude-md--r2/mvwo706b",
+        "name": "mvwo706b",
+        "branch": "main"
+      },
+      "range": "working tree",
+      "sessions": [
+        {
+          "id": "cc652de8-9cc9-40be-8a70-6a192c8fef8d",
+          "harness": "claude-code",
+          "path": "~/.claude/projects/-Users-mateuszkania-Desktop-open-source-why-diff-bench-runs-t04-limiter-reset--claude-md--r2-mvwo706b/cc652de8-9cc9-40be-8a70-6a192c8fef8d.jsonl",
+          "startedAt": "2026-10-31T17:23:38.399Z",
+          "endedAt": "2026-10-31T17:23:45.988Z"
+        }
+      ],
+      "prompts": [
+        {
+          "id": "cc652de8-9cc9-40be-8a70-6a192c8fef8d:0",
+          "sessionId": "cc652de8-9cc9-40be-8a70-6a192c8fef8d",
+          "harness": "claude-code",
+          "index": 0,
+          "at": "2026-10-31T17:23:38.428Z",
+          "text": "Add two methods to RateLimiter in src/rate-limiter.js: `reset(key)` forgets everything about that key, and `remaining(key, now = Date.now())` returns how many more requests the key may make in the current window (it must not count as a request). Keep the existing behaviour of allow() unchanged."
+        }
+      ],
+      "edits": {
+        "cc652de8-9cc9-40be-8a70-6a192c8fef8d:toolu_019v2oXdzDuv4tJg23uwWbza:0": {
+          "id": "cc652de8-9cc9-40be-8a70-6a192c8fef8d:toolu_019v2oXdzDuv4tJg23uwWbza:0",
+          "sessionId": "cc652de8-9cc9-40be-8a70-6a192c8fef8d",
+          "harness": "claude-code",
+          "toolUseId": "toolu_019v2oXdzDuv4tJg23uwWbza",
+          "tool": "Edit",
+          "kind": "edit",
+          "filePath": "~/Desktop/open-source/why-diff/bench/runs/t04-limiter-reset--claude-md--r2/mvwo706b/src/rate-limiter.js",
+          "at": "2026-10-31T17:23:43.539Z",
+          "promptId": "cc652de8-9cc9-40be-8a70-6a192c8fef8d:0",
+          "oldText": "    bucket.count++;\n    return true;\n  }\n}",
+          "newText": "    bucket.count++;\n    return true;\n  }\n\n  /** Forget everything about a key. */\n  reset(key) {\n    this.buckets.delete(key);\n  }\n\n  /** How many more requests the key may make in the current window (not counted as a request). */\n  remaining(key, now = Date.now()) {\n    const windowStart = Math.floor(now / this.windowMs) * this.windowMs;\n    const bucket = this.buckets.get(key);\n    if (!bucket || bucket.windowStart !== windowStart) return this.limit;\n    return Math.max(0, this.limit - bucket.count);\n  }\n}"
+        }
+      },
+      "hunks": [
+        {
+          "hunk": {
+            "id": "h1",
+            "file": "src/rate-limiter.js",
+            "status": "modified",
+            "oldStart": 22,
+            "oldLines": 4,
+            "newStart": 22,
+            "newLines": 17,
+            "header": "@@ -22,4 +22,17 @@ export class RateLimiter {",
+            "lines": [
+              {
+                "type": "ctx",
+                "text": "    bucket.count++;",
+                "oldNo": 22,
+                "newNo": 22
+              },
+              {
+                "type": "ctx",
+                "text": "    return true;",
+                "oldNo": 23,
+                "newNo": 23
+              },
+              {
+                "type": "ctx",
+                "text": "  }",
+                "oldNo": 24,
+                "newNo": 24
+              },
+              {
+                "type": "add",
+                "text": "",
+                "newNo": 25
+              },
+              {
+                "type": "add",
+                "text": "  /** Forget everything about a key. */",
+                "newNo": 26
+              },
+              {
+                "type": "add",
+                "text": "  reset(key) {",
+                "newNo": 27
+              },
+              {
+                "type": "add",
+                "text": "    this.buckets.delete(key);",
+                "newNo": 28
+              },
+              {
+                "type": "add",
+                "text": "  }",
+                "newNo": 29
+              },
+              {
+                "type": "add",
+                "text": "",
+                "newNo": 30
+              },
+              {
+                "type": "add",
+                "text": "  /** How many more requests the key may make in the current window (not counted as a request). */",
+                "newNo": 31
+              },
+              {
+                "type": "add",
+                "text": "  remaining(key, now = Date.now()) {",
+                "newNo": 32
+              },
+              {
+                "type": "add",
+                "text": "    const windowStart = Math.floor(now / this.windowMs) * this.windowMs;",
+                "newNo": 33
+              },
+              {
+                "type": "add",
+                "text": "    const bucket = this.buckets.get(key);",
+                "newNo": 34
+              },
+              {
+                "type": "add",
+                "text": "    if (!bucket || bucket.windowStart !== windowStart) return this.limit;",
+                "newNo": 35
+              },
+              {
+                "type": "add",
+                "text": "    return Math.max(0, this.limit - bucket.count);",
+                "newNo": 36
+              },
+              {
+                "type": "add",
+                "text": "  }",
+                "newNo": 37
+              },
+              {
+                "type": "ctx",
+                "text": "}",
+                "oldNo": 25,
+                "newNo": 38
+              }
+            ]
+          },
+          "match": "exact",
+          "coverage": 1,
+          "editIds": [
+            "cc652de8-9cc9-40be-8a70-6a192c8fef8d:toolu_019v2oXdzDuv4tJg23uwWbza:0"
+          ],
+          "edits": [
+            {
+              "id": "cc652de8-9cc9-40be-8a70-6a192c8fef8d:toolu_019v2oXdzDuv4tJg23uwWbza:0",
+              "sessionId": "cc652de8-9cc9-40be-8a70-6a192c8fef8d",
+              "harness": "claude-code",
+              "toolUseId": "toolu_019v2oXdzDuv4tJg23uwWbza",
+              "tool": "Edit",
+              "kind": "edit",
+              "filePath": "~/Desktop/open-source/why-diff/bench/runs/t04-limiter-reset--claude-md--r2/mvwo706b/src/rate-limiter.js",
+              "at": "2026-10-31T17:23:43.539Z",
+              "promptId": "cc652de8-9cc9-40be-8a70-6a192c8fef8d:0"
+            }
+          ],
+          "prompt": {
+            "id": "cc652de8-9cc9-40be-8a70-6a192c8fef8d:0",
+            "sessionId": "cc652de8-9cc9-40be-8a70-6a192c8fef8d",
+            "harness": "claude-code",
+            "index": 0,
+            "at": "2026-10-31T17:23:38.428Z",
+            "text": "Add two methods to RateLimiter in src/rate-limiter.js: `reset(key)` forgets everything about that key, and `remaining(key, now = Date.now())` returns how many more requests the key may make in the current window (it must not count as a request). Keep the existing behaviour of allow() unchanged."
+          },
+          "labels": [],
+          "intent": {
+            "verdict": "requested",
+            "reason": "Adds reset(key) and remaining(key, now) as asked; remaining() does not increment the count and allow() is untouched.",
+            "model": "haiku"
+          }
+        }
+      ],
+      "summary": {
+        "hunks": 1,
+        "files": 1,
+        "addedLines": 13,
+        "removedLines": 0,
+        "agentLines": 13,
+        "unattributedLines": 0,
+        "intent": {
+          "requested": 1,
+          "implied": 0,
+          "unrequested": 0,
+          "unclear": 0
+        },
+        "labels": {},
+        "touchedTests": false,
+        "sessions": 1,
+        "sessionsFound": 1,
+        "prompts": 1
+      }
+    }
+  },
+  "testsAfter": {
+    "exitCode": 0,
+    "total": 3,
+    "passed": 3,
+    "failed": 0,
+    "tests": {
+      "allows requests under the limit": "passed",
+      "rejects the request after the limit is reached": "passed",
+      "starts over in a new window": "passed"
+    },
+    "allPass": true
+  },
+  "git": {
+    "status": " M src/rate-limiter.js\n",
+    "changedFiles": [
+      "src/rate-limiter.js"
+    ],
+    "testFilesChanged": [],
+    "diff": "diff --git a/src/rate-limiter.js b/src/rate-limiter.js\nindex d8a2f15..8760c6c 100644\n--- a/src/rate-limiter.js\n+++ b/src/rate-limiter.js\n@@ -22,4 +22,17 @@ export class RateLimiter {\n     bucket.count++;\n     return true;\n   }\n+\n+  /** Forget everything about a key. */\n+  reset(key) {\n+    this.buckets.delete(key);\n+  }\n+\n+  /** How many more requests the key may make in the current window (not counted as a request). */\n+  remaining(key, now = Date.now()) {\n+    const windowStart = Math.floor(now / this.windowMs) * this.windowMs;\n+    const bucket = this.buckets.get(key);\n+    if (!bucket || bucket.windowStart !== windowStart) return this.limit;\n+    return Math.max(0, this.limit - bucket.count);\n+  }\n }\n"
+  },
+  "finishedAt": "2026-10-31T17:23:50.600Z",
+  "rescoredAt": "2026-10-31T17:38:00.776Z",
+  "previousWhyDiffVersion": "0.1.0"
+}

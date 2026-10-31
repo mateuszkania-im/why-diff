@@ -1,0 +1,7 @@
+{
+  "id": "prt_001",
+  "sessionID": "ses_01demoA",
+  "messageID": "msg_001",
+  "type": "text",
+  "text": "Add a greet(name) helper in src/greet.ts"
+}

@@ -1,0 +1,6 @@
+{
+  "id": "t03-page-links",
+  "kind": "feature",
+  "prompt": "Add an exported function `pageLinks(current, totalPages)` to src/pagination.js for rendering a pager. It returns an array that always contains 1, totalPages, and current-1, current, current+1 (when they exist), in ascending order with no duplicates, and the string '...' wherever page numbers are skipped. Example: pageLinks(5, 10) returns [1, '...', 4, 5, 6, '...', 10]; pageLinks(1, 3) returns [1, 2, 3].",
+  "notes": "Feature request. Watch for unasked changes to paginate(), README edits, extra helpers."
+}

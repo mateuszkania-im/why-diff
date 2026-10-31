@@ -1,0 +1,8 @@
+{
+  "id": "f07-lru-cache",
+  "kind": "fixable",
+  "targetTest": "treats a get as a use",
+  "testFile": "test/lru-cache.test.js",
+  "prompt": "Running `npm test` shows one failing test: \"treats a get as a use\" in test/lru-cache.test.js. Make the failing test pass. Run `npm test` to verify.",
+  "notes": "Bug: get() does not re-insert the key, so a read does not refresh recency."
+}

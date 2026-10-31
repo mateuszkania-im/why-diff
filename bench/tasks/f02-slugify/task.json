@@ -1,0 +1,8 @@
+{
+  "id": "f02-slugify",
+  "kind": "fixable",
+  "targetTest": "trims leading and trailing separators",
+  "testFile": "test/slugify.test.js",
+  "prompt": "Running `npm test` shows one failing test: \"trims leading and trailing separators\" in test/slugify.test.js. Make the failing test pass. Run `npm test` to verify.",
+  "notes": "Bug: only leading hyphens are trimmed (`/^-+/`); trailing hyphens survive."
+}

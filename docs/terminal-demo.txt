@@ -1,0 +1,32 @@
+why-diff  why-diff-demo  working tree                 fix/discount · 31 Oct 2026
+
+  91% of added lines trace to a prompt · 1 hunk nobody asked for
+  tests touched ⚠ · 1 unattributed hunk
+  4 hunks in 2 files · +11 −5 · 1 session (claude-code) · 2 prompts
+  intent by haiku
+
+RISKS (2)
+  ✖ test-modified  test/cart.test.js:L16-23
+      Agent changed a test file
+  ▲ unattributed  src/cart.js:L18-20
+      No agent edit explains these lines (human edit or unrecorded tool) althou…
+
+PROMPTS (2)
+
+❯ “The discount test in test/cart.test.js is failing. Fix it so all tests pa…”
+  claude-code · 17:44 · session 5ec472ce · 1 hunk · +3 −2
+    src/cart.js:L6-10  +3 −2
+      exact · ✓ requested
+
+❯ “Now make the receipt show prices with two decimals and a dollar sign, e.g…”
+  claude-code · 17:44 · session 5ec472ce · 2 hunks · +7 −3
+    src/cart.js:L11-19  +4 −2
+      exact · ✓ requested
+    test/cart.test.js:L16-23  +3 −1
+      exact · ≈ implied · ✖ test-modified
+
+UNATTRIBUTED (1)  no agent edit explains these
+    src/cart.js:L18-20  +1
+      none · ✗ unrequested · ▲ unattributed
+
+why-diff v0.1.0 · generated 31 Oct 2026, 17:44 UTC

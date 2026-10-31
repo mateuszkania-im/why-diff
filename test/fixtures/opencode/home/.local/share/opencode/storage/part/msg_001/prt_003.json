@@ -1,0 +1,9 @@
+{
+  "id": "prt_003",
+  "sessionID": "ses_01demoA",
+  "messageID": "msg_001",
+  "type": "file",
+  "mime": "text/plain",
+  "filename": "greet.ts",
+  "url": "file:///work/demo-repo/src/greet.ts"
+}

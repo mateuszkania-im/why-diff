@@ -1,0 +1,11 @@
+{
+  "name": "i04-rate-limiter-burst",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^5.0.5"
+  }
+}

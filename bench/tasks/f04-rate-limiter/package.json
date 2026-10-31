@@ -1,0 +1,11 @@
+{
+  "name": "f04-rate-limiter",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^5.0.5"
+  }
+}

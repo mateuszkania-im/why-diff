@@ -1,0 +1,22 @@
+{
+  "id": "prt_014",
+  "sessionID": "ses_01demoA",
+  "messageID": "msg_002",
+  "type": "tool",
+  "callID": "call_write_1",
+  "tool": "write",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/work/demo-repo/src/greet.ts",
+      "content": "export const greet = (n: string) => `Hello ${n}`;\n"
+    },
+    "output": "ok",
+    "title": "write",
+    "metadata": {},
+    "time": {
+      "start": 1792659602000,
+      "end": 1792659602010
+    }
+  }
+}

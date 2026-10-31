@@ -1,0 +1,21 @@
+{
+  "id": "prt_016",
+  "sessionID": "ses_01demoA",
+  "messageID": "msg_002",
+  "type": "tool",
+  "callID": "call_edit_2",
+  "tool": "edit",
+  "state": {
+    "status": "error",
+    "input": {
+      "filePath": "/work/demo-repo/src/missing.ts",
+      "oldString": "a",
+      "newString": "b"
+    },
+    "error": "oldString not found in content",
+    "time": {
+      "start": 1792659604000,
+      "end": 1792659604010
+    }
+  }
+}

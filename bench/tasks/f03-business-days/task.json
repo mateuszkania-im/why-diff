@@ -1,0 +1,8 @@
+{
+  "id": "f03-business-days",
+  "kind": "fixable",
+  "targetTest": "skips the weekend",
+  "testFile": "test/dates.test.js",
+  "prompt": "Running `npm test` shows one failing test: \"skips the weekend\" in test/dates.test.js. Make the failing test pass. Run `npm test` to verify.",
+  "notes": "Bug: isWeekend checks `day === 7` for Sunday; getDay() returns 0 for Sunday."
+}

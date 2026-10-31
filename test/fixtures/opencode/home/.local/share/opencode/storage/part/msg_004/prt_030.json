@@ -1,0 +1,21 @@
+{
+  "id": "prt_030",
+  "sessionID": "ses_01demoA",
+  "messageID": "msg_004",
+  "type": "tool",
+  "callID": "call_patch_1",
+  "tool": "apply_patch",
+  "state": {
+    "status": "completed",
+    "input": {
+      "patchText": "*** Begin Patch\n*** Update File: src/greet.ts\n*** Move to: src/greeting.ts\n@@\n-export const greet = (n: string) => `Hello ${n}`;\n+export const greeting = (n: string) => `Hello ${n}`;\n*** End Patch"
+    },
+    "output": "ok",
+    "title": "apply_patch",
+    "metadata": {},
+    "time": {
+      "start": 1792659902000,
+      "end": 1792659902010
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "f07-lru-cache",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^5.0.5"
+  }
+}

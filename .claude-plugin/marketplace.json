@@ -1,0 +1,12 @@
+{
+  "name": "why-diff",
+  "owner": { "name": "Mateusz Kania", "url": "https://github.com/mateuszkania-im" },
+  "plugins": [
+    {
+      "name": "why-diff",
+      "source": "./plugin",
+      "description": "Trace every hunk of an agent's diff to the prompt that wrote it; flag unrequested changes and test tampering.",
+      "version": "0.1.0"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "why-diff-bench-deps",
+  "private": true,
+  "description": "Shared node_modules for the bench task repos (symlinked into every run dir).",
+  "devDependencies": {
+    "vitest": "^5.0.5"
+  }
+}

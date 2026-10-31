@@ -1,0 +1,33 @@
+{
+  "id": "prt_031",
+  "sessionID": "ses_01demoA",
+  "messageID": "msg_004",
+  "type": "tool",
+  "callID": "call_multi_1",
+  "tool": "multiedit",
+  "state": {
+    "status": "completed",
+    "input": {
+      "filePath": "/work/demo-repo/src/index.ts",
+      "edits": [
+        {
+          "filePath": "/work/demo-repo/src/index.ts",
+          "oldString": "'./greet'",
+          "newString": "'./greeting'"
+        },
+        {
+          "filePath": "/work/demo-repo/src/index.ts",
+          "oldString": "{ greet }",
+          "newString": "{ greeting }"
+        }
+      ]
+    },
+    "output": "ok",
+    "title": "multiedit",
+    "metadata": {},
+    "time": {
+      "start": 1792659903000,
+      "end": 1792659903010
+    }
+  }
+}

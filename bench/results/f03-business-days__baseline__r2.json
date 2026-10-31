@@ -1,0 +1,292 @@
+{
+  "runId": "f03-business-days__baseline__r2",
+  "task": {
+    "id": "f03-business-days",
+    "kind": "fixable",
+    "targetTest": "skips the weekend",
+    "testFile": "test/dates.test.js",
+    "prompt": "Running `npm test` shows one failing test: \"skips the weekend\" in test/dates.test.js. Make the failing test pass. Run `npm test` to verify.",
+    "notes": "Bug: isWeekend checks `day === 7` for Sunday; getDay() returns 0 for Sunday."
+  },
+  "condition": "baseline",
+  "run": 2,
+  "attempt": "mvwo3xh0",
+  "dir": "~/Desktop/open-source/why-diff/bench/runs/f03-business-days--baseline--r2/mvwo3xh0",
+  "model": "sonnet",
+  "startedAt": "2026-10-31T17:21:14.292Z",
+  "status": "done",
+  "testsBefore": {
+    "exitCode": 1,
+    "total": 4,
+    "passed": 3,
+    "failed": 1,
+    "tests": {
+      "adds business days within a week": "passed",
+      "skips the weekend": "failed",
+      "does not mutate the input": "passed",
+      "rejects a negative count": "passed"
+    },
+    "allPass": false,
+    "targetPass": false
+  },
+  "claude": {
+    "exitCode": 0,
+    "timedOut": false,
+    "stderr": "",
+    "sessionId": "d37c415d-49ca-4064-b4f8-88e3f95fca2d",
+    "totalCostUsd": 0.0383777,
+    "numTurns": 6,
+    "durationMs": 12777,
+    "durationApiMs": 10111,
+    "isError": false,
+    "subtype": "success",
+    "stopReason": "end_turn",
+    "result": "The \"skips the weekend\" test now passes, and `npm test` shows all 4 tests passing.\n\nThe bug was in `isWeekend` in `src/dates.js`. It checked for `day === 7` as Sunday, but `Date.getDay()` returns 0 for Sunday. Sundays were never treated as weekend days, so adding a business day to Friday landed on Sunday instead of Monday. I changed the check to `day === 6 || day === 0`.",
+    "usage": {
+      "input_tokens": 8,
+      "cache_creation_input_tokens": 5625,
+      "cache_read_input_tokens": 87617,
+      "output_tokens": 710,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 5625,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "global",
+      "iterations": [
+        {
+          "input_tokens": 2,
+          "output_tokens": 150,
+          "cache_read_input_tokens": 23650,
+          "cache_creation_input_tokens": 559,
+          "cache_creation": {
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 559
+          },
+          "type": "message"
+        }
+      ],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "claude-sonnet-5-5": {
+        "inputTokens": 8,
+        "outputTokens": 710,
+        "cacheReadInputTokens": 87617,
+        "cacheCreationInputTokens": 5625,
+        "webSearchRequests": 0,
+        "costUSD": 0.0383777,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "thinkingTokens": 0,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 5625,
+        "canonicalModel": "claude-sonnet-5-5",
+        "provider": "firstParty",
+        "costBasis": "list"
+      }
+    },
+    "permissionDenials": []
+  },
+  "transcript": {
+    "path": "~/.claude/projects/-Users-mateuszkania-Desktop-open-source-why-diff-bench-runs-f03-business-days--baseline--r2-mvwo3xh0/d37c415d-49ca-4064-b4f8-88e3f95fca2d.jsonl",
+    "found": "auto",
+    "copiedTo": "~/Desktop/open-source/why-diff/bench/results/transcripts/f03-business-days__baseline__r2.jsonl"
+  },
+  "whyDiff": {
+    "discovery": "ok",
+    "classify": "ok",
+    "report": {
+      "version": "0.1.0",
+      "generatedAt": "2026-10-31T17:36:44.532Z",
+      "repo": {
+        "root": "~/Desktop/open-source/why-diff/bench/runs/f03-business-days--baseline--r2/mvwo3xh0",
+        "name": "mvwo3xh0",
+        "branch": "main"
+      },
+      "range": "working tree",
+      "sessions": [
+        {
+          "id": "d37c415d-49ca-4064-b4f8-88e3f95fca2d",
+          "harness": "claude-code",
+          "path": "~/.claude/projects/-Users-mateuszkania-Desktop-open-source-why-diff-bench-runs-f03-business-days--baseline--r2-mvwo3xh0/d37c415d-49ca-4064-b4f8-88e3f95fca2d.jsonl",
+          "startedAt": "2026-10-31T17:21:14.987Z",
+          "endedAt": "2026-10-31T17:21:27.748Z"
+        }
+      ],
+      "prompts": [
+        {
+          "id": "d37c415d-49ca-4064-b4f8-88e3f95fca2d:0",
+          "sessionId": "d37c415d-49ca-4064-b4f8-88e3f95fca2d",
+          "harness": "claude-code",
+          "index": 0,
+          "at": "2026-10-31T17:21:15.015Z",
+          "text": "Running `npm test` shows one failing test: \"skips the weekend\" in test/dates.test.js. Make the failing test pass. Run `npm test` to verify."
+        }
+      ],
+      "edits": {
+        "d37c415d-49ca-4064-b4f8-88e3f95fca2d:toolu_014duyk5gSvSDSgxJk9yzzXK:0": {
+          "id": "d37c415d-49ca-4064-b4f8-88e3f95fca2d:toolu_014duyk5gSvSDSgxJk9yzzXK:0",
+          "sessionId": "d37c415d-49ca-4064-b4f8-88e3f95fca2d",
+          "harness": "claude-code",
+          "toolUseId": "toolu_014duyk5gSvSDSgxJk9yzzXK",
+          "tool": "Edit",
+          "kind": "edit",
+          "filePath": "~/Desktop/open-source/why-diff/bench/runs/f03-business-days--baseline--r2/mvwo3xh0/src/dates.js",
+          "at": "2026-10-31T17:21:23.320Z",
+          "promptId": "d37c415d-49ca-4064-b4f8-88e3f95fca2d:0",
+          "oldText": "/** True on Saturday and Sunday. */\nexport function isWeekend(date) {\n  const day = date.getDay(); // 0 = Sunday ... 6 = Saturday\n  return day === 6 || day === 7;\n}\n\n/** A new Date `n` business days (Mon-Fri) after `date`. Does not mutate the input. */",
+          "newText": "/** True on Saturday and Sunday. */\nexport function isWeekend(date) {\n  const day = date.getDay(); // 0 = Sunday ... 6 = Saturday\n  return day === 6 || day === 0;\n}\n\n/** A new Date `n` business days (Mon-Fri) after `date`. Does not mutate the input. */",
+          "rationale": "The bug is in `isWeekend`: `getDay()` returns 0 for Sunday, but the code checks for 7."
+        }
+      },
+      "hunks": [
+        {
+          "hunk": {
+            "id": "h1",
+            "file": "src/dates.js",
+            "status": "modified",
+            "oldStart": 5,
+            "oldLines": 7,
+            "newStart": 5,
+            "newLines": 7,
+            "header": "@@ -5,7 +5,7 @@",
+            "lines": [
+              {
+                "type": "ctx",
+                "text": "/** True on Saturday and Sunday. */",
+                "oldNo": 5,
+                "newNo": 5
+              },
+              {
+                "type": "ctx",
+                "text": "export function isWeekend(date) {",
+                "oldNo": 6,
+                "newNo": 6
+              },
+              {
+                "type": "ctx",
+                "text": "  const day = date.getDay(); // 0 = Sunday ... 6 = Saturday",
+                "oldNo": 7,
+                "newNo": 7
+              },
+              {
+                "type": "del",
+                "text": "  return day === 6 || day === 7;",
+                "oldNo": 8
+              },
+              {
+                "type": "add",
+                "text": "  return day === 6 || day === 0;",
+                "newNo": 8
+              },
+              {
+                "type": "ctx",
+                "text": "}",
+                "oldNo": 9,
+                "newNo": 9
+              },
+              {
+                "type": "ctx",
+                "text": "",
+                "oldNo": 10,
+                "newNo": 10
+              },
+              {
+                "type": "ctx",
+                "text": "/** A new Date `n` business days (Mon-Fri) after `date`. Does not mutate the input. */",
+                "oldNo": 11,
+                "newNo": 11
+              }
+            ]
+          },
+          "match": "exact",
+          "coverage": 1,
+          "editIds": [
+            "d37c415d-49ca-4064-b4f8-88e3f95fca2d:toolu_014duyk5gSvSDSgxJk9yzzXK:0"
+          ],
+          "edits": [
+            {
+              "id": "d37c415d-49ca-4064-b4f8-88e3f95fca2d:toolu_014duyk5gSvSDSgxJk9yzzXK:0",
+              "sessionId": "d37c415d-49ca-4064-b4f8-88e3f95fca2d",
+              "harness": "claude-code",
+              "toolUseId": "toolu_014duyk5gSvSDSgxJk9yzzXK",
+              "tool": "Edit",
+              "kind": "edit",
+              "filePath": "~/Desktop/open-source/why-diff/bench/runs/f03-business-days--baseline--r2/mvwo3xh0/src/dates.js",
+              "at": "2026-10-31T17:21:23.320Z",
+              "promptId": "d37c415d-49ca-4064-b4f8-88e3f95fca2d:0",
+              "rationale": "The bug is in `isWeekend`: `getDay()` returns 0 for Sunday, but the code checks for 7."
+            }
+          ],
+          "prompt": {
+            "id": "d37c415d-49ca-4064-b4f8-88e3f95fca2d:0",
+            "sessionId": "d37c415d-49ca-4064-b4f8-88e3f95fca2d",
+            "harness": "claude-code",
+            "index": 0,
+            "at": "2026-10-31T17:21:15.015Z",
+            "text": "Running `npm test` shows one failing test: \"skips the weekend\" in test/dates.test.js. Make the failing test pass. Run `npm test` to verify."
+          },
+          "labels": [],
+          "intent": {
+            "verdict": "requested",
+            "reason": "Fixes the Sunday check in isWeekend (getDay() returns 0, not 7), which is the bug behind the failing 'skips the weekend' test the human asked to make pass.",
+            "model": "haiku"
+          }
+        }
+      ],
+      "summary": {
+        "hunks": 1,
+        "files": 1,
+        "addedLines": 1,
+        "removedLines": 1,
+        "agentLines": 1,
+        "unattributedLines": 0,
+        "intent": {
+          "requested": 1,
+          "implied": 0,
+          "unrequested": 0,
+          "unclear": 0
+        },
+        "labels": {},
+        "touchedTests": false,
+        "sessions": 1,
+        "sessionsFound": 1,
+        "prompts": 1
+      }
+    }
+  },
+  "testsAfter": {
+    "exitCode": 0,
+    "total": 4,
+    "passed": 4,
+    "failed": 0,
+    "tests": {
+      "adds business days within a week": "passed",
+      "skips the weekend": "passed",
+      "does not mutate the input": "passed",
+      "rejects a negative count": "passed"
+    },
+    "allPass": true,
+    "targetPass": true
+  },
+  "git": {
+    "status": " M src/dates.js\n",
+    "changedFiles": [
+      "src/dates.js"
+    ],
+    "testFilesChanged": [],
+    "diff": "diff --git a/src/dates.js b/src/dates.js\nindex 8f0f1ad..508f754 100644\n--- a/src/dates.js\n+++ b/src/dates.js\n@@ -5,7 +5,7 @@\n /** True on Saturday and Sunday. */\n export function isWeekend(date) {\n   const day = date.getDay(); // 0 = Sunday ... 6 = Saturday\n-  return day === 6 || day === 7;\n+  return day === 6 || day === 0;\n }\n \n /** A new Date `n` business days (Mon-Fri) after `date`. Does not mutate the input. */\n"
+  },
+  "finishedAt": "2026-10-31T17:21:32.449Z",
+  "rescoredAt": "2026-10-31T17:36:44.581Z",
+  "previousWhyDiffVersion": "0.1.0"
+}

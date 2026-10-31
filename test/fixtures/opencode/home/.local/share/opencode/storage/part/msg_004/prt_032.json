@@ -1,0 +1,18 @@
+{
+  "id": "prt_032",
+  "sessionID": "ses_01demoA",
+  "messageID": "msg_004",
+  "type": "tool",
+  "callID": "call_write_2",
+  "tool": "write",
+  "state": {
+    "status": "pending",
+    "input": {
+      "filePath": "/work/demo-repo/CHANGELOG.md",
+      "content": "- renamed\n"
+    },
+    "time": {
+      "start": 1792659904000
+    }
+  }
+}

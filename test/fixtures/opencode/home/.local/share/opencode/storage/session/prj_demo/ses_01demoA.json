@@ -1,0 +1,11 @@
+{
+  "id": "ses_01demoA",
+  "projectID": "prj_demo",
+  "directory": "/work/demo-repo",
+  "title": "Add greeting helper",
+  "version": "1.0.0",
+  "time": {
+    "created": 1792659600000,
+    "updated": 1792660200000
+  }
+}
