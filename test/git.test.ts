@@ -394,6 +394,30 @@ describe('base and window resolution', () => {
   });
 });
 
+describe('report paths', () => {
+  it('json and html carry no absolute path under the home directory: repo root tildified, edit paths repo-relative', async () => {
+    const home = realpathSync(tempDir('why-diff-home-user-'));
+    dirs.push(home);
+    const repo = path.join(home, 'code', 'shop');
+    mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repo, env: ENV });
+    put(repo, 'base.txt', 'base\n');
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-q', '-m', 'base');
+    put(repo, 'src/a.js', 'export const a = 1;\n');
+    const at = new Date(Date.now() - 60_000).toISOString();
+    writeSyntheticTranscript(home, repo, 'paths-1', [{ prompt: 'add a', at, calls: [{ tool: 'Write', at, input: { file_path: path.join(repo, 'src', 'a.js'), content: 'export const a = 1;\n' } }] }]);
+    const report = await buildReport({ cwd: repo, workingTree: true, home, harnesses: ['claude-code'] });
+    expect(report.hunks[0]?.match).toBe('exact');
+    expect(report.repo.root).toBe('~/code/shop');
+    expect(Object.values(report.edits).map((e) => e.filePath)).toEqual(['src/a.js']);
+    expect(report.hunks.flatMap((h) => h.edits.map((e) => e.filePath))).toEqual(['src/a.js']);
+    const { renderJson, renderHtml } = await import('../src/report/index.js');
+    expect(renderJson(report)).not.toContain(home);
+    expect(renderHtml(report)).not.toContain(home);
+  });
+});
+
 describe('untracked symlinks', () => {
   it('shows an untracked symlink as git does (its target, mode 120000) and never reads what it points at', async () => {
     const repo = freshRepo();

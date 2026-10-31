@@ -231,7 +231,7 @@ why-diff pr [options]    put the report into the current branch's PR description
 why-diff guard [--on k]  Claude Code Stop hook (reads the hook payload from stdin)
 ```
 
-Invalid values for `--fail-on`, `--since`, `--classify` and `--format` are rejected with an error instead of being ignored. Binary files are listed but not diffed: the summary counts them (`summary.binaryFiles`, and `summary.unattributedBinaryFiles` for those no agent edit names), and `--fail-on unattributed` also fails on a changed binary file that no agent Write or shell command explains. Home directory paths in reports are shortened to `~`. JSON output carries `schemaVersion: 1` and `mode` (`provenance` or `risk-scan`).
+Invalid values for `--fail-on`, `--since`, `--classify` and `--format` are rejected with an error instead of being ignored. Binary files are listed but not diffed: the summary counts them (`summary.binaryFiles`, and `summary.unattributedBinaryFiles` for those no agent edit names), and `--fail-on unattributed` also fails on a changed binary file that no agent Write or shell command explains. Home directory paths in reports are shortened to `~` (`repo.root`, session paths) and edit paths are stored relative to the repo root. JSON output carries `schemaVersion: 1` and `mode` (`provenance` or `risk-scan`).
 
 Secrets are masked everywhere they could leak: prompts, agent rationales, edit bodies, intent-check reasons, and key-shaped secrets in diff lines. `--redact-prompts` goes further and leaves prompt text and rationales out entirely, for reports you share.
 

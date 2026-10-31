@@ -7620,19 +7620,24 @@ async function buildReport(opts = {}) {
   }
   let summary = summarize(attributed, sessions);
   ignoredHunks > 0 && (summary.ignoredHunks = ignoredHunks), attributed.some((h) => h.intent) && (summary.intent = summarizeIntent(attributed));
-  let usedPromptIds = new Set(attributed.map((h) => h.prompt?.id).filter(Boolean)), contributing = contributingSessionIds(attributed), home = opts.home ?? os5.homedir();
+  let usedPromptIds = new Set(attributed.map((h) => h.prompt?.id).filter(Boolean)), contributing = contributingSessionIds(attributed), home = opts.home ?? os5.homedir(), pathRoots = [root, ...extraRoots].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdOf = new Map(sessions.map((s) => [s.id, s.cwd])), publicPath = (e) => {
+    let rel = repoRelativePath(e.filePath, pathRoots, cwdOf.get(e.sessionId) ?? "");
+    return rel ? rel.split(path10.sep).join("/") : tildify(e.filePath, home);
+  }, edits = editTable(attributed, sessions);
+  for (let e of Object.values(edits)) e.filePath = publicPath(e);
+  let reportHunks = compactHunks(attributed).map((h) => h.edits.length ? { ...h, edits: h.edits.map((e) => ({ ...e, filePath: publicPath(e) })) } : h);
   return redactReport({
     schemaVersion: 1,
     version: await readVersion(),
     generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
-    repo: { root, name: await repoName(root), branch: await currentBranch(root) },
+    repo: { root: tildify(root, home), name: await repoName(root), branch: await currentBranch(root) },
     range: rangeLabel,
     includesWorkingTree: typeof target != "string",
     mode,
     sessions: sessions.filter((s) => contributing.has(s.id)).map(({ id, harness, path: p, startedAt, endedAt, title }) => ({ id, harness, path: tildify(p, home), startedAt, endedAt, title })),
     prompts: prompts.filter((p) => usedPromptIds.has(p.id)),
-    edits: editTable(attributed, sessions),
-    hunks: compactHunks(attributed),
+    edits,
+    hunks: reportHunks,
     summary
   }, "secrets");
 }
@@ -9268,7 +9273,7 @@ program2.name("why-diff").enablePositionalOptions().version(VERSION, "-V, --vers
     model: o.model,
     onProgress: progress
   }), report = o.redactPrompts ? redactReport(built, "prompts") : built, out = renderReport(report, format, { verbose: !!o.verbose }), outFile = o.out;
-  if (format === "html" && !outFile && (outFile = path12.join(report.repo.root, ".why-diff", "report.html")), outFile) {
+  if (format === "html" && !outFile && (outFile = path12.join(await repoRoot(process.cwd()), ".why-diff", "report.html")), outFile) {
     await mkdir3(path12.dirname(path12.resolve(outFile)), { recursive: !0 }), await writeFile3(outFile, out);
     let outDir = path12.dirname(path12.resolve(outFile));
     path12.basename(outDir) === ".why-diff" && await writeFile3(path12.join(outDir, ".gitignore"), `*

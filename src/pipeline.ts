@@ -7,7 +7,7 @@ import { lstat, readFile } from 'node:fs/promises';
 import type { Harness, Hunk, Report, Session, SessionAdapter } from './types.js';
 import { getDiff, git, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
-import { attribute } from './attribute.js';
+import { attribute, repoRelativePath, rootVariants } from './attribute.js';
 import { labelHunks, needsFileText } from './labels.js';
 import { contributingSessionIds, summarize } from './summary.js';
 import { compactHunks, editTable } from './compact.js';
@@ -199,11 +199,22 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   const usedPromptIds = new Set(attributed.map((h) => h.prompt?.id).filter(Boolean));
   const contributing = contributingSessionIds(attributed);
   const home = opts.home ?? os.homedir();
+  // Reports are shared: edit paths are stored repo-relative (tildified when outside the repo), so
+  // they do not carry the user's home directory. Absolute paths are only used above, for matching.
+  const pathRoots = [root, ...extraRoots].flatMap(rootVariants).sort((a, b) => b.length - a.length);
+  const cwdOf = new Map(sessions.map((s) => [s.id, s.cwd]));
+  const publicPath = (e: { filePath: string; sessionId: string }): string => {
+    const rel = repoRelativePath(e.filePath, pathRoots, cwdOf.get(e.sessionId) ?? '');
+    return rel ? rel.split(path.sep).join('/') : tildify(e.filePath, home);
+  };
+  const edits = editTable(attributed, sessions);
+  for (const e of Object.values(edits)) e.filePath = publicPath(e);
+  const reportHunks = compactHunks(attributed).map((h) => (h.edits.length ? { ...h, edits: h.edits.map((e) => ({ ...e, filePath: publicPath(e) })) } : h));
   return redactReport({
     schemaVersion: 1,
     version: await readVersion(),
     generatedAt: new Date().toISOString(),
-    repo: { root, name: await repoName(root), branch: await currentBranch(root) },
+    repo: { root: tildify(root, home), name: await repoName(root), branch: await currentBranch(root) },
     range: rangeLabel,
     includesWorkingTree: typeof target !== 'string',
     mode,
@@ -211,8 +222,8 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
       .filter((s) => contributing.has(s.id))
       .map(({ id, harness, path: p, startedAt, endedAt, title }) => ({ id, harness, path: tildify(p, home), startedAt, endedAt, title })),
     prompts: prompts.filter((p) => usedPromptIds.has(p.id)),
-    edits: editTable(attributed, sessions),
-    hunks: compactHunks(attributed),
+    edits,
+    hunks: reportHunks,
     summary,
   }, 'secrets');
 }

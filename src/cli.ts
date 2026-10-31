@@ -16,7 +16,7 @@ import { redactReport } from './redact.js';
 import { renderReport, isReportFormat, type ReportFormat } from './report/index.js';
 import { terminalSafe } from './report/shared.js';
 import type { Harness, LabelKind } from './types.js';
-import { git } from './git.js';
+import { git, repoRoot } from './git.js';
 import { runGuard, type GuardPayload } from './guard.js';
 import type { ClassifierKind } from './classify/index.js';
 import { ghRunner, PR_BODY_LIMIT, readPrBody, sectionBudget, upsertSection, writePrBody } from './pr.js';
@@ -104,7 +104,7 @@ program
     const report = o.redactPrompts ? redactReport(built, 'prompts') : built;
     const out = renderReport(report, format, { verbose: Boolean(o.verbose) });
     let outFile = o.out as string | undefined;
-    if (format === 'html' && !outFile) outFile = path.join(report.repo.root, '.why-diff', 'report.html');
+    if (format === 'html' && !outFile) outFile = path.join(await repoRoot(process.cwd()), '.why-diff', 'report.html');
 
     if (outFile) {
       await mkdir(path.dirname(path.resolve(outFile)), { recursive: true });
