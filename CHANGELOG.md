@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.2
+
+### Changed
+
+- JSON and HTML reports store edit paths relative to the repo root (tildified when outside it) and `repo.root` with `~` for the home directory, so a shared report does not carry your user name.
+- `why-diff pr` treats `<!-- why-diff:start -->` / `<!-- why-diff:end -->` as markers only on a line of their own. A description with unbalanced markers (a start without an end, an end before the start, two sections) is not edited: `pr` exits 2 and says why.
+- Markdown: each quoted prompt is capped at 1500 characters; when the report is still too long, whole prompt groups are dropped (with a "more prompts not shown" line) before anything is cut.
+- `chmod`, `chown` and `touch` no longer explain changed lines; a bare `.` path explains files below it only for restores and formatters.
+
+### Fixed
+
+- Guard: long pasted prompts no longer make it slow. Path tokens are read in linear time (and from at most 64 KB of each prompt), and system-reminder and slash-command tags are stripped without backtracking, so a 300 KB prompt is checked in well under the hook timeout.
+- Guard: test files rewritten through the shell now block: `sed -i`, `perl -i`, `>` and `>>`, `tee`, `cp` onto the file, `truncate`, and inline `python -c` / `node -e` / heredoc scripts that write a literal path. A file the agent never named in a command is still never credited.
+- Shell commands: brace lists, variables assigned earlier on the same line, `export`, `for` loops over literal lists, `bash -c`, `sh -c`, `eval`, `find -delete`, `find -exec`, `ls|find ... | xargs`, `git clean -f`, `sudo -u <user>`, `rimraf`, `shred -u`, `dd of=`, `install` and `busybox` are followed. Expansion has one shared budget across nesting levels, so no command can make it slow.
+- File names in Unicode NFD (as macOS hands them over) attribute exactly against git's NFC paths.
+- Untracked symlinks are shown as git shows them (the link target, mode 120000); the file they point at is never read.
+- A Python directory with `__init__.py` at the base revision counts as a source package for test/source pairing, whatever its name (`tools/`, `bench/`).
+- Transcripts starting with a UTF-8 BOM keep their first line in every adapter. `--session` on a directory or a missing file gives a clear error. Windows drive paths compare case-insensitively and in both slash styles, including `--scan-all`.
+- Markdown: lone carriage returns break quoted prompts into lines instead of joining them; `@mentions` and `#123` references in prompt text no longer ping people or link issues.
+
+### Security
+
+- Prompts, file names, branch names and label details can no longer send escape sequences to your terminal: control characters show as visible glyphs (`␛`), C1 controls and bidi overrides as `�`. The HTML title is cleaned the same way; Markdown and JSON drop C0/C1 controls (keeping tab and newlines).
+- Markdown truncation never leaves a `<details>` open, so text after the why-diff section in a PR description stays outside it.
+- Redaction: PGP private key blocks are masked and labelled `secret-like`; `mysql -p<password>`, `curl -u user:<password>` and run-together names such as `PGPASSWORD=` are masked. Known library calls after a secret name (`getpass.getpass`, `keyring.get_password`, `secrets.token_hex`, `os.environ`) and type annotations in code (`token: Token;`) are left alone, but other values under those module names and capitalised values on config lines are still masked. An scp-style git remote (`git@github.com:org/repo.git`) is not treated as an e-mail address.
+
 ## 0.2.1
 
 ### Changed

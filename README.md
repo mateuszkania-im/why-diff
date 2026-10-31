@@ -141,7 +141,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # required: a shallow clone has no merge base
-      - uses: mateuszkania-im/why-diff@v0.2.1
+      - uses: mateuszkania-im/why-diff@v0.2.2
         with:
           fail-on: risk    # optional
 ```
@@ -173,7 +173,7 @@ npx -y github:mateuszkania-im/why-diff --version
 That runs the committed standalone file `plugin/bin/why-diff.mjs` (one file, zero dependencies, nothing to build). From v0.2.0 each release also has a tarball, which skips the git clone and is faster:
 
 ```bash
-npx -y https://github.com/mateuszkania-im/why-diff/releases/download/v0.2.1/why-diff.tgz --version
+npx -y https://github.com/mateuszkania-im/why-diff/releases/download/v0.2.2/why-diff.tgz --version
 ```
 
 Tip: `alias why-diff="npx -y github:mateuszkania-im/why-diff"`.
@@ -273,7 +273,9 @@ Reports stay small on big diffs: every edit a hunk references is stored once in 
 - Transcript formats are not public contracts. Adapters are tested against current Claude Code (2.1.x) and Codex (0.16x) files and will need updates.
 - Lines written by scripts the agent ran (`node fix.js`, codegen, formatters) can't be traced line by line, and show as `file-only` matches.
 - Binary files are attributed by path only: an agent Write or shell command that names the file (`cp logo.png assets/`) counts as explaining it, whatever bytes it wrote.
-- The guard credits a shell command only for a pure rename or a whole-file deletion of a path it names (literal paths and globs with `*`, `?`, `**`). Paths built from variables or brace expansion (`rm $DIR/*.test.js`, `rm test/{a,b}.test.js`) are not resolved, so such deletions are not blocked live; the CLI and the Action still label them. A `**` in a shell `rm` is credited as matching across directories (and `rm -r` with a glob as covering everything below the matches), even though bash without `globstar` expands `**` like `*`, so the guard can credit slightly more than the shell actually deleted.
+- The guard credits a shell command for a file only when the command itself names that path: literally, by a glob (`*`, `?`, `**`), by a brace list (`test/{a,b}.test.js`), through a variable assigned a literal earlier on the same command line (`D=test; rm $D/*.js`), a `for` loop over a literal list, `bash -c` / `sh -c` / `eval`, `find ... -delete` / `-exec`, or a literal `ls` / `find` piped into `xargs`. A shell delete or rename counts only when the hunk is exactly that operation. An in-place rewrite (`sed -i`, `perl -i`, `>`, `tee`, `cp` onto the file, `truncate`, an inline `python -c` / `node -e` / heredoc script that opens a literal path for writing) counts for every change in that file, so a human edit made afterwards in the same file is credited to the agent too. Not resolved: variables set outside the command (the environment, an earlier tool call), paths a script computes (`node fix.js`, `os.remove(name)` with a computed name), `rsync --delete`. Such changes are not blocked live; the CLI and the Action still label them. A `**` in a shell path is credited as matching across directories (and `rm -r` with a glob as covering everything below the matches), even though bash without `globstar` expands `**` like `*`.
+- `chmod`, `chown` and `touch` never explain changed lines, and a bare `.` explains files below it only for restores (`git checkout -- .`) and formatters (`prettier --write .`).
+- In a prompt longer than 64 KB (a pasted log or file), only the first and last 32 KB are read for path-like tokens; mentions of file names are still found anywhere. Markdown reports quote each prompt up to 1500 characters.
 - Sessions started in another folder (a sibling project, a workspace root) that edited the repo by absolute path are found only with `--scan-all`, which byte-scans every transcript modified in the window.
 - Sessions run in a `git worktree` are found while that worktree still exists (`git worktree list`), or when it was nested under the repo. Once a worktree outside the repo is removed, its transcripts are generally not found (`--scan-all` only matches edits by absolute path under the repo root), so review before pruning worktrees.
 - If an agent edited a file earlier and those edits were later reverted, a line you then type by hand in that file can show as a `file-only` match to that old prompt. It still carries the `unattributed` label, so it doesn't pass as agent work.
