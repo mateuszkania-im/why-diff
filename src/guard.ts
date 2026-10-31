@@ -94,14 +94,19 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   const stateFile = path.join(stateDir, 'guard-state.json');
   const sessionKey = payload.session_id ?? session.id;
   const hash = createHash('sha256').update(keys.sort().join('\n')).digest('hex');
-  const state = await readState(stateFile);
-  const prev = state[sessionKey];
-  if (prev?.hash === hash) return { block: false, hits };
-  if (hits.length || prev) {
-    state[sessionKey] = { hash, at: new Date().toISOString() };
-    const cutoff = Date.now() - STATE_TTL_MS;
-    for (const [k, v] of Object.entries(state)) if (!(Date.parse(v.at) >= cutoff)) delete state[k];
-    await writeState(stateDir, stateFile, state);
+  // State only dedupes repeat blocks: any failure here must never change the decision below.
+  try {
+    const state = await readState(stateFile);
+    const prev = state[sessionKey];
+    if (prev?.hash === hash) return { block: false, hits };
+    if (hits.length || prev) {
+      state[sessionKey] = { hash, at: new Date().toISOString() };
+      const cutoff = Date.now() - STATE_TTL_MS;
+      for (const [k, v] of Object.entries(state)) if (!(Date.parse(v.at) >= cutoff)) delete state[k];
+      await writeState(stateDir, stateFile, state);
+    }
+  } catch {
+    // fall through with the computed decision
   }
 
   if (!hits.length) return NO_BLOCK;
@@ -121,7 +126,13 @@ const STATE_TTL_MS = 30 * 86_400_000;
 async function readState(file: string): Promise<GuardState> {
   try {
     const parsed: unknown = JSON.parse(await readFile(file, 'utf8'));
-    return parsed && typeof parsed === 'object' ? (parsed as GuardState) : {};
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out: GuardState = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      const e = v as { hash?: unknown; at?: unknown } | null;
+      if (e && typeof e === 'object' && typeof e.hash === 'string' && typeof e.at === 'string') out[k] = { hash: e.hash, at: e.at };
+    }
+    return out;
   } catch {
     return {};
   }

@@ -166,6 +166,18 @@ describe('runGuard', () => {
     expect(Object.keys(state)).toEqual(['s-prune']);
   });
 
+  it('a corrupt state file cannot turn the guard off', async () => {
+    const { repo, home } = makeRepo();
+    mkdirSync(path.join(repo, '.why-diff'));
+    writeFileSync(path.join(repo, '.why-diff', 'guard-state.json'), '{"s1": null, "s2": 42, "s3": "abc"}');
+    const transcript = writeSyntheticTranscript(home, repo, 's-corrupt', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
+    applyEdit(repo, SKIP_OLD, SKIP_NEW);
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-corrupt' }, { blocking: BLOCKING, home });
+    expect(r.block).toBe(true);
+    const state = JSON.parse(readFileSync(path.join(repo, '.why-diff', 'guard-state.json'), 'utf8')) as Record<string, unknown>;
+    expect(Object.keys(state)).toEqual(['s-corrupt']);
+  });
+
   it('skips a huge untracked file the agent wrote (2 MB cap)', async () => {
     const { repo, home, stateDir } = makeRepo();
     const big = path.join(repo, 'dump.log');

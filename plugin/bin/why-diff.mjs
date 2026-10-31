@@ -8341,13 +8341,17 @@ async function guard(payload, opts) {
       for (let l of h.labels)
         opts.blocking.has(l.kind) && (hits.push(`- ${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`), keys.push(`${h.hunk.file}	${l.kind}	${l.detail}`));
   let stateDir = opts.stateDir ?? path10.join(root, ".why-diff"), stateFile = path10.join(stateDir, "guard-state.json"), sessionKey = payload.session_id ?? session.id, hash = createHash2("sha256").update(keys.sort().join(`
-`)).digest("hex"), state = await readState(stateFile), prev = state[sessionKey];
-  if (prev?.hash === hash) return { block: !1, hits };
-  if (hits.length || prev) {
-    state[sessionKey] = { hash, at: (/* @__PURE__ */ new Date()).toISOString() };
-    let cutoff = Date.now() - STATE_TTL_MS;
-    for (let [k, v] of Object.entries(state)) Date.parse(v.at) >= cutoff || delete state[k];
-    await writeState(stateDir, stateFile, state);
+`)).digest("hex");
+  try {
+    let state = await readState(stateFile), prev = state[sessionKey];
+    if (prev?.hash === hash) return { block: !1, hits };
+    if (hits.length || prev) {
+      state[sessionKey] = { hash, at: (/* @__PURE__ */ new Date()).toISOString() };
+      let cutoff = Date.now() - STATE_TTL_MS;
+      for (let [k, v] of Object.entries(state)) Date.parse(v.at) >= cutoff || delete state[k];
+      await writeState(stateDir, stateFile, state);
+    }
+  } catch {
   }
   return hits.length ? {
     block: !0,
@@ -8364,7 +8368,13 @@ var STATE_TTL_MS = 30 * 864e5;
 async function readState(file) {
   try {
     let parsed = JSON.parse(await readFile6(file, "utf8"));
-    return parsed && typeof parsed == "object" ? parsed : {};
+    if (!parsed || typeof parsed != "object" || Array.isArray(parsed)) return {};
+    let out = {};
+    for (let [k, v] of Object.entries(parsed)) {
+      let e = v;
+      e && typeof e == "object" && typeof e.hash == "string" && typeof e.at == "string" && (out[k] = { hash: e.hash, at: e.at });
+    }
+    return out;
   } catch {
     return {};
   }
