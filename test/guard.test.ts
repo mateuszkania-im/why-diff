@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { runGuard } from '../src/guard.js';
 import type { LabelKind } from '../src/types.js';
 import { tempDir, writeSyntheticTranscript, type SyntheticCall } from './helpers/claude-fixture.js';
+import { bestOfAsync, expectSubQuadratic } from './helpers/perf.js';
 
 const BLOCKING = new Set<LabelKind>(['test-skip-added', 'assertion-removed', 'secret-like', 'ci-changed']);
 const dirs: string[] = [];
@@ -279,20 +280,28 @@ describe('runGuard', () => {
     expect(Object.keys(state)).toEqual(['s-corrupt']);
   });
 
-  it('skips a huge untracked file the agent wrote (2 MB cap)', async () => {
+  it('skips a huge untracked file the agent wrote (2 MB cap): cost does not grow with its size', async () => {
     const { repo, home, stateDir } = makeRepo();
     const big = path.join(repo, 'dump.log');
     const transcript = writeSyntheticTranscript(home, repo, 's-big', [{ prompt: 'write a dump', at: SESSION_AT, calls: [{ tool: 'Write', at: CALL_AT, input: { file_path: big, content: 'it.skip("x")\n' } }] }]);
-    writeFileSync(big, Buffer.alloc(50 * 1024 * 1024, 'a'));
+    const timeWith = async (mb: number): Promise<number> => {
+      writeFileSync(big, Buffer.alloc(mb * 1024 * 1024, 'a'));
+      let block = true;
+      const ms = await bestOfAsync(async () => {
+        block = (await runGuard({ transcript_path: transcript, cwd: repo, session_id: `s-big-${mb}` }, { blocking: BLOCKING, home, stateDir })).block;
+      });
+      expect(block).toBe(false);
+      return ms;
+    };
     try {
-      const t0 = Date.now();
-      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-big' }, { blocking: BLOCKING, home, stateDir });
-      expect(Date.now() - t0).toBeLessThan(3000);
-      expect(r.block).toBe(false);
+      const t1 = await timeWith(12);
+      const t4 = await timeWith(48);
+      expect(t4).toBeLessThan(15_000);
+      expectSubQuadratic(t1, t4, 250);
     } finally {
       rmSync(big, { force: true });
     }
-  });
+  }, 60_000);
 });
 
 describe('why-diff guard CLI', () => {

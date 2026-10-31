@@ -70,7 +70,7 @@ describe('git helpers', () => {
     expect(files).toEqual(['.gitignore', 'docs/my notes.md', 'image.bin', 'no-newline.txt', 'weird "name".txt'].sort());
     expect(hunks.find((h) => h.file === 'no-newline.txt')?.lines).toEqual([{ type: 'add', text: 'last line without newline', newNo: 1 }]);
     expect(hunks.find((h) => h.file === 'image.bin')).toMatchObject({ header: 'Binary file changed', lines: [] });
-    // The index was never touched; the index was never touched.
+    // The index was never touched.
     expect(sh(repo, 'diff', '--cached', '--name-only')).toBe('');
 
     const withoutUntracked = parseUnifiedDiff(await getDiff(repo, { workingTree: true, includeUntracked: false }));
@@ -104,7 +104,7 @@ describe('git helpers', () => {
     expect((await resolveDefaultTarget(repo)).label).toBe('working tree');
   });
 
-  it('reports the repo root and name, and raises GitError with stderr for bad input', async () => {
+  it('reports the repo root and the root basename as name (an origin remote is ignored), and raises GitError with stderr for bad input', async () => {
     const repo = freshRepo();
     put(repo, 'x.txt', 'x\n');
     sh(repo, 'add', '-A');

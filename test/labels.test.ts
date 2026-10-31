@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { bestOf, expectSubQuadratic } from './helpers/perf.js';
 import { isLockfile, isTestFile, labelHunks } from '../src/labels.js';
 import type { AttributedHunk, DiffLine, FileEdit, Label, LabelKind, Prompt } from '../src/types.js';
 
@@ -1068,24 +1069,30 @@ describe('tests-disabled with the full post-image (fileText)', () => {
 
 
 describe('out-of-scope performance', () => {
-  it('labels a 1000-file, 20-prompt diff in under a second', () => {
+  /** 20 prompts: one wanders over `wide` files, the other 19 touch one file each. */
+  function diff(wide: number): { prompts: Prompt[]; hunks: AttributedHunk[] } {
     const prompts: Prompt[] = [];
     const hunks: AttributedHunk[] = [];
-    // 20 prompts: one wanders over 981 files, the other 19 touch one file each
     for (let p = 0; p < 20; p++) {
       const id = `s1:${p}`;
       prompts.push({ id, sessionId: 's1', harness: 'claude-code', index: p, at: '2026-10-31T09:59:00Z', text: `work on module${p} in the repository` });
-      for (let f = 0; f < (p === 0 ? 981 : 1); f++) {
+      for (let f = 0; f < (p === 0 ? wide : 1); f++) {
         const h = hunk(`pkg${p}/dir${f}/file${f}.ts`, ['+export const x = 1;']);
         h.prompt = prompts[p];
         h.edits = [{ ...h.edits[0]!, promptId: id }];
         hunks.push(h);
       }
     }
-    const t0 = performance.now();
-    const out = labelHunks(hunks, { prompts, repoRoot: '/repo' });
-    const ms = performance.now() - t0;
-    expect(out).toHaveLength(1000);
-    expect(ms).toBeLessThan(1000);
+    return { prompts, hunks };
+  }
+
+  it('labels a 1000-file, 20-prompt diff well within a ceiling and scales sub-quadratically', () => {
+    const small = diff(231); // 250 hunks
+    const large = diff(981); // 1000 hunks
+    expect(labelHunks(large.hunks, { prompts: large.prompts, repoRoot: '/repo' })).toHaveLength(1000);
+    const t1 = bestOf(() => labelHunks(small.hunks, { prompts: small.prompts, repoRoot: '/repo' }));
+    const t4 = bestOf(() => labelHunks(large.hunks, { prompts: large.prompts, repoRoot: '/repo' }));
+    expect(t4).toBeLessThan(5000);
+    expectSubQuadratic(t1, t4);
   });
 });

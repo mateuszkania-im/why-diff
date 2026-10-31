@@ -3,6 +3,7 @@ import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { bestOf, expectSubQuadratic } from './helpers/perf.js';
 import { compileGlobs, loadConfig, matchGlobs, samePath } from '../src/config.js';
 import { renderMarkdown } from '../src/report/index.js';
 import { runGuard } from '../src/guard.js';
@@ -60,14 +61,20 @@ describe('glob matching', () => {
   });
   it('pathological ** patterns finish fast (no regex backtracking)', () => {
     for (const n of [8, 12, 40]) {
-      const t0 = performance.now();
-      const hit = matchGlobs(['**/'.repeat(n) + 'x'], 'a/'.repeat(40) + 'y');
-      expect(hit).toBeUndefined();
-      expect(performance.now() - t0).toBeLessThan(50);
+      expect(matchGlobs(['**/'.repeat(n) + 'x'], 'a/'.repeat(40) + 'y')).toBeUndefined();
+      expect(bestOf(() => matchGlobs(['**/'.repeat(n) + 'x'], 'a/'.repeat(40) + 'y'))).toBeLessThan(250);
     }
-    const t1 = performance.now();
-    compileGlobs(['*a*a*a*a*a*a*a*a*b'])('a'.repeat(200));
-    expect(performance.now() - t1).toBeLessThan(50);
+    // 4x the path depth must cost under 8x the time (a backtracking matcher grows much faster).
+    const deep = (depth: number) => () => { for (let i = 0; i < 20; i++) matchGlobs(['**/'.repeat(10) + 'x'], 'a/'.repeat(depth) + 'y'); };
+    const d1 = bestOf(deep(40));
+    const d4 = bestOf(deep(160));
+    expect(d4).toBeLessThan(250);
+    expectSubQuadratic(d1, d4);
+    const stars = compileGlobs(['*a*a*a*a*a*a*a*a*b']);
+    const s1 = bestOf(() => { for (let i = 0; i < 20; i++) stars('a'.repeat(200)); });
+    const s4 = bestOf(() => { for (let i = 0; i < 20; i++) stars('a'.repeat(800)); });
+    expect(s4).toBeLessThan(250);
+    expectSubQuadratic(s1, s4);
   });
   it('is case-insensitive on darwin and win32 only', () => {
     const insensitive = process.platform === 'darwin' || process.platform === 'win32';
