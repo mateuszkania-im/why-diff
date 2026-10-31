@@ -15,17 +15,36 @@ export const SECTION_END = '<!-- why-diff:end -->';
 export const PR_BODY_LIMIT = 65_536;
 
 /**
- * Put `section` between the why-diff markers in `body`. An existing marked
- * section is replaced in place; otherwise the section is appended after a
- * blank line. Everything outside the markers stays byte-identical.
+ * Put `section` between the why-diff markers in `body`. Markers count only on a line of their own
+ * (trailing spaces and CR allowed), so markers quoted inline in prose are ordinary text. An
+ * existing marked section is replaced in place; with no markers the section is appended after a
+ * blank line. Everything outside the markers stays byte-identical. Anything else (a start without
+ * an end, an end before the start, several sections) is ambiguous: this throws instead of
+ * guessing, so the author's own text is never overwritten.
  */
 export function upsertSection(body: string, section: string): string {
   const block = `${SECTION_START}\n${section.replace(/\s+$/, '')}\n${SECTION_END}`;
-  const start = body.indexOf(SECTION_START);
-  const end = start >= 0 ? body.indexOf(SECTION_END, start + SECTION_START.length) : -1;
-  if (start >= 0 && end >= 0) return body.slice(0, start) + block + body.slice(end + SECTION_END.length);
-  if (body === '') return `${block}\n`;
-  return `${body}${body.endsWith('\n') ? '\n' : '\n\n'}${block}\n`;
+  const starts: Array<[number, number]> = [];
+  const ends: Array<[number, number]> = [];
+  const re = /^[^\S\r\n]*(<!-- why-diff:(?:start|end) -->)[^\S\n]*$/gm;
+  for (const m of body.matchAll(re)) {
+    const at = m.index + m[0].indexOf(m[1]!);
+    // The block ends after the marker; trailing spaces and the CR stay with the line ending.
+    (m[1] === SECTION_START ? starts : ends).push([m.index, at + m[1]!.length]);
+  }
+  if (starts.length === 0 && ends.length === 0) {
+    if (body === '') return `${block}\n`;
+    return `${body}${body.endsWith('\n') ? '\n' : '\n\n'}${block}\n`;
+  }
+  const [start] = starts;
+  const [end] = ends;
+  if (starts.length !== 1 || ends.length !== 1 || !start || !end || end[0] < start[1]) {
+    throw new Error(
+      `the pull request description has unbalanced why-diff markers (${starts.length} "${SECTION_START}" and ${ends.length} "${SECTION_END}" on their own lines, ` +
+      'expected one of each, start first); fix or remove them by hand and run again',
+    );
+  }
+  return body.slice(0, start[0]) + block + body.slice(end[1]);
 }
 
 /** Characters left for the section once `body` (outside the markers) and the markers are counted. */

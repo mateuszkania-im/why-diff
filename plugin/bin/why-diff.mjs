@@ -9195,14 +9195,25 @@ var SECTION_START = "<!-- why-diff:start -->", SECTION_END = "<!-- why-diff:end 
 function upsertSection(body, section) {
   let block = `${SECTION_START}
 ${section.replace(/\s+$/, "")}
-${SECTION_END}`, start = body.indexOf(SECTION_START), end = start >= 0 ? body.indexOf(SECTION_END, start + SECTION_START.length) : -1;
-  return start >= 0 && end >= 0 ? body.slice(0, start) + block + body.slice(end + SECTION_END.length) : body === "" ? `${block}
+${SECTION_END}`, starts = [], ends = [], re = /^[^\S\r\n]*(<!-- why-diff:(?:start|end) -->)[^\S\n]*$/gm;
+  for (let m of body.matchAll(re)) {
+    let at = m.index + m[0].indexOf(m[1]);
+    (m[1] === SECTION_START ? starts : ends).push([m.index, at + m[1].length]);
+  }
+  if (starts.length === 0 && ends.length === 0)
+    return body === "" ? `${block}
 ` : `${body}${body.endsWith(`
 `) ? `
 ` : `
 
 `}${block}
 `;
+  let [start] = starts, [end] = ends;
+  if (starts.length !== 1 || ends.length !== 1 || !start || !end || end[0] < start[1])
+    throw new Error(
+      `the pull request description has unbalanced why-diff markers (${starts.length} "${SECTION_START}" and ${ends.length} "${SECTION_END}" on their own lines, expected one of each, start first); fix or remove them by hand and run again`
+    );
+  return body.slice(0, start[0]) + block + body.slice(end[1]);
 }
 function sectionBudget(body) {
   return PR_BODY_LIMIT - upsertSection(body, "").length - 1;

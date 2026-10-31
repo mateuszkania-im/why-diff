@@ -5,7 +5,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { buildReport } from '../src/pipeline.js';
-import { SECTION_END, SECTION_START, upsertSection } from '../src/pr.js';
+import { SECTION_END, SECTION_START, sectionBudget, upsertSection } from '../src/pr.js';
 import { tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
 
 const root = path.resolve(__dirname, '..');
@@ -40,11 +40,29 @@ describe('upsertSection', () => {
     expect(upsertSection(out, 'new report')).toBe(out);
   });
 
-  it('appends instead of guessing when the markers are out of order', () => {
-    const body = `${SECTION_END}\nmiddle\n${SECTION_START}`;
-    const out = upsertSection(body, 'x');
-    expect(out.startsWith(body)).toBe(true);
-    expect(out.endsWith(`${block('x')}\n`)).toBe(true);
+  it('refuses to edit when the markers are out of order, unpaired or duplicated', () => {
+    for (const body of [
+      `${SECTION_END}\nmiddle\n${SECTION_START}`,
+      `intro\n${SECTION_START}\nold\n\nuser text`,
+      `intro\n${SECTION_END}\nuser text`,
+      `${block('a')}\nmid\n${block('b')}`,
+      `${SECTION_START}\n${SECTION_START}\nx\n${SECTION_END}`,
+    ]) {
+      expect(() => upsertSection(body, 'x'), body).toThrow(/why-diff markers/);
+      expect(() => sectionBudget(body), body).toThrow(/why-diff markers/);
+    }
+  });
+
+  it('ignores markers quoted inline in prose; only markers on their own line count', () => {
+    const prose = `Use \`${SECTION_START}\` and ${SECTION_END} to mark it.\n`;
+    expect(upsertSection(prose, 'x')).toBe(`${prose}\n${block('x')}\n`);
+    const both = `${prose}\n${block('old')}\ntail ${SECTION_END} here\n`;
+    expect(upsertSection(both, 'new')).toBe(`${prose}\n${block('new')}\ntail ${SECTION_END} here\n`);
+  });
+
+  it('accepts markers on lines with CRLF endings or trailing spaces', () => {
+    const body = `intro\r\n${SECTION_START}  \r\nold\r\n${SECTION_END}\r\nafter\r\n`;
+    expect(upsertSection(body, 'new')).toBe(`intro\r\n${block('new')}\r\nafter\r\n`);
   });
 });
 
@@ -242,6 +260,14 @@ describe('why-diff pr', () => {
     const r = cli(['pr', '-q'], env());
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('65536');
+    expect(calls().map((c) => c.args[1])).toEqual(['view']);
+  });
+
+  it('exits 2 without editing when the description has an unpaired why-diff marker', () => {
+    writeFileSync(path.join(stubDir, 'body.md'), `Notes\n${SECTION_START}\nhalf a section\n\nMy own text.\n`);
+    const r = cli(['pr', '-q'], env());
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('why-diff markers');
     expect(calls().map((c) => c.args[1])).toEqual(['view']);
   });
 
