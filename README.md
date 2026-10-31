@@ -10,6 +10,8 @@ npx why-diff --html     # interactive review page
 npx why-diff --classify # + "did I actually ask for this?" check per hunk
 ```
 
+> Not on npm yet? Run it straight from GitHub: `npx github:mateuszkania-im/why-diff` (same flags).
+
 Works with **Claude Code**, **Codex** and **OpenCode** transcripts. Runs locally. No account, no server, no telemetry.
 
 <!-- STUDY:START -->

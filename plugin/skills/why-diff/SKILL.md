@@ -8,7 +8,7 @@ description: Use before committing, opening a PR, or when the user asks what cha
 When the user is about to commit or open a pull request after agent work, or asks "what did you change", "why did this change", "did you touch the tests", run:
 
 ```bash
-npx -y why-diff --format md --no-open
+npx -y github:mateuszkania-im/why-diff --format md --no-open
 ```
 
 Read the output and report back:

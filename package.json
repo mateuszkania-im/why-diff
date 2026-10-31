@@ -23,7 +23,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "eval": "npx -y promptfoo@0.120.19 eval -c evals/promptfooconfig.yaml -o evals/results.json --no-cache && node evals/score.mjs",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+    "prepublishOnly": "npm run typecheck && npm test && npm run build",
+    "prepare": "npm run build"
   },
   "keywords": [
     "claude-code",
