@@ -39,7 +39,7 @@
 
 - Risk-scan mode: without transcripts (CI, a reviewer's machine) why-diff still reports every risk label, without prompt attribution.
 - `why-diff pr` writes the provenance report into the current branch's PR description via `gh`. It never pushes or creates a PR.
-- GitHub Action (`mateuszkania-im/why-diff@main`): one sticky PR comment plus the job summary, optional `fail-on`, read-only handling of fork PRs. See `docs/github-action.md`.
+- GitHub Action (`mateuszkania-im/why-diff@v0.2.0`): one sticky PR comment plus the job summary, optional `fail-on`, read-only handling of fork PRs. See `docs/github-action.md`.
 - Team rules in `.why-diff.json` (or `"whyDiff"` in `package.json`): `protected` paths, `ignore`, and `blockOn` for the guard. Rules are read from the base revision, so a change cannot loosen the rules it is judged by.
 
 ## 0.1.0

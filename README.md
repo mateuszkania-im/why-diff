@@ -141,7 +141,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # required: a shallow clone has no merge base
-      - uses: mateuszkania-im/why-diff@main
+      - uses: mateuszkania-im/why-diff@v0.2.0
         with:
           fail-on: risk    # optional
 ```
