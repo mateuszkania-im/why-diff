@@ -239,6 +239,10 @@ describe('base and window resolution', () => {
     // An existing base still works.
     const ok = await buildReport({ cwd: repo, base: 'main', home: repo });
     expect(ok.range).toBe('main...HEAD + working tree');
+    expect(ok.includesWorkingTree).toBe(true);
+    const committed = await buildReport({ cwd: repo, base: 'main', committedOnly: true, home: repo });
+    expect(committed.range).toBe('main...HEAD');
+    expect(committed.includesWorkingTree).toBe(false);
   });
 
   it('rejects --base and ignores CI env values that look like options', async () => {
@@ -293,6 +297,11 @@ describe('base and window resolution', () => {
     const magic = await buildReport({ cwd: clone, workingTree: true, paths: [':(bad)x'], home: parent }).catch((e: Error) => e);
     expect((magic as Error).message).toContain('pathspec magic');
     expect((magic as Error).message).not.toContain('fetch-depth');
+    // A typo in a ref name looks like a missing revision: the hint is added, git's own text is kept.
+    const mistyped = await buildReport({ cwd: clone, range: 'mian...HEAD', home: parent }).catch((e: Error) => e);
+    expect((mistyped as Error).message).toContain('fetch-depth: 0');
+    expect((mistyped as Error).message).toContain('mian...HEAD');
+    expect((mistyped as Error).message).toMatch(/unknown revision|ambiguous argument|bad revision|not a valid object name|no merge base/);
     // A revision the shallow history does not have: the hint.
     await expect(buildReport({ cwd: clone, range: 'HEAD~1..HEAD', home: parent })).rejects.toThrow('fetch-depth: 0');
   });

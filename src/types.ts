@@ -231,6 +231,8 @@ export interface Report {
   repo: { root: string; name: string; branch?: string };
   /** What was diffed, e.g. "main...HEAD" or "working tree" */
   range: string;
+  /** True when uncommitted changes (the working tree) are part of the diff */
+  includesWorkingTree: boolean;
   /**
    * `provenance`: agent sessions were found and hunks are traced to prompts.
    * `risk-scan`: no transcripts at all (a reviewer's machine, CI), so only the

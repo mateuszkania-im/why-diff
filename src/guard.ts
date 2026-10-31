@@ -194,7 +194,8 @@ async function recordState(dir: string, file: string, key: string, entry: { hash
     }
     const lock = `${file}.lock`;
     // No lock, no write: the state only dedupes repeat blocks, so skipping it is always safe.
-    if (!(await acquireLock(lock))) return;
+    const token = await acquireLock(lock);
+    if (!token) return;
     try {
       const state = await readState(file);
       state[key] = entry;
@@ -208,7 +209,7 @@ async function recordState(dir: string, file: string, key: string, entry: { hash
         await rm(tmp, { force: true }).catch(() => {});
       }
     } finally {
-      await rm(lock, { force: true }).catch(() => {});
+      await releaseLock(lock, token);
     }
   } catch {
     // state is best effort; a failed write only means a possible repeat block
@@ -223,37 +224,52 @@ const pause = (): Promise<void> => new Promise((r) => setTimeout(r, 5 + Math.flo
 /**
  * Take the state lock: exclusive `wx` create of a regular file. A lock older than `staleMs` is
  * removed and retried. Every iteration checks the deadline first and every retry sleeps, so this
- * always returns within about `waitMs`: false (no lock) on timeout, on a lock path that is not a
- * regular file, on a stale lock that cannot be removed, or on any unexpected error. The guard must
- * never hang; without the lock the dedupe state is simply not written.
+ * always returns within about `waitMs`: a random owner token, or null (no lock) on timeout, on a
+ * lock path that is not a regular file, on a stale lock that cannot be removed, or on any
+ * unexpected error. The guard must never hang; without the lock the dedupe state is not written.
+ *
+ * Known race, accepted: two waiters can both judge the same lock stale, and the second can remove
+ * the lock the first just took over. Both then write; the worst outcome is a lost dedupe entry, so
+ * one repeat block, never a missed one. The owner token keeps a writer from removing a lock that
+ * is no longer its own on release.
  */
-export async function acquireLock(lock: string, opts: { waitMs?: number; staleMs?: number } = {}): Promise<boolean> {
+export async function acquireLock(lock: string, opts: { waitMs?: number; staleMs?: number } = {}): Promise<string | null> {
   const deadline = Date.now() + (opts.waitMs ?? LOCK_WAIT_MS);
   const staleMs = opts.staleMs ?? LOCK_STALE;
+  const token = `${process.pid}-${randomBytes(8).toString('hex')}`;
   for (;;) {
-    if (Date.now() > deadline) return false;
+    if (Date.now() > deadline) return null;
     try {
-      await writeFile(lock, String(process.pid), { flag: 'wx' });
-      return true;
+      await writeFile(lock, token, { flag: 'wx' });
+      return token;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') return false;
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') return null;
     }
     let info;
     try {
       info = await lstat(lock);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
       await pause(); // released between our attempts
       continue;
     }
-    if (!info.isFile()) return false; // a directory, symlink or device is never our lock
+    if (!info.isFile()) return null; // a directory, symlink or device is never our lock
     if (Date.now() - info.mtimeMs > staleMs) {
       try {
         await rm(lock);
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
       }
     }
     await pause();
+  }
+}
+
+/** Remove the lock only while it still holds our token (it may have been taken over as stale). */
+export async function releaseLock(lock: string, token: string): Promise<void> {
+  try {
+    if ((await readFile(lock, 'utf8')) === token) await rm(lock, { force: true });
+  } catch {
+    // gone already, or unreadable: leave it; it goes stale and is taken over
   }
 }

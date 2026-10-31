@@ -190,7 +190,7 @@ program
     });
     // On the base branch (or with nothing committed beyond it) the report falls back to the working
     // tree, so uncommitted changes ARE included: warn only when they were actually left out.
-    if (!withWorkingTree && !built.range.includes('working tree') && (await isDirty(process.cwd()))) {
+    if (!withWorkingTree && !built.includesWorkingTree && (await isDirty(process.cwd()))) {
       process.stderr.write(pc.yellow('why-diff: uncommitted changes are not included in the PR report (committed work only); use --include-uncommitted to include them\n'));
     }
     const report = o.redactPrompts ? redactReport(built, 'prompts') : built;
@@ -231,8 +231,9 @@ program
 /**
  * Index in `args` of the `--` that ends option parsing, walking the arguments the way commander
  * does: an option with a required value consumes the next argument (even `--`), an optional value
- * is taken only when the next argument does not start with `-`, and variadic values stop at the
- * next `-` argument. -1 when there is none.
+ * is taken only when the next argument does not start with `-`. Extra values of a variadic option
+ * (`-s a.jsonl b.jsonl`) are walked as plain words: commander ends a variadic list at the first
+ * argument starting with `-`, so a `--` after them is still found as the separator. -1 when none.
  */
 function separatorIndex(args: string[], cmd: Command): number {
   const byFlag = new Map<string, Option>();

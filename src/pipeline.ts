@@ -205,6 +205,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
     generatedAt: new Date().toISOString(),
     repo: { root, name: await repoName(root), branch: await currentBranch(root) },
     range: rangeLabel,
+    includesWorkingTree: typeof target !== 'string',
     mode,
     sessions: sessions
       .filter((s) => contributing.has(s.id))

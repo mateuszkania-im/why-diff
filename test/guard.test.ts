@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { acquireLock, runGuard } from '../src/guard.js';
+import { acquireLock, releaseLock, runGuard } from '../src/guard.js';
 import type { LabelKind } from '../src/types.js';
 import { tempDir, writeSyntheticTranscript, type SyntheticCall } from './helpers/claude-fixture.js';
 import { bestOfAsync, expectSubQuadratic } from './helpers/perf.js';
@@ -177,6 +177,14 @@ describe('runGuard', () => {
       expect(r.block).toBe(true);
       expect(r.message).toContain('tests/unit/a.spec.ts');
     });
+    it('blocks on rm -rf with a glob that covers a nested test file', async () => {
+      const r = await run('cd $R && rm -rf test/*', (repo) => rmSync(path.join(repo, 'test', 'unit'), { recursive: true }), BL, (repo) => {
+        mkdirSync(path.join(repo, 'test', 'unit'), { recursive: true });
+        writeFileSync(path.join(repo, 'test', 'unit', 'a.test.js'), testFile());
+      });
+      expect(r.block).toBe(true);
+      expect(r.message).toContain('test/unit/a.test.js');
+    });
     it('blocks on mv -t into a target directory', async () => {
       const r = await run('cd $R && mv -t old test/f.test.js', (repo) => {
         mkdirSync(path.join(repo, 'old'));
@@ -238,12 +246,25 @@ describe('runGuard', () => {
       chmodSync(dir, 0o555);
       try {
         const t0 = Date.now();
-        expect(await acquireLock(lock, { waitMs: 200, staleMs: 1000 })).toBe(false);
+        expect(await acquireLock(lock, { waitMs: 200, staleMs: 1000 })).toBeNull();
         expect(Date.now() - t0).toBeLessThan(2000);
       } finally {
         chmodSync(dir, 0o755);
       }
     }, 10_000);
+
+    it('releases only its own lock: a lock taken over by another writer is left alone', async () => {
+      const dir = temp('why-diff-guard-lockown-');
+      const lock = path.join(dir, 'state.lock');
+      const token = await acquireLock(lock);
+      expect(token).toEqual(expect.any(String));
+      writeFileSync(lock, 'someone-else');
+      await releaseLock(lock, token!);
+      expect(readFileSync(lock, 'utf8')).toBe('someone-else');
+      writeFileSync(lock, token!);
+      await releaseLock(lock, token!);
+      expect(existsSync(lock)).toBe(false);
+    });
 
     it('a stale lock that is re-created all the time: acquireLock stops at the deadline', async () => {
       const dir = temp('why-diff-guard-lockre-');

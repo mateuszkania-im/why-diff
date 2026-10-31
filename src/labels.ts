@@ -631,7 +631,7 @@ function detectTestsDisabled(path: string, hunk: AttributedHunk['hunk'], lines: 
   const base = posix.basename(path);
 
   // A test file deleted outright (unless the code it tests is deleted or moved in the same diff).
-  const sourceGone = (scope.goneSourceStems.get(testStem(base)) ?? []).some((dir) => relatedDirs(posix.dirname(path), dir));
+  const sourceGone = (scope.goneSourceStems.get(testStem(base)) ?? []).some((dir) => relatedDirs(path, dir));
   if (hunk.status === 'deleted' && isTestFile(path) && !sourceGone) {
     hits.push(`Deletes test file ${base}`);
   }
@@ -701,19 +701,26 @@ function goneSourceStems(hunks: AttributedHunk[], repoRoot: string): Map<string,
   return out;
 }
 
-const TEST_DIR_SEGMENTS = new Set(['test', 'tests', 'spec', 'specs', '__tests__', '__test__']);
-const SOURCE_DIR_SEGMENTS = new Set(['src', 'lib', 'source']);
+/** Directory names that only mark a test tree or a source tree (`src/test/java` vs `src/main/java`). */
+const LAYOUT_SEGMENTS = new Set(['test', 'tests', '__tests__', '__test__', 'spec', 'specs', 'src', 'lib', 'source', 'main', 'app']);
+const PY_TEST_NAME = /^test_[^/]*\.py$|_test\.py$/;
 
 /**
- * Is a test in `testDir` plausibly the test of a source file in `srcDir`? Same directory, or the
- * test tree mirrors the source tree: `test/x.test.js` and `src/x.js`, `__tests__/x.test.js` and
- * `x.js`, `pkg/test/a/x.test.ts` and `pkg/src/a/x.ts`.
+ * Is a test at `testPath` plausibly the test of a source file in `srcDir`? Same directory, or the
+ * trees mirror each other once layout-only segments are dropped: `test/x.test.js` and `src/x.js`,
+ * `__tests__/x.test.js` and `x.js`, `src/test/java/com/a/FooTest.java` and
+ * `src/main/java/com/a/Foo.java`. Python tests (`test_<stem>.py`, `<stem>_test.py`) in a top-level
+ * test tree pair with the package anywhere (`tests/test_foo.py` and `src/pkg/foo.py`).
  */
-function relatedDirs(testDir: string, srcDir: string): boolean {
+function relatedDirs(testPath: string, srcDir: string): boolean {
+  const testDir = posix.dirname(testPath);
   if (testDir === srcDir) return true;
-  const norm = (dir: string): string =>
-    dir.split('/').filter((s) => s && s !== '.' && !TEST_DIR_SEGMENTS.has(s) && !SOURCE_DIR_SEGMENTS.has(s)).join('/');
-  return norm(testDir) === norm(srcDir);
+  const norm = (dir: string): string => dir.split('/').filter((s) => s && s !== '.' && !LAYOUT_SEGMENTS.has(s)).join('/');
+  const t = norm(testDir);
+  const src = norm(srcDir);
+  if (t === src) return true;
+  if (PY_TEST_NAME.test(posix.basename(testPath))) return t === '' || src.endsWith(`/${t}`);
+  return false;
 }
 
 function detectCiSwallowedTests(lines: DiffLine[], added: Set<DiffLine>): string[] {

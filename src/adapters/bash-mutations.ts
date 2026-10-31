@@ -123,9 +123,14 @@ export function detectBashMutations(command: string, cwd: string): BashMutation[
         break;
       }
       case 'rm':
-      case 'unlink':
-        for (const f of positional(args)) push(f, 'delete');
+      case 'unlink': {
+        const recursive = prog === 'rm' && isRecursive(args);
+        for (const f of positional(args)) {
+          push(f, 'delete');
+          if (recursive && GLOB_CHARS.test(f)) push(`${f.replace(/\/+$/, '')}/**`, 'delete'); // `rm -rf test/*` also removes what is below
+        }
         break;
+      }
       case 'touch':
         for (const f of positional(args, new Set(['-d', '-r', '-t']))) push(f, 'touch');
         break;
@@ -212,6 +217,17 @@ function inlineScriptWrites(prog: string, args: string[], redirects: Redirect[])
     }
   }
   return [...files].filter((f) => /[\w-]\.[A-Za-z0-9]{1,10}$|\//.test(f) && !/\s/.test(f));
+}
+
+const GLOB_CHARS = /[*?[]/;
+
+/** `-r`, `-R`, `-rf`, `-fr`, `--recursive` before the end of options. */
+function isRecursive(args: string[]): boolean {
+  for (const a of args) {
+    if (a === '--') return false;
+    if (a === '--recursive' || /^-[A-Za-z]*[rR][A-Za-z]*$/.test(a)) return true;
+  }
+  return false;
 }
 
 /** Positional (non-option) arguments; `valueOptions` take a following value that is skipped. */
@@ -356,8 +372,13 @@ function gitMutations(args: string[]): Array<{ path: string; op: MutationOp }> {
       const files = afterDashDash(rest) ?? positional(rest, new Set(['-s', '--source']));
       return files.map((p) => ({ path: p, op: 'restore' as const }));
     }
-    case 'rm':
-      return (afterDashDash(rest) ?? positional(rest)).map((p) => ({ path: p, op: 'delete' as const }));
+    case 'rm': {
+      const recursive = isRecursive(rest.slice(0, rest.includes('--') ? rest.indexOf('--') : rest.length));
+      return (afterDashDash(rest) ?? positional(rest)).flatMap((p) => [
+        { path: p, op: 'delete' as const },
+        ...(recursive && GLOB_CHARS.test(p) ? [{ path: `${p.replace(/\/+$/, '')}/**`, op: 'delete' as const }] : []),
+      ]);
+    }
     case 'mv': {
       const files = positional(rest);
       const dest = files[files.length - 1];

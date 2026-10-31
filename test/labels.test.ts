@@ -933,6 +933,17 @@ describe('tests-disabled', () => {
     expect(t?.labels.map((l) => l.kind)).not.toContain('tests-disabled');
   });
 
+  it.each([
+    ['test/index.test.js', 'x/index.js'],
+    ['src/test/java/com/a/FooTest.java', 'src/main/java/com/b/Foo.java'],
+    ['test/a/x.test.js', 'src/b/x.js'],
+  ])('still flags deleting %s with a same-stem source in an unrelated directory %s', (testPath, srcPath) => {
+    const test = renameHunk(testPath, '', 'deleted', ['-it("x", () => {})']);
+    const src = renameHunk(srcPath, '', 'deleted', ['-export const x = 1']);
+    const [t] = labelHunks([test, src], ctx);
+    expect(t?.labels.map((l) => l.kind)).toContain('tests-disabled');
+  });
+
   it('still flags deleting a test when a same-stem source file in an unrelated directory is deleted', () => {
     const test = renameHunk('test/index.test.js', '', 'deleted', ['-it("x", () => {})']);
     const src = renameHunk('x/index.js', '', 'deleted', ['-export const x = 1']);
@@ -941,6 +952,13 @@ describe('tests-disabled', () => {
   });
 
   it.each([
+    ['src/test/java/com/a/FooTest.java', 'src/main/java/com/a/Foo.java'],
+    ['src/test/kotlin/com/a/FooTest.kt', 'src/main/kotlin/com/a/Foo.kt'],
+    ['tests/test_foo.py', 'src/pkg/foo.py'],
+    ['tests/test_foo.py', 'foo.py'],
+    ['tests/test_foo.py', 'pkg/foo.py'],
+    ['tests/foo_test.py', 'pkg/foo.py'],
+    ['app/test/x.test.ts', 'app/src/x.ts'],
     ['__tests__/x.test.js', 'x.js'],
     ['src/__tests__/x.test.js', 'src/x.js'],
     ['test/util/x.test.js', 'src/util/x.js'],

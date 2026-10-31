@@ -3628,10 +3628,13 @@ function secretSuffix(segs) {
   return SECRET_SUFFIXES.some((w) => last.endsWith(w));
 }
 var EXACT_SECRET_NAMES = /* @__PURE__ */ new Set(["password", "passwd", "pwd", "passphrase", "secret"]);
-function dottedSecret(segs, v) {
-  if (segs.length !== 1 || !EXACT_SECRET_NAMES.has(segs[0] ?? "") || /\d/.test(v) || CODE_ROOTS.test(v)) return !1;
+function dottedSecret(segs, v, head, op, text2, at, end) {
+  if (!EXACT_SECRET_NAMES.has(segs[segs.length - 1] ?? "") || /\d/.test(v) || CODE_ROOTS.test(v)) return !1;
   let last = v.slice(v.lastIndexOf(".") + 1);
-  return !secretName(nameSegments(last)) && !secretSuffix(nameSegments(last));
+  if (secretName(nameSegments(last)) || secretSuffix(nameSegments(last)) || !/^\s|^$/.test(text2.slice(end, end + 1))) return !1;
+  let back = text2.slice(Math.max(0, at - 200), at), prefix = back.slice(back.lastIndexOf(`
+`) + 1);
+  return /(?:^|[\s;({])(?:const|let|var|val|def)\s+$/.test(prefix) ? !1 : op === "=" ? !/\s/.test(head) : op === ":" ? /^\s*(?:-\s+)?$/.test(prefix) : !1;
 }
 var ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/, CALL = /^[A-Za-z_$][\w$.]*\(/, MEMBER_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/, CODE_ROOTS = /^(?:process|os|env|config|conf|settings|this|self|ctx|args|params|options|opts|vars|secrets|props|state|req|request)\./i, CODE_WORDS = /* @__PURE__ */ new Set(["new", "null", "undefined", "nil", "none", "true", "false", "this", "self", "await", "async", "function", "return", "require", "string", "number", "boolean", "any", "unknown", "str", "int", "bool", "object", "void", "never", "optional", "required"]);
 function redactKeys(text2) {
@@ -3654,7 +3657,7 @@ function redactSecrets(text2) {
       return `${head}${quote2}${DOTS}${quote2}`;
     }
     let v = bare ?? "";
-    if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase()) || MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dottedSecret(segs, v) || !strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
+    if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase()) || MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dottedSecret(segs, v, head, op, str3 ?? "", offset ?? 0, (offset ?? 0) + m.length) || !strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
     if (op === ":" && /^[A-Za-z]+(?:\.[A-Za-z]+)*$/.test(v)) {
       let text3 = str3 ?? "", at = offset ?? 0, WINDOW = 200, back = text3.slice(Math.max(0, at - WINDOW), at), nl = back.lastIndexOf(`
 `), prefix = nl !== -1 ? back.slice(nl + 1) : at <= WINDOW || /^\s*$/.test(back) ? back : null, configLike = q !== "" || prefix !== null && /^[\s{,-]*$/.test(prefix), after = at + m.length, rest = text3.slice(after, after + WINDOW).split(`
@@ -4068,7 +4071,7 @@ function detectPytestOptions(lines, added, base) {
   return hits;
 }
 function detectTestsDisabled(path13, hunk, lines, scope) {
-  let hits = [], base = posix.basename(path13), sourceGone = (scope.goneSourceStems.get(testStem(base)) ?? []).some((dir) => relatedDirs(posix.dirname(path13), dir));
+  let hits = [], base = posix.basename(path13), sourceGone = (scope.goneSourceStems.get(testStem(base)) ?? []).some((dir) => relatedDirs(path13, dir));
   if (hunk.status === "deleted" && isTestFile(path13) && !sourceGone && hits.push(`Deletes test file ${base}`), hunk.status === "renamed" && hunk.oldFile && isTestFile(hunk.oldFile)) {
     let oldBase = posix.basename(hunk.oldFile);
     if (oldBase !== base && TEST_BASENAME.test(oldBase)) {
@@ -4115,11 +4118,12 @@ function goneSourceStems(hunks, repoRoot2) {
   }
   return out;
 }
-var TEST_DIR_SEGMENTS = /* @__PURE__ */ new Set(["test", "tests", "spec", "specs", "__tests__", "__test__"]), SOURCE_DIR_SEGMENTS = /* @__PURE__ */ new Set(["src", "lib", "source"]);
-function relatedDirs(testDir, srcDir) {
+var LAYOUT_SEGMENTS = /* @__PURE__ */ new Set(["test", "tests", "__tests__", "__test__", "spec", "specs", "src", "lib", "source", "main", "app"]), PY_TEST_NAME = /^test_[^/]*\.py$|_test\.py$/;
+function relatedDirs(testPath, srcDir) {
+  let testDir = posix.dirname(testPath);
   if (testDir === srcDir) return !0;
-  let norm = (dir) => dir.split("/").filter((s) => s && s !== "." && !TEST_DIR_SEGMENTS.has(s) && !SOURCE_DIR_SEGMENTS.has(s)).join("/");
-  return norm(testDir) === norm(srcDir);
+  let norm = (dir) => dir.split("/").filter((s) => s && s !== "." && !LAYOUT_SEGMENTS.has(s)).join("/"), t = norm(testDir), src = norm(srcDir);
+  return t === src ? !0 : PY_TEST_NAME.test(posix.basename(testPath)) ? t === "" || src.endsWith(`/${t}`) : !1;
 }
 function detectCiSwallowedTests(lines, added) {
   let hits = [], indentOf = (t) => t.length - t.trimStart().length, stepStart = /^\s*-\s+[\w-]+:/, block = [], boundary = -1, implicit = !1, flush = () => {
@@ -4823,9 +4827,12 @@ function detectBashMutations(command, cwd) {
         break;
       }
       case "rm":
-      case "unlink":
-        for (let f of positional(args)) push(f, "delete");
+      case "unlink": {
+        let recursive = prog === "rm" && isRecursive(args);
+        for (let f of positional(args))
+          push(f, "delete"), recursive && GLOB_CHARS.test(f) && push(`${f.replace(/\/+$/, "")}/**`, "delete");
         break;
+      }
       case "touch":
         for (let f of positional(args, /* @__PURE__ */ new Set(["-d", "-r", "-t"]))) push(f, "touch");
         break;
@@ -4900,6 +4907,14 @@ function inlineScriptWrites(prog, args, redirects) {
       if (loop?.[1]) for (let l of loop[1].matchAll(new RegExp(SCRIPT_PATH, "g"))) l[2] && files.add(l[2]);
     }
   return [...files].filter((f) => /[\w-]\.[A-Za-z0-9]{1,10}$|\//.test(f) && !/\s/.test(f));
+}
+var GLOB_CHARS = /[*?[]/;
+function isRecursive(args) {
+  for (let a of args) {
+    if (a === "--") return !1;
+    if (a === "--recursive" || /^-[A-Za-z]*[rR][A-Za-z]*$/.test(a)) return !0;
+  }
+  return !1;
 }
 function positional(args, valueOptions = /* @__PURE__ */ new Set()) {
   let out = [], endOfOptions = !1;
@@ -5003,8 +5018,13 @@ function gitMutations(args) {
     }
     case "restore":
       return (afterDashDash(rest) ?? positional(rest, /* @__PURE__ */ new Set(["-s", "--source"]))).map((p) => ({ path: p, op: "restore" }));
-    case "rm":
-      return (afterDashDash(rest) ?? positional(rest)).map((p) => ({ path: p, op: "delete" }));
+    case "rm": {
+      let recursive = isRecursive(rest.slice(0, rest.includes("--") ? rest.indexOf("--") : rest.length));
+      return (afterDashDash(rest) ?? positional(rest)).flatMap((p) => [
+        { path: p, op: "delete" },
+        ...recursive && GLOB_CHARS.test(p) ? [{ path: `${p.replace(/\/+$/, "")}/**`, op: "delete" }] : []
+      ]);
+    }
     case "mv": {
       let files = positional(rest), dest = files[files.length - 1];
       return files.length < 2 || !dest ? [] : [
@@ -7544,6 +7564,7 @@ async function buildReport(opts = {}) {
     generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
     repo: { root, name: await repoName(root), branch: await currentBranch(root) },
     range: rangeLabel,
+    includesWorkingTree: typeof target != "string",
     mode,
     sessions: sessions.filter((s) => contributing.has(s.id)).map(({ id, harness, path: p, startedAt, endedAt, title }) => ({ id, harness, path: tildify(p, home), startedAt, endedAt, title })),
     prompts: prompts.filter((p) => usedPromptIds.has(p.id)),
@@ -9005,8 +9026,8 @@ async function recordState(dir, file, key, entry) {
     await mkdir2(dir, { recursive: !0 }), path11.basename(dir) === ".why-diff" && await writeFile2(path11.join(dir, ".gitignore"), `*
 `, { flag: "wx" }).catch(() => {
     });
-    let lock = `${file}.lock`;
-    if (!await acquireLock(lock)) return;
+    let lock = `${file}.lock`, token = await acquireLock(lock);
+    if (!token) return;
     try {
       let state = await readState(file);
       state[key] = entry;
@@ -9020,38 +9041,43 @@ async function recordState(dir, file, key, entry) {
         });
       }
     } finally {
-      await rm(lock, { force: !0 }).catch(() => {
-      });
+      await releaseLock(lock, token);
     }
   } catch {
   }
 }
 var LOCK_WAIT_MS = 3e3, LOCK_STALE = 1e4, pause = () => new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 20)));
 async function acquireLock(lock, opts = {}) {
-  let deadline = Date.now() + (opts.waitMs ?? LOCK_WAIT_MS), staleMs = opts.staleMs ?? LOCK_STALE;
+  let deadline = Date.now() + (opts.waitMs ?? LOCK_WAIT_MS), staleMs = opts.staleMs ?? LOCK_STALE, token = `${process.pid}-${randomBytes(8).toString("hex")}`;
   for (; ; ) {
-    if (Date.now() > deadline) return !1;
+    if (Date.now() > deadline) return null;
     try {
-      return await writeFile2(lock, String(process.pid), { flag: "wx" }), !0;
+      return await writeFile2(lock, token, { flag: "wx" }), token;
     } catch (err) {
-      if (err.code !== "EEXIST") return !1;
+      if (err.code !== "EEXIST") return null;
     }
     let info;
     try {
       info = await lstat(lock);
     } catch (err) {
-      if (err.code !== "ENOENT") return !1;
+      if (err.code !== "ENOENT") return null;
       await pause();
       continue;
     }
-    if (!info.isFile()) return !1;
+    if (!info.isFile()) return null;
     if (Date.now() - info.mtimeMs > staleMs)
       try {
         await rm(lock);
       } catch (err) {
-        if (err.code !== "ENOENT") return !1;
+        if (err.code !== "ENOENT") return null;
       }
     await pause();
+  }
+}
+async function releaseLock(lock, token) {
+  try {
+    await readFile7(lock, "utf8") === token && await rm(lock, { force: !0 });
+  } catch {
   }
 }
 
@@ -9187,7 +9213,7 @@ program2.command("pr").description("put the report into the current branch's pul
     model: o.model,
     onProgress: progress
   });
-  !withWorkingTree && !built.range.includes("working tree") && await isDirty(process.cwd()) && process.stderr.write(import_picocolors2.default.yellow(`why-diff: uncommitted changes are not included in the PR report (committed work only); use --include-uncommitted to include them
+  !withWorkingTree && !built.includesWorkingTree && await isDirty(process.cwd()) && process.stderr.write(import_picocolors2.default.yellow(`why-diff: uncommitted changes are not included in the PR report (committed work only); use --include-uncommitted to include them
 `));
   let report = o.redactPrompts ? redactReport(built, "prompts") : built, next = upsertSection(body, renderReport(report, "md", { maxChars: budget }));
   if (next.length > PR_BODY_LIMIT) throw new Error(`the new pull request description would be ${next.length} characters, over GitHub's ${PR_BODY_LIMIT}; shorten it and run again`);

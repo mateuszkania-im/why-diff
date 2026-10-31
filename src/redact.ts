@@ -76,15 +76,26 @@ function secretSuffix(segs: string[]): boolean {
 const EXACT_SECRET_NAMES = new Set(['password', 'passwd', 'pwd', 'passphrase', 'secret']);
 
 /**
- * `password=foo.bar`: a member-path-shaped value after an exact secret name is a literal unless it
- * starts at a known code root (`config.`, `process.`, ...) or ends in a secret-named member
- * (`user.password`), which is how code reads a secret.
+ * `password=foo.bar`, `DB_PASSWORD=my.dotted.word`: a dotted all-letter value after a secret name
+ * is a literal only on a .env / CLI / config-shaped line. Redaction also runs on edit bodies, so
+ * ordinary code (`const password = event.target.value;`, `password: input.value,`) must stay
+ * as it is. Required: the name ends in an exact secret word; `name=value` with no spaces around
+ * `=`, or a YAML `name: value` at the start of a line; no const/let/var/val/def before the name;
+ * nothing but whitespace or the line end after the value; no known code root (`config.`,
+ * `process.`, ...) and no secret-named last member (`user.password`).
  */
-function dottedSecret(segs: string[], v: string): boolean {
-  if (segs.length !== 1 || !EXACT_SECRET_NAMES.has(segs[0] ?? '')) return false;
+function dottedSecret(segs: string[], v: string, head: string, op: string, text: string, at: number, end: number): boolean {
+  if (!EXACT_SECRET_NAMES.has(segs[segs.length - 1] ?? '')) return false;
   if (/\d/.test(v) || CODE_ROOTS.test(v)) return false;
   const last = v.slice(v.lastIndexOf('.') + 1);
-  return !secretName(nameSegments(last)) && !secretSuffix(nameSegments(last));
+  if (secretName(nameSegments(last)) || secretSuffix(nameSegments(last))) return false;
+  if (!/^\s|^$/.test(text.slice(end, end + 1))) return false; // `;`, `,`, `)` ... after the value: code
+  const back = text.slice(Math.max(0, at - 200), at);
+  const prefix = back.slice(back.lastIndexOf('\n') + 1);
+  if (/(?:^|[\s;({])(?:const|let|var|val|def)\s+$/.test(prefix)) return false;
+  if (op === '=') return !/\s/.test(head);
+  if (op === ':') return /^\s*(?:-\s+)?$/.test(prefix);
+  return false;
 }
 
 const ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/;
@@ -127,7 +138,7 @@ export function redactSecrets(text: string): string {
     }
     const v = bare ?? '';
     if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase())) return m;
-    if (MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dottedSecret(segs, v)) return m;
+    if (MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dottedSecret(segs, v, head, op, str ?? '', offset ?? 0, (offset ?? 0) + m.length)) return m;
     if (!strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
     // `name: word` is usually prose; an all-letter (or dotted all-letter) value needs a config-like line.
     if (op === ':' && /^[A-Za-z]+(?:\.[A-Za-z]+)*$/.test(v)) {

@@ -52,6 +52,8 @@ describe('detectBashMutations', () => {
     expect(paths(`rm -- -weird.js`)).toEqual([`delete:${abs('-weird.js')}`]);
     expect(paths(`rm test/*.test.js`)).toEqual([`delete:${abs('test/*.test.js')}`]);
     expect(paths(`rm -f tests/**/*.spec.ts`)).toEqual([`delete:${abs('tests/**/*.spec.ts')}`]);
+    expect(paths(`rm -rf test/*`)).toEqual([`delete:${abs('test/*')}`, `delete:${abs('test/*/**')}`]);
+    expect(paths(`git rm -r -q test/*`)).toEqual([`delete:${abs('test/*')}`, `delete:${abs('test/*/**')}`]);
   });
 
   it('maps package manager commands to manifest and lockfile', () => {

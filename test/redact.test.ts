@@ -141,7 +141,7 @@ function expectFastAndLinear(unit: string): void {
 }
 
 describe('redactSecrets: performance', () => {
-  it.each(['a.', 'a-', 'ab_', 'token '])('200 KB of %j is fast and scales sub-quadratically', (unit) => {
+  it.each(['a.', 'a-', 'ab_', 'token ', 'Basic ', 'Basic dXNlcjpwYXNz '])('200 KB of %j is fast and scales sub-quadratically', (unit) => {
     expectFastAndLinear(unit);
   });
 });
@@ -221,6 +221,9 @@ describe('redactSecrets: residuals (0.2.1)', () => {
     ['pwd=alpha.beta', 'alpha.beta'],
     ['secret=open.sesame', 'open.sesame'],
     ['passwd = "x" ; passwd=correct.horse', 'correct.horse'],
+    ['DB_PASSWORD=my.dotted.word', 'my.dotted.word'],
+    ['export PASSWORD=foo.bar', 'foo.bar'],
+    ['  password: foo.bar', 'foo.bar'],
   ])('masks a dotted all-letter value after an exact secret name: %s', (t, leak) => {
     expect(redactSecrets(t)).not.toContain(leak);
   });
@@ -234,6 +237,14 @@ describe('redactSecrets: residuals (0.2.1)', () => {
     'password = form.values.password',
     'password = hash.update(x)',
     'apiVersion = foo.bar',
+    'const password = event.target.value;',
+    'const password = e.target.value;',
+    'password: input.value,',
+    'secret = response.data',
+    'pwd = path.sep',
+    'password = body.pass',
+    'const secret = crypto.webcrypto',
+    'let password=form.value;',
   ])('keeps code references: %s', (t) => {
     expect(redactSecrets(t)).toBe(t);
   });
