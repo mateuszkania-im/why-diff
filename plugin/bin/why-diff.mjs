@@ -8884,7 +8884,7 @@ function renderReport(report, format, opts = {}) {
 
 // src/guard.ts
 import { createHash as createHash2, randomBytes } from "node:crypto";
-import { mkdir as mkdir2, readFile as readFile7, rename as rename2, rm, writeFile as writeFile2 } from "node:fs/promises";
+import { mkdir as mkdir2, readFile as readFile7, rename as rename2, rm, stat as stat4, writeFile as writeFile2 } from "node:fs/promises";
 import path11 from "node:path";
 var DEFAULT_BLOCK_ON = ["test-skip-added", "tests-disabled", "assertion-removed", "secret-like", "ci-changed", "protected-path"], NO_BLOCK = { block: !1, hits: [] };
 async function runGuard(payload, opts) {
@@ -8977,7 +8977,8 @@ async function recordState(dir, file, key, entry) {
     await mkdir2(dir, { recursive: !0 }), path11.basename(dir) === ".why-diff" && await writeFile2(path11.join(dir, ".gitignore"), `*
 `, { flag: "wx" }).catch(() => {
     });
-    for (let attempt = 0; attempt < 5; attempt++) {
+    let lock = `${file}.lock`, locked = await acquireLock(lock);
+    try {
       let state = await readState(file);
       state[key] = entry;
       let cutoff = Date.now() - STATE_TTL_MS;
@@ -8989,11 +8990,32 @@ async function recordState(dir, file, key, entry) {
         await rm(tmp, { force: !0 }).catch(() => {
         });
       }
-      let now = (await readState(file))[key];
-      if (now?.hash === entry.hash && now.at === entry.at) return;
-      await new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 20)));
+    } finally {
+      locked && await rm(lock, { force: !0 }).catch(() => {
+      });
     }
   } catch {
+  }
+}
+var LOCK_WAIT_MS = 3e3, LOCK_STALE_MS = 1e4;
+async function acquireLock(lock) {
+  let deadline = Date.now() + LOCK_WAIT_MS;
+  for (; ; ) {
+    try {
+      return await writeFile2(lock, String(process.pid), { flag: "wx" }), !0;
+    } catch (err) {
+      if (err.code !== "EEXIST") return !1;
+    }
+    try {
+      if (Date.now() - (await stat4(lock)).mtimeMs > LOCK_STALE_MS) {
+        await rm(lock, { force: !0 });
+        continue;
+      }
+    } catch {
+      continue;
+    }
+    if (Date.now() > deadline) return !1;
+    await new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 20)));
   }
 }
 

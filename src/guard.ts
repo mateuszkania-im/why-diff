@@ -8,7 +8,7 @@
  * same file never does. Every internal error means "do not block".
  */
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
@@ -181,9 +181,10 @@ async function readState(file: string): Promise<GuardState> {
 }
 
 /**
- * Store one session's entry. Other guards (parallel sessions) may write the same file, so the
- * entry is merged into the latest on-disk state right before an atomic temp-file + rename write,
- * and the write is retried a few times if a concurrent writer replaced our entry.
+ * Store one session's entry. Guards of parallel sessions write the same file, so the update runs
+ * under an exclusive lock file (`wx` create; a lock older than {@link LOCK_STALE_MS} is taken
+ * over), merges into the latest on-disk state, and lands with an atomic temp-file + rename.
+ * If the lock cannot be had in time the merged write still happens, unlocked (best effort).
  */
 async function recordState(dir: string, file: string, key: string, entry: { hash: string; at: string }): Promise<void> {
   try {
@@ -191,7 +192,9 @@ async function recordState(dir: string, file: string, key: string, entry: { hash
     if (path.basename(dir) === '.why-diff') {
       await writeFile(path.join(dir, '.gitignore'), '*\n', { flag: 'wx' }).catch(() => {});
     }
-    for (let attempt = 0; attempt < 5; attempt++) {
+    const lock = `${file}.lock`;
+    const locked = await acquireLock(lock);
+    try {
       const state = await readState(file);
       state[key] = entry;
       const cutoff = Date.now() - STATE_TTL_MS;
@@ -203,11 +206,35 @@ async function recordState(dir: string, file: string, key: string, entry: { hash
       } finally {
         await rm(tmp, { force: true }).catch(() => {});
       }
-      const now = (await readState(file))[key];
-      if (now?.hash === entry.hash && now.at === entry.at) return;
-      await new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 20)));
+    } finally {
+      if (locked) await rm(lock, { force: true }).catch(() => {});
     }
   } catch {
     // state is best effort; a failed write only means a possible repeat block
+  }
+}
+
+const LOCK_WAIT_MS = 3000;
+const LOCK_STALE_MS = 10_000;
+
+async function acquireLock(lock: string): Promise<boolean> {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      await writeFile(lock, String(process.pid), { flag: 'wx' });
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') return false;
+    }
+    try {
+      if (Date.now() - (await stat(lock)).mtimeMs > LOCK_STALE_MS) {
+        await rm(lock, { force: true });
+        continue;
+      }
+    } catch {
+      continue; // released between our attempts
+    }
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 20)));
   }
 }
