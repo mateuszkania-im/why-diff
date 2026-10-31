@@ -57,7 +57,7 @@ export function arr(obj: unknown, key: string): unknown[] {
 /** JSON.parse that returns undefined instead of throwing. */
 export function tryParseJson(text: string): unknown {
   try {
-    return JSON.parse(text) as unknown;
+    return JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text) as unknown;
   } catch {
     return undefined;
   }

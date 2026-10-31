@@ -35,7 +35,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import type { DiscoverOptions, FileEdit, Prompt, Session, SessionAdapter } from '../types.js';
-import { fileMentions } from './scan.js';
+import { DRIVE_PATH, fileMentions, pathWithin } from './scan.js';
 import {
   arr,
   clip,
@@ -113,6 +113,7 @@ async function realpathSafe(p: string): Promise<string> {
 
 /** True when `child` is `root` or lives below it. */
 export function isInside(root: string, child: string): boolean {
+  if (DRIVE_PATH.test(root) || DRIVE_PATH.test(child)) return pathWithin(root, child);
   const rel = path.relative(root, child);
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }

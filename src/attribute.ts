@@ -67,6 +67,7 @@
 
 import { realpathSync } from 'node:fs';
 import path from 'node:path';
+import { DRIVE_PATH, driveKey } from './adapters/scan.js';
 
 import type { AttributedHunk, DiffLine, EditRef, FileEdit, Hunk, Label, MatchStrength, Prompt, Session } from './types.js';
 
@@ -422,6 +423,7 @@ export function repoRelativePath(
   cwd = '',
   cwdVariants: string[] = rootVariants(cwd),
 ): string | null {
+  if (DRIVE_PATH.test(filePath) || (!path.isAbsolute(filePath) && DRIVE_PATH.test(cwd))) return driveRelativePath(filePath, roots, cwd);
   // Compared in Unicode NFC: macOS file APIs and agents may hand over NFD names (`cafe\u0301.js`)
   // where git reports NFC (`caf\u00e9.js`).
   const candidates = new Set<string>();
@@ -441,6 +443,19 @@ export function repoRelativePath(
       if (c === root) return '';
       if (c.startsWith(root + path.sep)) return path.relative(root, c).split(path.sep).join('/');
     }
+  }
+  return null;
+}
+
+/** {@link repoRelativePath} for Windows drive paths: case-insensitive, either slash style. */
+function driveRelativePath(filePath: string, roots: string[], cwd: string): string | null {
+  const abs = (DRIVE_PATH.test(filePath) ? filePath : `${cwd}/${filePath}`).normalize('NFC').replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/(?:\.\/)+/g, '/').replace(/\/$/, '');
+  const lower = abs.toLowerCase();
+  for (const root of roots) {
+    if (!DRIVE_PATH.test(root)) continue;
+    const r = driveKey(root.normalize('NFC'));
+    if (lower === r) return '';
+    if (lower.startsWith(`${r}/`) && abs.length === lower.length) return abs.slice(r.length + 1);
   }
   return null;
 }

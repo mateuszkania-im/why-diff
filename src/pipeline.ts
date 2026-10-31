@@ -3,7 +3,7 @@
  */
 import os from 'node:os';
 import path from 'node:path';
-import { lstat, readFile } from 'node:fs/promises';
+import { lstat, readFile, stat } from 'node:fs/promises';
 import type { Harness, Hunk, Report, Session, SessionAdapter } from './types.js';
 import { getDiff, git, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
@@ -139,6 +139,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   const extraRoots = await worktreeRoots(root);
   if (opts.sessionFiles?.length) {
     for (const file of opts.sessionFiles) {
+      await checkSessionFile(file);
       const adapter = guessAdapter(file);
       sessions.push(await adapter.parse(file));
     }
@@ -274,6 +275,18 @@ async function pythonPackageDirs(root: string, rev: string | undefined, hunks: H
     } catch { /* not a package */ }
   }
   return out;
+}
+
+/** A clear error for a `--session` argument that is not a readable transcript file. */
+async function checkSessionFile(file: string): Promise<void> {
+  let info;
+  try {
+    info = await stat(/^(.*\.db)#[^#/\\]+$/.exec(file)?.[1] ?? file); // opencode `<db>#<session id>`
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    throw new Error(code === 'ENOENT' ? `--session ${file}: file not found` : `--session ${file}: cannot read (${code ?? (err as Error).message})`);
+  }
+  if (info.isDirectory()) throw new Error(`--session ${file}: is a directory; pass a transcript file (a .jsonl, or an opencode session .json / .db)`);
 }
 
 /** Replace a leading home directory with `~` so reports do not leak the user name. */

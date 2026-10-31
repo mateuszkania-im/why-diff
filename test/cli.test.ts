@@ -59,6 +59,17 @@ afterAll(() => {
 });
 
 describe('argument validation', () => {
+  it('--session pointing at a directory or a missing file gives a clear error, not a raw errno', () => {
+    const dir = cli(['-q', '--format', 'json', '-s', repo]);
+    expect(dir.status).toBe(2);
+    expect(dir.stderr).toContain('is a directory');
+    expect(dir.stderr).not.toContain('EISDIR');
+    const missing = cli(['-q', '--format', 'json', '-s', path.join(repo, 'nope.jsonl')]);
+    expect(missing.status).toBe(2);
+    expect(missing.stderr).toContain('not found');
+    expect(missing.stderr).not.toContain('ENOENT');
+  });
+
   it('rejects an unknown --fail-on value', () => {
     const r = cli(['--fail-on', 'risks', '-q']);
     expect(r.status).toBe(2);

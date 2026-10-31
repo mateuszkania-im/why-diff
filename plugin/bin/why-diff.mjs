@@ -2631,7 +2631,7 @@ import { spawn as spawn2 } from "node:child_process";
 // src/pipeline.ts
 import os5 from "node:os";
 import path10 from "node:path";
-import { lstat as lstat2, readFile as readFile6 } from "node:fs/promises";
+import { lstat as lstat2, readFile as readFile6, stat as stat4 } from "node:fs/promises";
 
 // src/git.ts
 import { execFile } from "node:child_process";
@@ -3107,6 +3107,51 @@ function unquotePath(raw) {
 // src/attribute.ts
 import { realpathSync } from "node:fs";
 import path3 from "node:path";
+
+// src/adapters/scan.ts
+import { createReadStream } from "node:fs";
+async function fileMentions(file, needles) {
+  let bufs = needles.map((n) => Buffer.from(n, "utf8")).filter((b) => b.length > 0);
+  if (bufs.length === 0) return !1;
+  let keep = Math.max(...bufs.map((b) => b.length)) - 1, stream = createReadStream(file, { highWaterMark: 1 << 20 }), tail = Buffer.alloc(0);
+  try {
+    for await (let chunk of stream) {
+      let hay = tail.length ? Buffer.concat([tail, chunk]) : chunk;
+      if (bufs.some((b) => hay.includes(b))) return !0;
+      tail = hay.subarray(Math.max(0, hay.length - keep));
+    }
+  } catch {
+    return !1;
+  } finally {
+    stream.destroy();
+  }
+  return !1;
+}
+function filePathNeedles(roots, sep) {
+  let out = /* @__PURE__ */ new Set();
+  for (let root of roots) {
+    let forms = DRIVE_PATH.test(root) ? [root.replace(/\//g, "\\"), root.replace(/\\/g, "/")].flatMap((r) => [r.charAt(0).toUpperCase() + r.slice(1), r.charAt(0).toLowerCase() + r.slice(1)]) : [root];
+    for (let r of forms) {
+      let s = DRIVE_PATH.test(r) ? r.includes("\\") ? "\\" : "/" : sep;
+      out.add(`"file_path":${JSON.stringify(r.endsWith(s) ? r : r + s).slice(0, -1)}`);
+    }
+  }
+  return [...out];
+}
+var DRIVE_PATH = /^[A-Za-z]:[\\/]/;
+function driveKey(p) {
+  return p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+function pathWithin(root, p) {
+  if (DRIVE_PATH.test(root) || DRIVE_PATH.test(p)) {
+    let r2 = driveKey(root), c = driveKey(p);
+    return c === r2 || c.startsWith(`${r2}/`);
+  }
+  let r = root.length > 1 ? root.replace(/\/+$/, "") : root;
+  return p === r || p.startsWith(r.endsWith("/") ? r : `${r}/`);
+}
+
+// src/attribute.ts
 var MAX_POSITIONS_PER_LINE = 64, SEGMENT_CONTEXT = 2, MIN_SEGMENT_RUN = 3, DOMINANT_SHARE = 0.9, MAX_SEGMENTS = 8, MIN_LINES_PER_SEGMENT = 8, MAX_FILE_ONLY_EDITS = 8, TRIVIAL_LINE = /^[\s{}()[\];,]*$/, HUNK_HEADER2 = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(.*)$/;
 function attribute(hunks, sessions, repoRoot2, opts = {}) {
   let prompts = /* @__PURE__ */ new Map();
@@ -3244,6 +3289,7 @@ function difference(a, b) {
   return out;
 }
 function repoRelativePath(filePath, roots, cwd = "", cwdVariants = rootVariants(cwd)) {
+  if (DRIVE_PATH.test(filePath) || !path3.isAbsolute(filePath) && DRIVE_PATH.test(cwd)) return driveRelativePath(filePath, roots, cwd);
   let candidates = /* @__PURE__ */ new Set(), nfcCwd = cwd.normalize("NFC"), abs = path3.isAbsolute(filePath) ? path3.normalize(filePath.normalize("NFC")) : nfcCwd ? path3.resolve(nfcCwd, filePath.normalize("NFC")) : null;
   if (!abs) return null;
   cwdVariants = cwdVariants.map((v) => v.normalize("NFC")), roots = roots.map((r) => r.normalize("NFC")), candidates.add(abs);
@@ -3255,6 +3301,16 @@ function repoRelativePath(filePath, roots, cwd = "", cwdVariants = rootVariants(
       if (c === root) return "";
       if (c.startsWith(root + path3.sep)) return path3.relative(root, c).split(path3.sep).join("/");
     }
+  return null;
+}
+function driveRelativePath(filePath, roots, cwd) {
+  let abs = (DRIVE_PATH.test(filePath) ? filePath : `${cwd}/${filePath}`).normalize("NFC").replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/(?:\.\/)+/g, "/").replace(/\/$/, ""), lower = abs.toLowerCase();
+  for (let root of roots) {
+    if (!DRIVE_PATH.test(root)) continue;
+    let r = driveKey(root.normalize("NFC"));
+    if (lower === r) return "";
+    if (lower.startsWith(`${r}/`) && abs.length === lower.length) return abs.slice(r.length + 1);
+  }
   return null;
 }
 function rootVariants(p) {
@@ -4831,29 +4887,6 @@ import os2 from "node:os";
 import path5 from "node:path";
 import readline from "node:readline";
 
-// src/adapters/scan.ts
-import { createReadStream } from "node:fs";
-async function fileMentions(file, needles) {
-  let bufs = needles.map((n) => Buffer.from(n, "utf8")).filter((b) => b.length > 0);
-  if (bufs.length === 0) return !1;
-  let keep = Math.max(...bufs.map((b) => b.length)) - 1, stream = createReadStream(file, { highWaterMark: 1 << 20 }), tail = Buffer.alloc(0);
-  try {
-    for await (let chunk of stream) {
-      let hay = tail.length ? Buffer.concat([tail, chunk]) : chunk;
-      if (bufs.some((b) => hay.includes(b))) return !0;
-      tail = hay.subarray(Math.max(0, hay.length - keep));
-    }
-  } catch {
-    return !1;
-  } finally {
-    stream.destroy();
-  }
-  return !1;
-}
-function filePathNeedles(roots, sep) {
-  return roots.map((root) => `"file_path":${JSON.stringify(root.endsWith(sep) ? root : root + sep).slice(0, -1)}`);
-}
-
 // src/adapters/bash-mutations.ts
 import os from "node:os";
 import path4 from "node:path";
@@ -5950,8 +5983,10 @@ function applyReplacement(text2, oldString, newString, replaceAll) {
 async function forEachLine(file, fn, skip) {
   let handle = (line) => {
     let end = line.length;
-    if (end > 0 && line[end - 1] === 13 && end--, end === 0 || line[0] !== 123) return;
-    let raw = end === line.length ? line : line.subarray(0, end);
+    end > 0 && line[end - 1] === 13 && end--;
+    let bom = line[0] === 239 && line[1] === 187 && line[2] === 191 ? 3 : 0;
+    if (end <= bom || line[bom] !== 123) return;
+    let raw = bom === 0 && end === line.length ? line : line.subarray(bom, end);
     if (skip?.(raw)) return;
     let parsed;
     try {
@@ -5982,8 +6017,9 @@ async function forEachLine(file, fn, skip) {
 async function peekTranscript(file) {
   let peek = {}, stream = createReadStream2(file, { encoding: "utf8" }), rl = readline.createInterface({ input: stream, crlfDelay: 1 / 0 }), n = 0;
   try {
-    for await (let raw of rl) {
+    for await (let line of rl) {
       if (++n > PEEK_LINES) break;
+      let raw = n === 1 ? line.replace(/^\uFEFF/, "") : line;
       if (!raw || raw[0] !== "{") continue;
       let o;
       try {
@@ -6008,7 +6044,7 @@ async function listSubagentFiles(dir) {
 }
 async function readMeta(file) {
   try {
-    let parsed = JSON.parse(await readFile2(file, "utf8"));
+    let parsed = JSON.parse((await readFile2(file, "utf8")).replace(/^\uFEFF/, ""));
     return isRecord(parsed) ? { toolUseId: str(parsed.toolUseId) } : null;
   } catch {
     return null;
@@ -6028,12 +6064,14 @@ async function isInside(roots, cwd) {
     candidates.add(await realpath2(cwd));
   } catch {
   }
+  if (DRIVE_PATH.test(cwd)) return roots.some((root) => pathWithin(root, cwd));
   for (let root of roots)
     for (let c of candidates)
       if (c === root || c.startsWith(root.endsWith(path5.sep) ? root : root + path5.sep)) return !0;
   return !1;
 }
 async function isAncestor(cwd, roots) {
+  if (DRIVE_PATH.test(cwd)) return roots.some((r) => driveKey(r) !== driveKey(cwd) && pathWithin(cwd, r));
   let candidates = /* @__PURE__ */ new Set([path5.resolve(cwd)]);
   try {
     candidates.add(await realpath2(cwd));
@@ -6092,7 +6130,7 @@ function arr(obj, key) {
 }
 function tryParseJson(text2) {
   try {
-    return JSON.parse(text2);
+    return JSON.parse(text2.charCodeAt(0) === 65279 ? text2.slice(1) : text2);
   } catch {
     return;
   }
@@ -6480,6 +6518,7 @@ async function realpathSafe(p) {
   }
 }
 function isInside2(root, child) {
+  if (DRIVE_PATH.test(root) || DRIVE_PATH.test(child)) return pathWithin(root, child);
   let rel = path7.relative(root, child);
   return rel === "" || !rel.startsWith("..") && !path7.isAbsolute(rel);
 }
@@ -7820,6 +7859,7 @@ async function buildReport(opts = {}) {
   }), since = opts.since ?? (window ? new Date(new Date(window.since).getTime() - 6 * 36e5) : void 0), sessions = [], extraRoots = await worktreeRoots(root);
   if (opts.sessionFiles?.length)
     for (let file of opts.sessionFiles) {
+      await checkSessionFile(file);
       let adapter = guessAdapter(file);
       sessions.push(await adapter.parse(file));
     }
@@ -7910,6 +7950,16 @@ async function pythonPackageDirs(root, rev, hunks) {
     }
   }
   return out;
+}
+async function checkSessionFile(file) {
+  let info;
+  try {
+    info = await stat4(/^(.*\.db)#[^#/\\]+$/.exec(file)?.[1] ?? file);
+  } catch (err) {
+    let code2 = err.code;
+    throw new Error(code2 === "ENOENT" ? `--session ${file}: file not found` : `--session ${file}: cannot read (${code2 ?? err.message})`);
+  }
+  if (info.isDirectory()) throw new Error(`--session ${file}: is a directory; pass a transcript file (a .jsonl, or an opencode session .json / .db)`);
 }
 function tildify(p, home) {
   if (!home) return p;

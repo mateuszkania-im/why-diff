@@ -26,7 +26,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 
 import type { DiscoverOptions, EditKind, FileEdit, Harness, Prompt, Session, SessionAdapter } from '../types.js';
-import { fileMentions, filePathNeedles } from './scan.js';
+import { DRIVE_PATH, driveKey, fileMentions, filePathNeedles, pathWithin } from './scan.js';
 import { detectBashMutations } from './bash-mutations.js';
 
 // ---------------------------------------------------------------------------
@@ -733,8 +733,9 @@ async function forEachLine(file: string, fn: (line: TranscriptLine) => void, ski
   const handle = (line: Buffer): void => {
     let end = line.length;
     if (end > 0 && line[end - 1] === 0x0d) end--; // CRLF
-    if (end === 0 || line[0] !== 0x7b /* { */) return;
-    const raw = end === line.length ? line : line.subarray(0, end);
+    const bom = line[0] === 0xef && line[1] === 0xbb && line[2] === 0xbf ? 3 : 0; // UTF-8 BOM (first line)
+    if (end <= bom || line[bom] !== 0x7b /* { */) return;
+    const raw = bom === 0 && end === line.length ? line : line.subarray(bom, end);
     if (skip?.(raw)) return;
     let parsed: unknown;
     try {
@@ -780,8 +781,9 @@ async function peekTranscript(file: string): Promise<Peek> {
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
   let n = 0;
   try {
-    for await (const raw of rl) {
+    for await (const line of rl) {
       if (++n > PEEK_LINES) break;
+      const raw = n === 1 ? line.replace(/^\uFEFF/, '') : line;
       if (!raw || raw[0] !== '{') continue;
       let o: unknown;
       try {
@@ -815,7 +817,7 @@ async function listSubagentFiles(dir: string): Promise<string[]> {
 
 async function readMeta(file: string): Promise<SubagentMeta | null> {
   try {
-    const parsed: unknown = JSON.parse(await readFile(file, 'utf8'));
+    const parsed: unknown = JSON.parse((await readFile(file, 'utf8')).replace(/^\uFEFF/, ''));
     return isRecord(parsed) ? { toolUseId: str(parsed.toolUseId) } : null;
   } catch {
     return null;
@@ -841,6 +843,7 @@ async function isInside(roots: string[], cwd: string): Promise<boolean> {
   } catch {
     // cwd no longer exists; compare the string only
   }
+  if (DRIVE_PATH.test(cwd)) return roots.some((root) => pathWithin(root, cwd));
   for (const root of roots) {
     for (const c of candidates) {
       if (c === root || c.startsWith(root.endsWith(path.sep) ? root : root + path.sep)) return true;
@@ -851,6 +854,7 @@ async function isInside(roots: string[], cwd: string): Promise<boolean> {
 
 /** True when `cwd` is a strict ancestor of one of `roots`. */
 async function isAncestor(cwd: string, roots: string[]): Promise<boolean> {
+  if (DRIVE_PATH.test(cwd)) return roots.some((r) => driveKey(r) !== driveKey(cwd) && pathWithin(cwd, r));
   const candidates = new Set<string>([path.resolve(cwd)]);
   try {
     candidates.add(await realpath(cwd));
