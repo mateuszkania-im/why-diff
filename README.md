@@ -93,7 +93,7 @@ You get:
 
 - **`/why-diff`**: a review of the current diff, summarised by Claude with every risk quoted as `file:line`.
 - **A skill** Claude uses before committing or opening a PR, so it reports its own scope creep.
-- **A Stop hook guard** (`why-diff guard`): if the agent skipped, deleted or weakened a test, touched CI, or added something that looks like a secret *in this session*, it is not allowed to finish silently. The hook blocks once and tells it to revert or tell you plainly. It never blocks twice in a row and never breaks your session if something goes wrong.
+- **A Stop hook guard** (`why-diff guard`): if the agent skipped, deleted or weakened a test, touched CI, or added something that looks like a secret *in this session*, it is not allowed to finish silently. The hook blocks once and tells it to revert or tell you plainly. It never blocks twice in a row and never breaks your session if something goes wrong. Team rules live in `.why-diff.json` at the repo root (or a `"whyDiff"` key in `package.json`): `{ "protected": ["migrations/**"], "ignore": ["generated/**"], "blockOn": ["protected-path", "ci-changed"] }`. Agent edits under `protected` paths get a `protected-path` risk label, `ignore` drops paths from the report, and `blockOn` replaces the guard's default blocking list (an explicit `--on` still wins).
 
 ## Intent check accuracy
 

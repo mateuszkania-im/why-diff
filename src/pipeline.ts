@@ -15,6 +15,7 @@ import { claudeCodeAdapter } from './adapters/claude.js';
 import { codexAdapter } from './adapters/codex.js';
 import { opencodeAdapter } from './adapters/opencode.js';
 import { redactReport } from './redact.js';
+import { loadConfig, matchGlobs, type WhyDiffConfig } from './config.js';
 import { createClassifier, classifyHunks, summarizeIntent, type ClassifierKind } from './classify/index.js';
 
 export const ADAPTERS: Record<Harness, SessionAdapter> = {
@@ -50,6 +51,8 @@ export interface BuildOptions {
    * transcript modified in the window, so it is opt-in.
    */
   scanAll?: boolean;
+  /** Team rules; default: read from the repo root (`.why-diff.json`) */
+  config?: WhyDiffConfig;
   /** LLM intent check backend; 'none' to skip */
   classify?: ClassifierKind;
   model?: string;
@@ -95,8 +98,10 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
     rangeLabel = resolved.label;
   }
 
+  const config = opts.config ?? (await loadConfig(root));
   log(`diffing ${rangeLabel}`);
-  const hunks = parseUnifiedDiff(await getDiff(root, target, { paths: opts.paths }));
+  const hunks = parseUnifiedDiff(await getDiff(root, target, { paths: opts.paths }))
+    .filter((h) => !matchGlobs(config.ignore, h.file));
 
   const window = await commitTimes(root, target).catch(() => undefined);
   const since = opts.since ?? (window ? new Date(new Date(window.since).getTime() - 6 * 3600_000) : undefined);
@@ -138,6 +143,15 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   // Without any transcript every hunk would be "unattributed": noise, not a finding.
   const mode: Report['mode'] = sessions.length === 0 ? 'risk-scan' : 'provenance';
   if (mode === 'risk-scan') attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== 'unattributed') }));
+  if (config.protected?.length) {
+    // A human editing a protected path is not a risk; only the agent's hunks (or any hunk when there are no transcripts) are.
+    attributed = attributed.map((h) => {
+      if (mode === 'provenance' && h.match === 'none') return h;
+      const glob = matchGlobs(config.protected, h.hunk.file) ?? (h.hunk.oldFile ? matchGlobs(config.protected, h.hunk.oldFile) : undefined);
+      if (!glob) return h;
+      return { ...h, labels: [...h.labels, { kind: 'protected-path' as const, severity: 'risk' as const, detail: `Protected path (${glob}): ${h.hunk.file}` }] };
+    });
+  }
 
   const kind = opts.classify ?? 'none';
   if (kind !== 'none' && attributed.length && mode === 'risk-scan') {

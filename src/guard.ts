@@ -14,7 +14,10 @@ import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
 import { git, hasHead, repoRoot, worktreeRoots } from './git.js';
 import { repoRelativePath, rootVariants } from './attribute.js';
+import { loadConfig, type WhyDiffConfig } from './config.js';
 import type { LabelKind } from './types.js';
+
+export const DEFAULT_BLOCK_ON: readonly LabelKind[] = ['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path'];
 
 export interface GuardPayload {
   transcript_path?: string;
@@ -24,7 +27,8 @@ export interface GuardPayload {
 }
 
 export interface GuardOptions {
-  blocking: Set<LabelKind>;
+  /** Explicit blocking list (`--on`); default: config `blockOn`, then {@link DEFAULT_BLOCK_ON} */
+  blocking?: Set<LabelKind>;
   /** Home dir for transcript discovery (tests) */
   home?: string;
   /** Where guard-state.json lives; default `<repo>/.why-diff` */
@@ -62,6 +66,10 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
     .map((p) => `:(literal)${p.split(path.sep).join('/')}`);
   if (!paths.length) return NO_BLOCK;
 
+  // An invalid config must not break the session: fall back to defaults.
+  const config: WhyDiffConfig = await loadConfig(root).catch(() => ({}));
+  const blocking = opts.blocking ?? new Set<LabelKind>(config.blockOn ?? DEFAULT_BLOCK_ON);
+
   let baseRev = 'HEAD';
   if (await hasHead(root)) {
     const before = await git(root, ['rev-list', '-1', `--before=${session.startedAt}`, 'HEAD']).catch(() => '');
@@ -76,6 +84,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
     sessionFiles: [payload.transcript_path],
     harnesses: ['claude-code'],
     home: opts.home,
+    config,
   });
 
   const hits: string[] = [];
@@ -84,7 +93,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
     if (h.match !== 'exact' && h.match !== 'partial') continue;
     if (!h.editIds.length || !h.editIds.every((id) => id.startsWith(`${session.id}:`))) continue;
     for (const l of h.labels) {
-      if (!opts.blocking.has(l.kind)) continue;
+      if (!blocking.has(l.kind)) continue;
       hits.push(`- ${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`);
       keys.push(`${h.hunk.file}\t${l.kind}\t${l.detail}`);
     }

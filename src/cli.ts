@@ -203,12 +203,12 @@ program
 program
   .command('guard')
   .description('Claude Code Stop hook: block the agent from finishing if it skipped, weakened or deleted tests')
-  .option('--on <kinds>', 'labels that block (comma list)', 'test-skip-added,tests-disabled,assertion-removed,secret-like,ci-changed')
-  .action(async (o: { on: string }) => {
+  .option('--on <kinds>', 'labels that block (comma list; default: blockOn from .why-diff.json, else test-skip-added,tests-disabled,assertion-removed,secret-like,ci-changed,protected-path)')
+  .action(async (o: { on?: string }) => {
     const raw = await readStdin();
     let payload: GuardPayload = {};
     try { payload = raw.trim() ? JSON.parse(raw) : {}; } catch { /* not a hook payload */ }
-    const blocking = new Set(o.on.split(',').map((s) => s.trim()).filter(Boolean)) as Set<LabelKind>;
+    const blocking = o.on === undefined ? undefined : (new Set(o.on.split(',').map((s) => s.trim()).filter(Boolean)) as Set<LabelKind>);
     const result = await runGuard(payload, { blocking });
     if (!result.block) return;
     process.stderr.write(result.message ?? '');

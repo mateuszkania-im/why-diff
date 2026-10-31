@@ -1,5 +1,6 @@
 /** Public library API of why-diff. */
 export * from './types.js';
+export { loadConfig, type WhyDiffConfig } from './config.js';
 export { buildReport, ADAPTERS, type BuildOptions } from './pipeline.js';
 export { parseUnifiedDiff } from './diff-parse.js';
 export { attribute } from './attribute.js';

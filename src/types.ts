@@ -133,7 +133,8 @@ export type LabelKind =
   | 'secret-like'          // high-entropy / key-looking string added
   | 'unattributed'         // no agent edit explains this hunk (human or unknown tool)
   | 'out-of-scope'         // file never mentioned in prompts and not near other touched files (heuristic)
-  | 'bash-edit';           // produced via shell command, low-confidence attribution
+  | 'bash-edit'            // produced via shell command, low-confidence attribution
+  | 'protected-path';      // agent edit under a path the team marked protected (.why-diff.json)
 
 export interface Label {
   kind: LabelKind;
@@ -207,6 +208,7 @@ export const FILE_LEVEL_LABELS: ReadonlySet<LabelKind> = new Set<LabelKind>([
   'ci-changed',
   'out-of-scope',
   'dependency-added',
+  'protected-path',
 ]);
 
 export interface Report {
