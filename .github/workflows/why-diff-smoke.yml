@@ -1,0 +1,14 @@
+name: why-diff smoke
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  why-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: ./
+        with:
+          fail-on: risk
