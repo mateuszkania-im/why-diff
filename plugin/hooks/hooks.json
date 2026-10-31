@@ -1,5 +1,5 @@
 {
-  "description": "why-diff guard: stop the agent from finishing silently after skipping, weakening or deleting tests, or touching CI and secrets. Runs the bundled CLI locally (no network, ~0.1 s).",
+  "description": "why-diff guard: stop the agent from finishing silently after skipping, weakening or deleting tests, or touching CI and secrets. Runs the bundled CLI locally (no network).",
   "hooks": {
     "Stop": [
       {

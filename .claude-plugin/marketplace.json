@@ -1,6 +1,10 @@
 {
   "name": "why-diff",
-  "owner": { "name": "Mateusz Kania", "url": "https://github.com/mateuszkania-im" },
+  "owner": {
+    "name": "Mateusz Kania",
+    "url": "https://github.com/mateuszkania-im"
+  },
+  "description": "why-diff: trace every hunk of an AI agent's diff to the prompt that wrote it, and flag unrequested changes and test tampering.",
   "plugins": [
     {
       "name": "why-diff",

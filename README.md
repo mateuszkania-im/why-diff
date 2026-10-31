@@ -16,7 +16,7 @@ Node 20+. Works with **Claude Code**, **Codex** and **OpenCode** transcripts. Ru
 > **What we measured** ([full study](docs/STUDY.md), 78 headless Claude Code sessions, raw data in `bench/`):
 > Claude Code (Sonnet) **never edited a test in 72 runs**, even when the failing test was wrong. It refused all 24 impossible tasks.
 > Add one sentence to the prompt ("just make the suite green") and it **edited the tests in 5 of 6** impossible tasks (p < 0.001).
-> **why-diff flagged all 5**, including `3240 → 3300`, `false → true` and a deleted `expect`.
+> **why-diff flagged all 5 as test changes**, and 3 of them as skipped tests or weakened assertions, including `3240 → 3300`, `false → true` and a deleted `expect`.
 > Attribution on the benchmark: **340 / 340 agent-written lines traced to the exact edit and prompt.**
 <!-- STUDY:END -->
 
@@ -38,13 +38,13 @@ Node 20+. Works with **Claude Code**, **Codex** and **OpenCode** transcripts. Ru
 
 **Transcripts are the missing link.** Claude Code, Codex and OpenCode already record every `Edit`, `Write` and `apply_patch` with the exact old and new text, next to the prompt that led to it. The record exists on your machine; nothing reads it at review time. `why-diff` joins that record with your git diff, line by line.
 
-**Instruction files are not enough.** `AGENTS.md` and `CLAUDE.md` tell the agent what to do. They don't check what it did. In [our study](docs/STUDY.md) Claude Code never edited a test in 72 runs, with or without a CLAUDE.md rule against it. One sentence of pressure in the prompt ("just get `npm test` fully green") was enough for it to edit the tests in 5 of 6 tasks it could not solve honestly. An instruction can be outweighed by the next prompt, and nothing tells you when that happened. why-diff flagged all 5 of those test edits, because it looks at the result instead of the request.
+**Instruction files are not enough.** `AGENTS.md` and `CLAUDE.md` tell the agent what to do. They don't check what it did. In [our study](docs/STUDY.md) Claude Code never edited a test in 72 runs, with or without a CLAUDE.md rule against it. One sentence of pressure in the prompt ("just get `npm test` fully green") was enough for it to edit the tests in 5 of 6 tasks it could not solve honestly. An instruction can be outweighed by the next prompt, and nothing tells you when that happened. why-diff flagged all 5 of those runs as test changes, and 3 of them as skipped tests or weakened assertions, because it looks at the result instead of the request.
 
 **What it is not.**
 
 - Not a code reviewer. It doesn't judge whether the code is correct, fast or well designed.
 - Not a linter. The risk labels point at things a human should look at (a removed assertion, a new dependency, a CI change); they don't enforce style.
-- Not telemetry. Transcripts are read locally and nothing is sent anywhere. The only network call is the optional `--classify` intent check, to the model backend you pick.
+- Not telemetry. Transcripts are read locally and nothing is sent anywhere. The only network calls are the optional `--classify` intent check, to the model backend you pick, and `why-diff pr`, which edits your PR description through `gh`.
 
 ## How is this different from code review?
 
@@ -90,7 +90,7 @@ UNATTRIBUTED (1)  no agent edit explains these
     src/cart.js:L18-20  +1
       none · ✗ unrequested · ▲ unattributed
 
-why-diff v0.1.0 · generated 31 Oct 2026, 17:44 UTC
+why-diff v0.2.0 · generated 31 Oct 2026, 21:47 UTC
 ```
 
 - **Per-line provenance.** Each added line is owned by the edit that *introduced* it (not the one that merely had it as context). Hunks that mix several prompts, or your own manual edits, are split into segments.
