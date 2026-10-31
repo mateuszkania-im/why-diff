@@ -34,6 +34,17 @@ const JWT = /\beyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}/g;
 const AUTH_HEADER = /\b(authorization["']?\s*[:=]\s*["']?(?:Bearer|Basic|Token)\s+)[^\s"']{8,}/gi;
 /** A bare `Bearer <token>` / `Basic <b64>`: needs a digit so prose like "Basic installation" is left alone. */
 const BARE_SCHEME = /\b(Bearer|Basic)(\s+)(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/-]{8,}={0,2}/g;
+/** A bare `Basic <b64>` with no digit: masked only when it is valid base64 of a printable `user:pass`. */
+const BARE_BASIC = /\b(Basic)(\s+)([A-Za-z0-9+/]{12,}={0,2})(?![\w+/=-])/g;
+
+function basicCredential(b64: string): boolean {
+  const body = b64.replace(/=+$/, '');
+  if (body.length % 4 === 1) return false;
+  const buf = Buffer.from(body, 'base64');
+  if (buf.toString('base64').replace(/=+$/, '') !== body) return false;
+  const text = buf.toString('latin1');
+  return /^[\x20-\x7e]+$/.test(text) && /^[^:]+:./.test(text);
+}
 /**
  * `name <op> value`. The name is at most 60 chars and starts at a word start
  * (lookbehind), so scanning is linear. Whether the name is secret-sounding and
@@ -61,6 +72,21 @@ function secretSuffix(segs: string[]): boolean {
   return SECRET_SUFFIXES.some((w) => last.endsWith(w));
 }
 
+/** Names that are a secret on their own; a dotted all-letter value after them is masked unless it reads as code. */
+const EXACT_SECRET_NAMES = new Set(['password', 'passwd', 'pwd', 'passphrase', 'secret']);
+
+/**
+ * `password=foo.bar`: a member-path-shaped value after an exact secret name is a literal unless it
+ * starts at a known code root (`config.`, `process.`, ...) or ends in a secret-named member
+ * (`user.password`), which is how code reads a secret.
+ */
+function dottedSecret(segs: string[], v: string): boolean {
+  if (segs.length !== 1 || !EXACT_SECRET_NAMES.has(segs[0] ?? '')) return false;
+  if (/\d/.test(v) || CODE_ROOTS.test(v)) return false;
+  const last = v.slice(v.lastIndexOf('.') + 1);
+  return !secretName(nameSegments(last)) && !secretSuffix(nameSegments(last));
+}
+
 const ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/;
 const CALL = /^[A-Za-z_$][\w$.]*\(/;
 const MEMBER_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/;
@@ -76,6 +102,7 @@ export function redactKeys(text: string): string {
   out = out.replace(JWT, `eyJ${DOTS}`);
   out = out.replace(AUTH_HEADER, (_m, head: string) => `${head}${DOTS}`);
   out = out.replace(BARE_SCHEME, (_m, scheme: string, sp: string) => `${scheme}${sp}${DOTS}`);
+  out = out.replace(BARE_BASIC, (m, scheme: string, sp: string, b64: string) => (basicCredential(b64) ? `${scheme}${sp}${DOTS}` : m));
   for (const { re } of SECRET_RULES) {
     if (re.source.includes('PRIVATE KEY')) continue;
     out = out.replace(new RegExp(re.source, 'g'), (m) => `${m.slice(0, m.startsWith('sk-ant-') ? 7 : 4)}${DOTS}`);
@@ -99,17 +126,20 @@ export function redactSecrets(text: string): string {
       return `${head}${quote}${DOTS}${quote}`;
     }
     const v = bare ?? '';
-    if (ENV_REF.test(v) || CALL.test(v) || (MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v))) || CODE_WORDS.has(v.toLowerCase())) return m;
+    if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase())) return m;
+    if (MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dottedSecret(segs, v)) return m;
     if (!strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
-    // `name: word` is usually prose; an all-letter value needs a config-like line.
-    if (op === ':' && /^[A-Za-z]+$/.test(v)) {
+    // `name: word` is usually prose; an all-letter (or dotted all-letter) value needs a config-like line.
+    if (op === ':' && /^[A-Za-z]+(?:\.[A-Za-z]+)*$/.test(v)) {
       const text = str ?? '';
       const at = offset ?? 0;
       // Bounded look-around keeps this linear on very long lines.
       const WINDOW = 200;
       const back = text.slice(Math.max(0, at - WINDOW), at);
       const nl = back.lastIndexOf('\n');
-      const prefix = nl === -1 ? (at > WINDOW ? null : back) : back.slice(nl + 1);
+      // No newline in the window: the line start is further back. Only whitespace all the way
+      // through the window (deep YAML indentation) still counts as a config-like line start.
+      const prefix = nl !== -1 ? back.slice(nl + 1) : at <= WINDOW || /^\s*$/.test(back) ? back : null;
       const configLike = q !== '' || (prefix !== null && /^[\s{,-]*$/.test(prefix));
       const after = at + m.length;
       const ahead = text.slice(after, after + WINDOW);

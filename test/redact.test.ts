@@ -201,3 +201,50 @@ describe('redactSecrets: round 2', () => {
     expect(performance.now() - t0).toBeLessThan(200);
   });
 });
+
+describe('redactSecrets: residuals (0.2.1)', () => {
+  it('masks `password: word` after more than 200 characters of leading whitespace', () => {
+    const t = `${' '.repeat(250)}password: hunter`;
+    expect(redactSecrets(t)).not.toContain('hunter');
+    const nl = `config:\n${' '.repeat(250)}password: hunter`;
+    expect(redactSecrets(nl)).not.toContain('hunter');
+  });
+  it('keeps prose with more than 200 characters before `token: word` on the same line', () => {
+    const t = `${'some words here '.repeat(15)}the token: expires`;
+    expect(redactSecrets(t)).toBe(t);
+  });
+  it.each([
+    ['password=foo.bar', 'foo.bar'],
+    ['pwd=alpha.beta', 'alpha.beta'],
+    ['secret=open.sesame', 'open.sesame'],
+    ['passwd = "x" ; passwd=correct.horse', 'correct.horse'],
+  ])('masks a dotted all-letter value after an exact secret name: %s', (t, leak) => {
+    expect(redactSecrets(t)).not.toContain(leak);
+  });
+  it.each([
+    'password = config.db.password',
+    'password=process.env.DB_PASS',
+    'password = settings.password',
+    'password = this.password',
+    'password = os.environ.get',
+    'password = user.password',
+    'password = form.values.password',
+    'password = hash.update(x)',
+    'apiVersion = foo.bar',
+  ])('keeps code references: %s', (t) => {
+    expect(redactSecrets(t)).toBe(t);
+  });
+  it('masks a bare Basic credential without digits when it decodes to user:pass', () => {
+    expect(Buffer.from('dXNlcjpwYXNz', 'base64').toString()).toBe('user:pass');
+    expect(redactSecrets('curl -H "Basic dXNlcjpwYXNz" https://x')).not.toContain('dXNlcjpwYXNz');
+    expect(redactSecrets('Basic YWRtaW46c2VjcmV0')).not.toContain('YWRtaW46c2VjcmV0');
+  });
+  it.each([
+    'Basic installation steps are in the README',
+    'Basic authentication is supported',
+    'Basic configuration',
+    'Basic HelloWorldExample',
+  ])('keeps prose: %s', (t) => {
+    expect(redactSecrets(t)).toBe(t);
+  });
+});

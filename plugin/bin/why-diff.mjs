@@ -3607,7 +3607,16 @@ var SECRET_RULES = [
   { re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/, name: "Slack token" },
   { re: /\bAIza[0-9A-Za-z_-]{35}\b/, name: "Google API key" },
   { re: /\bnpm_[A-Za-z0-9]{36}\b/, name: "npm token" }
-], DOTS = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022", PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/'"`@:]{1,100}:[^\s/'"`]{1,200}@/gi, JWT = /\beyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}/g, AUTH_HEADER = /\b(authorization["']?\s*[:=]\s*["']?(?:Bearer|Basic|Token)\s+)[^\s"']{8,}/gi, BARE_SCHEME = /\b(Bearer|Basic)(\s+)(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/-]{8,}={0,2}/g, NAME_VALUE = /(?<![\w.])((["']?)([A-Za-z_][\w.-]{0,60})\2\s*(:=|=>|===?|!==?|=|:)[ \t]*)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'`,;]+))/g, EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b/g, SECRET_WORDS = /* @__PURE__ */ new Set(["password", "passwd", "pwd", "passphrase", "secret", "token", "credential", "credentials", "apikey"]), SECRET_SUFFIXES = ["password", "passwd", "passphrase", "secret", "token", "apikey", "credential", "credentials"];
+], DOTS = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022", PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/'"`@:]{1,100}:[^\s/'"`]{1,200}@/gi, JWT = /\beyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}/g, AUTH_HEADER = /\b(authorization["']?\s*[:=]\s*["']?(?:Bearer|Basic|Token)\s+)[^\s"']{8,}/gi, BARE_SCHEME = /\b(Bearer|Basic)(\s+)(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/-]{8,}={0,2}/g, BARE_BASIC = /\b(Basic)(\s+)([A-Za-z0-9+/]{12,}={0,2})(?![\w+/=-])/g;
+function basicCredential(b64) {
+  let body = b64.replace(/=+$/, "");
+  if (body.length % 4 === 1) return !1;
+  let buf = Buffer.from(body, "base64");
+  if (buf.toString("base64").replace(/=+$/, "") !== body) return !1;
+  let text2 = buf.toString("latin1");
+  return /^[\x20-\x7e]+$/.test(text2) && /^[^:]+:./.test(text2);
+}
+var NAME_VALUE = /(?<![\w.])((["']?)([A-Za-z_][\w.-]{0,60})\2\s*(:=|=>|===?|!==?|=|:)[ \t]*)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'`,;]+))/g, EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b/g, SECRET_WORDS = /* @__PURE__ */ new Set(["password", "passwd", "pwd", "passphrase", "secret", "token", "credential", "credentials", "apikey"]), SECRET_SUFFIXES = ["password", "passwd", "passphrase", "secret", "token", "apikey", "credential", "credentials"];
 function nameSegments(name) {
   return name.split(/[._-]+/).flatMap((p) => p.split(/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/)).map((x) => x.toLowerCase());
 }
@@ -3618,11 +3627,17 @@ function secretSuffix(segs) {
   let last = segs[segs.length - 1] ?? "";
   return SECRET_SUFFIXES.some((w) => last.endsWith(w));
 }
+var EXACT_SECRET_NAMES = /* @__PURE__ */ new Set(["password", "passwd", "pwd", "passphrase", "secret"]);
+function dottedSecret(segs, v) {
+  if (segs.length !== 1 || !EXACT_SECRET_NAMES.has(segs[0] ?? "") || /\d/.test(v) || CODE_ROOTS.test(v)) return !1;
+  let last = v.slice(v.lastIndexOf(".") + 1);
+  return !secretName(nameSegments(last)) && !secretSuffix(nameSegments(last));
+}
 var ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/, CALL = /^[A-Za-z_$][\w$.]*\(/, MEMBER_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/, CODE_ROOTS = /^(?:process|os|env|config|conf|settings|this|self|ctx|args|params|options|opts|vars|secrets|props|state|req|request)\./i, CODE_WORDS = /* @__PURE__ */ new Set(["new", "null", "undefined", "nil", "none", "true", "false", "this", "self", "await", "async", "function", "return", "require", "string", "number", "boolean", "any", "unknown", "str", "int", "bool", "object", "void", "never", "optional", "required"]);
 function redactKeys(text2) {
   if (!text2) return text2;
   let out = text2.replace(PRIVATE_KEY_BLOCK, "-----PRIVATE KEY REDACTED-----");
-  out = out.replace(URL_CREDENTIALS, (_m, scheme) => `${scheme}${DOTS}@`), out = out.replace(JWT, `eyJ${DOTS}`), out = out.replace(AUTH_HEADER, (_m, head) => `${head}${DOTS}`), out = out.replace(BARE_SCHEME, (_m, scheme, sp) => `${scheme}${sp}${DOTS}`);
+  out = out.replace(URL_CREDENTIALS, (_m, scheme) => `${scheme}${DOTS}@`), out = out.replace(JWT, `eyJ${DOTS}`), out = out.replace(AUTH_HEADER, (_m, head) => `${head}${DOTS}`), out = out.replace(BARE_SCHEME, (_m, scheme, sp) => `${scheme}${sp}${DOTS}`), out = out.replace(BARE_BASIC, (m, scheme, sp, b64) => basicCredential(b64) ? `${scheme}${sp}${DOTS}` : m);
   for (let { re } of SECRET_RULES)
     re.source.includes("PRIVATE KEY") || (out = out.replace(new RegExp(re.source, "g"), (m) => `${m.slice(0, m.startsWith("sk-ant-") ? 7 : 4)}${DOTS}`));
   return out;
@@ -3639,10 +3654,10 @@ function redactSecrets(text2) {
       return `${head}${quote2}${DOTS}${quote2}`;
     }
     let v = bare ?? "";
-    if (ENV_REF.test(v) || CALL.test(v) || MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) || CODE_WORDS.has(v.toLowerCase()) || !strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
-    if (op === ":" && /^[A-Za-z]+$/.test(v)) {
+    if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase()) || MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dottedSecret(segs, v) || !strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
+    if (op === ":" && /^[A-Za-z]+(?:\.[A-Za-z]+)*$/.test(v)) {
       let text3 = str3 ?? "", at = offset ?? 0, WINDOW = 200, back = text3.slice(Math.max(0, at - WINDOW), at), nl = back.lastIndexOf(`
-`), prefix = nl === -1 ? at > WINDOW ? null : back : back.slice(nl + 1), configLike = q !== "" || prefix !== null && /^[\s{,-]*$/.test(prefix), after = at + m.length, rest = text3.slice(after, after + WINDOW).split(`
+`), prefix = nl !== -1 ? back.slice(nl + 1) : at <= WINDOW || /^\s*$/.test(back) ? back : null, configLike = q !== "" || prefix !== null && /^[\s{,-]*$/.test(prefix), after = at + m.length, rest = text3.slice(after, after + WINDOW).split(`
 `, 1)[0] ?? "";
       if (!configLike || !/^\s*[,;}\]]?\s*$/.test(rest)) return m;
     }
@@ -4053,8 +4068,8 @@ function detectPytestOptions(lines, added, base) {
   return hits;
 }
 function detectTestsDisabled(path13, hunk, lines, scope) {
-  let hits = [], base = posix.basename(path13);
-  if (hunk.status === "deleted" && isTestFile(path13) && !scope.goneSourceStems.has(testStem(base)) && hits.push(`Deletes test file ${base}`), hunk.status === "renamed" && hunk.oldFile && isTestFile(hunk.oldFile)) {
+  let hits = [], base = posix.basename(path13), sourceGone = (scope.goneSourceStems.get(testStem(base)) ?? []).some((dir) => relatedDirs(posix.dirname(path13), dir));
+  if (hunk.status === "deleted" && isTestFile(path13) && !sourceGone && hits.push(`Deletes test file ${base}`), hunk.status === "renamed" && hunk.oldFile && isTestFile(hunk.oldFile)) {
     let oldBase = posix.basename(hunk.oldFile);
     if (oldBase !== base && TEST_BASENAME.test(oldBase)) {
       let suffixed = base.startsWith(oldBase) && DISABLED_SUFFIX.test(base.slice(oldBase.length) || " "), markerDropped = !TEST_BASENAME.test(base) && testStem(base) === testStem(oldBase) && !DISABLED_SUFFIX.test(base);
@@ -4091,12 +4106,20 @@ function fullFileView(path13, lines, added, scope) {
   }), { lines: out, added: wideAdded };
 }
 function goneSourceStems(hunks, repoRoot2) {
-  let out = /* @__PURE__ */ new Set();
+  let out = /* @__PURE__ */ new Map();
   for (let { hunk } of hunks) {
     let gone = hunk.status === "deleted" ? toRepoPath(hunk.file, repoRoot2) : hunk.status === "renamed" && hunk.oldFile && hunk.oldFile !== hunk.file ? toRepoPath(hunk.oldFile, repoRoot2) : null;
-    gone && !isTestFile(gone) && out.add(testStem(posix.basename(gone)));
+    if (!gone || isTestFile(gone)) continue;
+    let stem = testStem(posix.basename(gone));
+    out.set(stem, [...out.get(stem) ?? [], posix.dirname(gone)]);
   }
   return out;
+}
+var TEST_DIR_SEGMENTS = /* @__PURE__ */ new Set(["test", "tests", "spec", "specs", "__tests__", "__test__"]), SOURCE_DIR_SEGMENTS = /* @__PURE__ */ new Set(["src", "lib", "source"]);
+function relatedDirs(testDir, srcDir) {
+  if (testDir === srcDir) return !0;
+  let norm = (dir) => dir.split("/").filter((s) => s && s !== "." && !TEST_DIR_SEGMENTS.has(s) && !SOURCE_DIR_SEGMENTS.has(s)).join("/");
+  return norm(testDir) === norm(srcDir);
 }
 function detectCiSwallowedTests(lines, added) {
   let hits = [], indentOf = (t) => t.length - t.trimStart().length, stepStart = /^\s*-\s+[\w-]+:/, block = [], boundary = -1, implicit = !1, flush = () => {
@@ -4106,11 +4129,17 @@ function detectCiSwallowedTests(lines, added) {
       for (let l of block)
         added.has(l) && /^\s*(?:-\s+)?continue-on-error:\s*true\b/.test(l.text) && hits.push("continue-on-error: true on a test step");
     block = [];
+  }, nested = (ind) => {
+    for (let i = block.length - 1; i >= 0; i--) {
+      let t = block[i]?.text ?? "";
+      if (indentOf(t) < ind) return !/^\s*steps:\s*$/.test(t);
+    }
+    return !1;
   };
   for (let l of lines) {
     if (l.type === "del" || !l.text.trim()) continue;
     let ind = indentOf(l.text);
-    stepStart.test(l.text) && (block.length === 0 || ind <= boundary || implicit) ? (flush(), boundary = ind, implicit = !1) : block.length === 0 ? (boundary = ind - 1, implicit = !0) : ind <= boundary && (flush(), boundary = ind - 1, implicit = !0), block.push(l);
+    stepStart.test(l.text) && (block.length === 0 || ind <= boundary || implicit && !nested(ind)) ? (flush(), boundary = ind, implicit = !1) : block.length === 0 ? (boundary = ind - 1, implicit = !0) : ind <= boundary && (flush(), boundary = ind - 1, implicit = !0), block.push(l);
   }
   flush();
   for (let l of added)

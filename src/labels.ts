@@ -631,7 +631,8 @@ function detectTestsDisabled(path: string, hunk: AttributedHunk['hunk'], lines: 
   const base = posix.basename(path);
 
   // A test file deleted outright (unless the code it tests is deleted or moved in the same diff).
-  if (hunk.status === 'deleted' && isTestFile(path) && !scope.goneSourceStems.has(testStem(base))) {
+  const sourceGone = (scope.goneSourceStems.get(testStem(base)) ?? []).some((dir) => relatedDirs(posix.dirname(path), dir));
+  if (hunk.status === 'deleted' && isTestFile(path) && !sourceGone) {
     hits.push(`Deletes test file ${base}`);
   }
   // A test file renamed so the runner no longer finds it.
@@ -688,14 +689,31 @@ function fullFileView(path: string, lines: DiffLine[], added: Set<DiffLine>, sco
   return { lines: out, added: wideAdded };
 }
 
-/** Stems of non-test source files deleted or renamed away anywhere in the diff. */
-function goneSourceStems(hunks: AttributedHunk[], repoRoot: string): Set<string> {
-  const out = new Set<string>();
+/** Non-test source files deleted or renamed away anywhere in the diff: stem -> their directories. */
+function goneSourceStems(hunks: AttributedHunk[], repoRoot: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
   for (const { hunk } of hunks) {
     const gone = hunk.status === 'deleted' ? toRepoPath(hunk.file, repoRoot) : hunk.status === 'renamed' && hunk.oldFile && hunk.oldFile !== hunk.file ? toRepoPath(hunk.oldFile, repoRoot) : null;
-    if (gone && !isTestFile(gone)) out.add(testStem(posix.basename(gone)));
+    if (!gone || isTestFile(gone)) continue;
+    const stem = testStem(posix.basename(gone));
+    out.set(stem, [...(out.get(stem) ?? []), posix.dirname(gone)]);
   }
   return out;
+}
+
+const TEST_DIR_SEGMENTS = new Set(['test', 'tests', 'spec', 'specs', '__tests__', '__test__']);
+const SOURCE_DIR_SEGMENTS = new Set(['src', 'lib', 'source']);
+
+/**
+ * Is a test in `testDir` plausibly the test of a source file in `srcDir`? Same directory, or the
+ * test tree mirrors the source tree: `test/x.test.js` and `src/x.js`, `__tests__/x.test.js` and
+ * `x.js`, `pkg/test/a/x.test.ts` and `pkg/src/a/x.ts`.
+ */
+function relatedDirs(testDir: string, srcDir: string): boolean {
+  if (testDir === srcDir) return true;
+  const norm = (dir: string): string =>
+    dir.split('/').filter((s) => s && s !== '.' && !TEST_DIR_SEGMENTS.has(s) && !SOURCE_DIR_SEGMENTS.has(s)).join('/');
+  return norm(testDir) === norm(srcDir);
 }
 
 function detectCiSwallowedTests(lines: DiffLine[], added: Set<DiffLine>): string[] {
@@ -715,11 +733,21 @@ function detectCiSwallowedTests(lines: DiffLine[], added: Set<DiffLine>): string
     }
     block = [];
   };
+  // In a block whose start the hunk did not show, a `- key:` item is a new step only when it is
+  // not nested under a key of the current block (`with:`, `strategy: matrix: include:`, a `run: |`
+  // body): the nearest shallower line in the block, if any, must be the `steps:` key itself.
+  const nested = (ind: number): boolean => {
+    for (let i = block.length - 1; i >= 0; i--) {
+      const t = block[i]?.text ?? '';
+      if (indentOf(t) < ind) return !/^\s*steps:\s*$/.test(t);
+    }
+    return false;
+  };
   for (const l of lines) {
     if (l.type === 'del') continue;
     if (!l.text.trim()) continue;
     const ind = indentOf(l.text);
-    if (stepStart.test(l.text) && (block.length === 0 || ind <= boundary || implicit)) {
+    if (stepStart.test(l.text) && (block.length === 0 || ind <= boundary || (implicit && !nested(ind)))) {
       flush();
       boundary = ind;
       implicit = false;
@@ -1471,8 +1499,8 @@ interface ScopeIndex {
   promptText: string;
   /** Distinct repo paths of agent-attributed hunks. */
   agentFiles: string[];
-  /** Stems of source files deleted or renamed away anywhere in the diff. */
-  goneSourceStems: Set<string>;
+  /** Source files deleted or renamed away anywhere in the diff: stem -> directories. */
+  goneSourceStems: Map<string, string[]>;
   /** Directories each prompt points at: dirs of touched files it names by basename/stem, and dirs of path-like tokens in it. */
   promptDirs: Map<string, Set<string>>;
   /** Distinct repo paths of the agent-attributed hunks each prompt produced. */

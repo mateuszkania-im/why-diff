@@ -193,6 +193,35 @@ describe('base and window resolution', () => {
     expect((await commitTimes(repo, { workingTree: true, baseRev: 'HEAD' })).commits).toBe(0);
   });
 
+  it('an a..b range reads the post-image of runner configs from b (git show), not from the disk', async () => {
+    const repo = freshRepo();
+    const config = (exclude: boolean): string => [
+      "import { defineConfig } from 'vitest/config';",
+      'export default defineConfig({',
+      '  test: {',
+      "    environment: 'node',",
+      '    globals: true,',
+      "    include: ['src/**/*.ts'],",
+      "    setupFiles: ['./setup.ts'],",
+      '    retry: 1,',
+      ...(exclude ? ["    exclude: ['**/*.test.ts'],"] : []),
+      "    reporters: ['default'],",
+      '    testTimeout: 5000,',
+      '    hookTimeout: 5000,',
+      '  },',
+      '});',
+      '',
+    ].join('\n');
+    commitFile(repo, 'vitest.config.ts', config(false), 'base');
+    sh(repo, 'checkout', '-q', '-b', 'feat');
+    commitFile(repo, 'vitest.config.ts', config(true), 'exclude tests');
+    sh(repo, 'checkout', '-q', 'main'); // the disk now has the pre-image
+    const report = await buildReport({ cwd: repo, range: 'main..feat', home: repo });
+    const h = report.hunks.find((x) => x.hunk.file === 'vitest.config.ts');
+    expect(h?.hunk.lines.some((l) => l.type === 'ctx' && l.text.includes('test: {'))).toBe(false); // the key is outside the hunk
+    expect(h?.labels.map((l) => l.kind)).toContain('tests-disabled');
+  });
+
   it('listUntracked ignores .why-diff/', async () => {
     const repo = freshRepo();
     commitFile(repo, 'a.txt', 'one\n', 'base');

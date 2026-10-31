@@ -932,6 +932,26 @@ describe('tests-disabled', () => {
     expect(t?.labels.map((l) => l.kind)).not.toContain('tests-disabled');
   });
 
+  it('still flags deleting a test when a same-stem source file in an unrelated directory is deleted', () => {
+    const test = renameHunk('test/index.test.js', '', 'deleted', ['-it("x", () => {})']);
+    const src = renameHunk('x/index.js', '', 'deleted', ['-export const x = 1']);
+    const [t] = labelHunks([test, src], ctx);
+    expect(t?.labels.map((l) => l.kind)).toContain('tests-disabled');
+  });
+
+  it.each([
+    ['__tests__/x.test.js', 'x.js'],
+    ['src/__tests__/x.test.js', 'src/x.js'],
+    ['test/util/x.test.js', 'src/util/x.js'],
+    ['packages/p/test/x.test.ts', 'packages/p/src/x.ts'],
+    ['pkg/x_test.go', 'pkg/x.go'],
+  ])('does not flag deleting %s together with its source %s', (testPath, srcPath) => {
+    const test = renameHunk(testPath, '', 'deleted', ['-it("x", () => {})']);
+    const src = renameHunk(srcPath, '', 'deleted', ['-export const x = 1']);
+    const [t] = labelHunks([test, src], ctx);
+    expect(t?.labels.map((l) => l.kind)).not.toContain('tests-disabled');
+  });
+
   it('still flags deleting a test when an unrelated source file is deleted', () => {
     const test = renameHunk('test/a.test.js', '', 'deleted', ['-it("x", () => {})']);
     const src = renameHunk('src/other.js', '', 'deleted', ['-x']);
@@ -1001,6 +1021,41 @@ describe('tests-disabled with the full post-image (fileText)', () => {
     const text = ['[pytest]', 'testpaths = tests', 'addopts =', '    -q', '    --strict-markers', '    -k "not network"', '    --tb=short', 'markers =', '    slow'].join('\n');
     const h = hunkAt('pytest.ini', 4, ['     -q', '     --strict-markers', '+    -k "not network"', '     --tb=short', ' markers =']);
     expect(kindsWith(h, { 'pytest.ini': text })).toContain('tests-disabled');
+    expect(kinds(h)).not.toContain('tests-disabled');
+  });
+
+  it('a nested `- key:` list inside a step does not start a new step (hunk starts mid-step)', () => {
+    const h = hunkAt('.github/workflows/ci.yml', 6, [
+      '        run: npm test',
+      '        strategy:',
+      '          matrix:',
+      '            include:',
+      '              - os: linux',
+      '              - os: macos',
+      '+        continue-on-error: true',
+    ]);
+    expect(kinds(h)).toContain('tests-disabled');
+  });
+
+  it('a nested `- key:` list under with: does not end the step (whole step in the hunk)', () => {
+    const h = hunkAt('.github/workflows/ci.yml', 4, [
+      '      - name: Test',
+      '        run: npm test',
+      '        with:',
+      '          matrix:',
+      '            - node: 20',
+      '+        continue-on-error: true',
+    ]);
+    expect(kinds(h)).toContain('tests-disabled');
+  });
+
+  it('a real next step after a mid-step hunk start still ends the test step', () => {
+    const h = hunkAt('.github/workflows/ci.yml', 6, [
+      '        run: npm test',
+      '      - name: Upload',
+      '        uses: actions/upload-artifact@v4',
+      '+        continue-on-error: true',
+    ]);
     expect(kinds(h)).not.toContain('tests-disabled');
   });
 
