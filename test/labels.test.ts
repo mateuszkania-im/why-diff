@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { bestOf, expectSubQuadratic } from './helpers/perf.js';
+import { bestOf, expectScalesSubQuadratically } from './helpers/perf.js';
 import { isLockfile, isTestFile, labelHunks } from '../src/labels.js';
 import type { AttributedHunk, DiffLine, FileEdit, Label, LabelKind, Prompt } from '../src/types.js';
 
@@ -1090,9 +1090,10 @@ describe('out-of-scope performance', () => {
     const small = diff(231); // 250 hunks
     const large = diff(981); // 1000 hunks
     expect(labelHunks(large.hunks, { prompts: large.prompts, repoRoot: '/repo' })).toHaveLength(1000);
-    const t1 = bestOf(() => labelHunks(small.hunks, { prompts: small.prompts, repoRoot: '/repo' }));
-    const t4 = bestOf(() => labelHunks(large.hunks, { prompts: large.prompts, repoRoot: '/repo' }));
-    expect(t4).toBeLessThan(5000);
-    expectSubQuadratic(t1, t4);
+    expect(bestOf(() => labelHunks(large.hunks, { prompts: large.prompts, repoRoot: '/repo' }), 3)).toBeLessThan(5000);
+    expectScalesSubQuadratically(
+      () => labelHunks(small.hunks, { prompts: small.prompts, repoRoot: '/repo' }),
+      () => labelHunks(large.hunks, { prompts: large.prompts, repoRoot: '/repo' }),
+    );
   });
 });

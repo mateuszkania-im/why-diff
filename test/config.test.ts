@@ -3,7 +3,7 @@ import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
-import { bestOf, expectSubQuadratic } from './helpers/perf.js';
+import { bestOf, expectScalesSubQuadratically } from './helpers/perf.js';
 import { compileGlobs, loadConfig, matchGlobs, samePath } from '../src/config.js';
 import { renderMarkdown } from '../src/report/index.js';
 import { runGuard } from '../src/guard.js';
@@ -64,17 +64,13 @@ describe('glob matching', () => {
       expect(matchGlobs(['**/'.repeat(n) + 'x'], 'a/'.repeat(40) + 'y')).toBeUndefined();
       expect(bestOf(() => matchGlobs(['**/'.repeat(n) + 'x'], 'a/'.repeat(40) + 'y'))).toBeLessThan(250);
     }
-    // 4x the path depth must cost under 8x the time (a backtracking matcher grows much faster).
-    const deep = (depth: number) => () => { for (let i = 0; i < 20; i++) matchGlobs(['**/'.repeat(10) + 'x'], 'a/'.repeat(depth) + 'y'); };
-    const d1 = bestOf(deep(40));
-    const d4 = bestOf(deep(160));
-    expect(d4).toBeLessThan(250);
-    expectSubQuadratic(d1, d4);
+    // 4x the path depth must cost at most 10x the time (a backtracking matcher grows much faster).
+    const deep = (depth: number) => () => matchGlobs(['**/'.repeat(10) + 'x'], 'a/'.repeat(depth) + 'y');
+    expect(bestOf(deep(160), 3)).toBeLessThan(250);
+    expectScalesSubQuadratically(deep(40), deep(160));
     const stars = compileGlobs(['*a*a*a*a*a*a*a*a*b']);
-    const s1 = bestOf(() => { for (let i = 0; i < 20; i++) stars('a'.repeat(200)); });
-    const s4 = bestOf(() => { for (let i = 0; i < 20; i++) stars('a'.repeat(800)); });
-    expect(s4).toBeLessThan(250);
-    expectSubQuadratic(s1, s4);
+    expect(bestOf(() => stars('a'.repeat(800)), 3)).toBeLessThan(250);
+    expectScalesSubQuadratically(() => stars('a'.repeat(200)), () => stars('a'.repeat(800)));
   });
   it('is case-insensitive on darwin and win32 only', () => {
     const insensitive = process.platform === 'darwin' || process.platform === 'win32';

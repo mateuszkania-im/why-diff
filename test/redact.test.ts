@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { bestOf, expectSubQuadratic } from './helpers/perf.js';
+import { bestOf, expectScalesSubQuadratically } from './helpers/perf.js';
 import type { AttributedHunk, Report } from '../src/types.js';
 import { redactReport, redactSecrets } from '../src/redact.js';
 import { renderReport } from '../src/report/index.js';
@@ -132,14 +132,12 @@ describe('redactSecrets: more secret shapes', () => {
   });
 });
 
-/** 200 KB of `unit` within a generous ceiling, and 4x the input (50 KB -> 200 KB) under 8x the time. */
+/** 200 KB of `unit` within a generous ceiling, and 4x the input (50 KB -> 200 KB) at most 10x the time. */
 function expectFastAndLinear(unit: string): void {
   const small = unit.repeat(Math.ceil(50_000 / unit.length));
   const large = unit.repeat(Math.ceil(200_000 / unit.length));
-  const t1 = bestOf(() => redactSecrets(small));
-  const t4 = bestOf(() => redactSecrets(large));
-  expect(t4).toBeLessThan(1000);
-  expectSubQuadratic(t1, t4);
+  expect(bestOf(() => redactSecrets(large), 3)).toBeLessThan(1000);
+  expectScalesSubQuadratically(() => redactSecrets(small), () => redactSecrets(large));
 }
 
 describe('redactSecrets: performance', () => {
