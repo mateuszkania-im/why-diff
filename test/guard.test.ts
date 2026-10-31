@@ -207,6 +207,41 @@ describe('runGuard', () => {
       }, BL, (repo) => writeFileSync(path.join(repo, 'src', 'tmp.js'), 'export const t = 1;\n'));
       expect(r.block).toBe(false);
     });
+    describe('shell edits of a test file', () => {
+      const skipT5 = (repo: string) => applyEdit(repo, SKIP_OLD, SKIP_NEW);
+      const weaken = (repo: string) => applyEdit(repo, ASSERT_OLD.replace('toBe(2)', 'toBe(2)'), '  expect(f(2)).toBeTruthy();\n');
+      const empty = (repo: string) => writeFileSync(path.join(repo, 'test', 'f.test.js'), '');
+      const forms: Array<[string, string, (repo: string) => void]> = [
+        ['sed -i', `cd $R && sed -i 's/it("t5"/it.skip("t5"/' test/f.test.js`, skipT5],
+        ['sed -i with a glob', `cd $R && sed -i '' -e 's/toBe(2)/toBeTruthy()/' test/*.test.js`, weaken],
+        ['perl -pi', `perl -pi -e 's/toBe\\(2\\)/toBeTruthy()/' $R/test/f.test.js`, weaken],
+        ['a > redirect', 'cd $R && : > test/f.test.js', empty],
+        ['tee', 'cd $R && echo "" | tee test/f.test.js', empty],
+        ['cp /dev/null', 'cp /dev/null $R/test/f.test.js', empty],
+        ['truncate', 'truncate -s 0 $R/test/f.test.js', empty],
+        ['a python heredoc', `cd $R && python3 - <<'EOF'\np = "test/f.test.js"\nopen(p, "w").write(open(p).read().replace("toBe(2)", "toBeTruthy()"))\nEOF`, weaken],
+        ['python -c', `cd $R && python3 -c "open('test/f.test.js','w').write('')"`, empty],
+        ['node -e', `cd $R && node -e "require('fs').writeFileSync('test/f.test.js','')"`, empty],
+      ];
+      for (const [name, cmd, act] of forms) {
+        it(`blocks on ${name}`, async () => {
+          const r = await run(cmd, act);
+          expect(r.block).toBe(true);
+          expect(r.message).toContain('test/f.test.js');
+        });
+      }
+      it('does not credit a human edit in a test file when the session only edited another file through the shell', async () => {
+        const r = await run(`cd $R && sed -i 's/x = 1/x = 3/' src/x.js`, (repo) => {
+          writeFileSync(path.join(repo, 'src', 'x.js'), 'export const x = 3;\n');
+          skipT5(repo);
+        });
+        expect(r.block).toBe(false);
+      });
+      it('does not credit a human edit when the command only reads the test file', async () => {
+        const r = await run('cd $R && cat test/f.test.js > /dev/null && grep -c it test/f.test.js', skipT5);
+        expect(r.block).toBe(false);
+      });
+    });
     it('does not block on a human rm with no transcript edit', async () => {
       const r = await run(null, (repo) => rmSync(path.join(repo, 'test', 'f.test.js')));
       expect(r.block).toBe(false);

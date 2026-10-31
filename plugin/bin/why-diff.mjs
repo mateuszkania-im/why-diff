@@ -9020,17 +9020,17 @@ async function guard(payload, opts) {
     home: opts.home,
     config,
     keepAgentIgnored: !0
-  }), removedByShell = new Set(session.edits.filter((e) => !e.failed && e.kind === "bash" && (e.bashOp === "delete" || e.bashOp === "move")).map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants)).filter((p) => !!p).map((p) => p.split(path11.sep).join("/").replace(/^(\.\/)+/, "").replace(/\/+$/, ""))), shellRemoved = (file) => {
+  }), shellTargets = (ops) => new Set(session.edits.filter((e) => !e.failed && e.kind === "bash" && ops.has(e.bashOp ?? "")).map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants)).filter((p) => !!p).map((p) => p.split(path11.sep).join("/").replace(/^(\.\/)+/, "").replace(/\/+$/, ""))), removedByShell = shellTargets(REMOVE_OPS), rewrittenByShell = shellTargets(REWRITE_OPS), targeted = (targets, file, dirs) => {
     let f = file.replace(/^(\.\/)+/, "");
-    for (let r of removedByShell)
-      if (r && (f === r || f.startsWith(`${r}/`) || SHELL_GLOB.test(r) && globToRegExp(r).test(f)))
+    for (let r of targets)
+      if (r && (f === r || dirs && f.startsWith(`${r}/`) || SHELL_GLOB.test(r) && globToRegExp(r).test(f)))
         return !0;
     return !1;
   }, hits = [], keys = [];
   for (let h of report.hunks) {
     if (h.match !== "exact" && h.match !== "partial") {
-      let source = h.hunk.oldFile ?? h.hunk.file;
-      if (!(h.match === "file-only" && shellOnly(h.hunk) && shellRemoved(source))) continue;
+      let source = h.hunk.oldFile ?? h.hunk.file, removed = h.match === "file-only" && shellOnly(h.hunk) && targeted(removedByShell, source, !0), rewritten = h.match === "file-only" && h.hunk.status !== "renamed" && targeted(rewrittenByShell, h.hunk.file, !1);
+      if (!removed && !rewritten) continue;
     }
     if (!(!h.editIds.length || !h.editIds.every((id) => id.startsWith(`${session.id}:`))))
       for (let l of h.labels)
@@ -9055,7 +9055,7 @@ Before finishing: if you skipped, weakened or removed tests (or changed CI/secre
 `
   } : NO_BLOCK;
 }
-var SHELL_GLOB = /[*?[]/;
+var SHELL_GLOB = /[*?[]/, REMOVE_OPS = /* @__PURE__ */ new Set(["delete", "move"]), REWRITE_OPS = /* @__PURE__ */ new Set(["edit", "write", "append", "copy"]);
 function shellOnly(hunk) {
   return hunk.status === "renamed" ? !hunk.lines.some((l) => l.type === "add" || l.type === "del") : hunk.status === "deleted" ? hunk.newLines === 0 && hunk.oldStart <= 1 && hunk.lines.every((l) => l.type === "del") : !1;
 }

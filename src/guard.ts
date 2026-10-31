@@ -95,17 +95,21 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
     keepAgentIgnored: true,
   });
 
-  // Paths the session's own shell commands removed or moved away (rm, git rm, mv, git mv).
-  const removedByShell = new Set(session.edits
-    .filter((e) => !e.failed && e.kind === 'bash' && (e.bashOp === 'delete' || e.bashOp === 'move'))
+  // Paths the session's own shell commands targeted literally (or by a glob), by kind of operation:
+  // removed or moved away (rm, git rm, mv, git mv), or rewritten in place (sed -i, perl -i, `>`,
+  // tee, cp onto it, truncate, inline python/node scripts that open the path for writing).
+  const shellTargets = (ops: ReadonlySet<string>): Set<string> => new Set(session.edits
+    .filter((e) => !e.failed && e.kind === 'bash' && ops.has(e.bashOp ?? ''))
     .map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants))
     .filter((p): p is string => Boolean(p))
     .map((p) => p.split(path.sep).join('/').replace(/^(\.\/)+/, '').replace(/\/+$/, '')));
-  const shellRemoved = (file: string): boolean => {
+  const removedByShell = shellTargets(REMOVE_OPS);
+  const rewrittenByShell = shellTargets(REWRITE_OPS);
+  const targeted = (targets: Set<string>, file: string, dirs: boolean): boolean => {
     const f = file.replace(/^(\.\/)+/, '');
-    for (const r of removedByShell) {
+    for (const r of targets) {
       if (!r) continue;
-      if (f === r || f.startsWith(`${r}/`)) return true;
+      if (f === r || (dirs && f.startsWith(`${r}/`))) return true;
       if (SHELL_GLOB.test(r) && globToRegExp(r).test(f)) return true;
     }
     return false;
@@ -115,11 +119,15 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   const keys: string[] = [];
   for (const h of report.hunks) {
     if (h.match !== 'exact' && h.match !== 'partial') {
-      // A shell delete/rename leaves a file-only hunk: it counts only when the session's own
-      // command targeted that path AND the hunk is nothing but that operation (a pure rename with
-      // no changed lines, or a whole-file deletion). Line changes on top came from someone else.
+      // A shell command leaves a file-only hunk. It counts only when the session's own command
+      // named that path (literally or by a glob): a delete/rename when the hunk is nothing but that
+      // operation (a pure rename with no changed lines, or a whole-file deletion; line changes on
+      // top came from someone else), an in-place rewrite of the file for any of its hunks.
+      // A file the agent never named in a command is never credited.
       const source = h.hunk.oldFile ?? h.hunk.file;
-      if (!(h.match === 'file-only' && shellOnly(h.hunk) && shellRemoved(source))) continue;
+      const removed = h.match === 'file-only' && shellOnly(h.hunk) && targeted(removedByShell, source, true);
+      const rewritten = h.match === 'file-only' && h.hunk.status !== 'renamed' && targeted(rewrittenByShell, h.hunk.file, false);
+      if (!removed && !rewritten) continue;
     }
     if (!h.editIds.length || !h.editIds.every((id) => id.startsWith(`${session.id}:`))) continue;
     for (const l of h.labels) {
@@ -154,6 +162,8 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
 }
 
 const SHELL_GLOB = /[*?[]/;
+const REMOVE_OPS: ReadonlySet<string> = new Set(['delete', 'move']);
+const REWRITE_OPS: ReadonlySet<string> = new Set(['edit', 'write', 'append', 'copy']);
 
 /** The hunk is exactly a shell rename (no changed lines) or a shell deletion of the whole file. */
 function shellOnly(hunk: Hunk): boolean {
