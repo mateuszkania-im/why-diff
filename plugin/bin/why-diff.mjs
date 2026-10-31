@@ -3607,7 +3607,7 @@ import { posix } from "node:path";
 
 // src/redact.ts
 var SECRET_RULES = [
-  { re: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/, name: "private key" },
+  { re: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/, name: "private key" },
   { re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/, name: "AWS access key" },
   { re: /\bsk-(?:proj-|ant-(?:api\d\d-)?)?[A-Za-z0-9_-]{20,}/, name: "API secret key (sk-)" },
   { re: /\b(?:sk|rk)_live_[0-9a-zA-Z]{20,}/, name: "Stripe live key" },
@@ -3617,7 +3617,7 @@ var SECRET_RULES = [
   { re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/, name: "Slack token" },
   { re: /\bAIza[0-9A-Za-z_-]{35}\b/, name: "Google API key" },
   { re: /\bnpm_[A-Za-z0-9]{36}\b/, name: "npm token" }
-], DOTS = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022", PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/'"`@:]{1,100}:[^\s/'"`]{1,200}@/gi, JWT = /\beyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}/g, AUTH_HEADER = /\b(authorization["']?\s*[:=]\s*["']?(?:Bearer|Basic|Token)\s+)[^\s"']{8,}/gi, BARE_SCHEME = /\b(Bearer|Basic)(\s+)(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/-]{8,}={0,2}/g, BARE_BASIC = /\b(Basic)(\s+)([A-Za-z0-9+/]{12,}={0,2})(?![\w+/=-])/g;
+], DOTS = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022", PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|$)/g, URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/'"`@:]{1,100}:[^\s/'"`]{1,200}@/gi, JWT = /\beyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}/g, AUTH_HEADER = /\b(authorization["']?\s*[:=]\s*["']?(?:Bearer|Basic|Token)\s+)[^\s"']{8,}/gi, BARE_SCHEME = /\b(Bearer|Basic)(\s+)(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/-]{8,}={0,2}/g, BARE_BASIC = /\b(Basic)(\s+)([A-Za-z0-9+/]{12,}={0,2})(?![\w+/=-])/g;
 function basicCredential(b64) {
   let body = b64.replace(/=+$/, "");
   if (body.length % 4 === 1) return !1;
@@ -3626,7 +3626,7 @@ function basicCredential(b64) {
   let text2 = buf.toString("latin1");
   return /^[\x20-\x7e]+$/.test(text2) && /^[^:]+:./.test(text2);
 }
-var NAME_VALUE = /(?<![\w.])((["']?)([A-Za-z_][\w.-]{0,60})\2\s*(:=|=>|===?|!==?|=|:)[ \t]*)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'`,;]+))/g, EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b/g, SECRET_WORDS = /* @__PURE__ */ new Set(["password", "passwd", "pwd", "passphrase", "secret", "token", "credential", "credentials", "apikey"]), SECRET_SUFFIXES = ["password", "passwd", "passphrase", "secret", "token", "apikey", "credential", "credentials"];
+var NAME_VALUE = /(?<![\w.])((["']?)([A-Za-z_][\w.-]{0,60})\2\s*(:=|=>|===?|!==?|=|:)[ \t]*)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'`,;]+))/g, EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b(?![\w.-]*:[\w~/.-])/g, MYSQL_PASSWORD = /\b(mysql(?:dump|admin|import|show|check)?|mariadb(?:-dump)?)\b([^\n|;&]{0,200}?\s)-p(?=[^\s-])([^\s'"`]+)/g, CURL_USER = /\b(curl\b[^\n|;&]{0,300}?\s(?:-u|--user)(?:\s+|=)["']?[^\s:"'`]{1,100}:)([^\s"'`@]{1,200})/g, SECRET_WORDS = /* @__PURE__ */ new Set(["password", "passwd", "pwd", "passphrase", "secret", "token", "credential", "credentials", "apikey"]), SECRET_SUFFIXES = ["password", "passwd", "passphrase", "secret", "token", "apikey", "credential", "credentials"];
 function nameSegments(name) {
   return name.split(/[._-]+/).flatMap((p) => p.split(/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/)).map((x) => x.toLowerCase());
 }
@@ -3646,16 +3646,16 @@ function dottedSecret(segs, v, head, op, text2, at, end) {
 `) + 1);
   return /(?:^|[\s;({])(?:const|let|var|val|def)\s+$/.test(prefix) ? !1 : op === "=" ? !/\s/.test(head) : op === ":" ? /^\s*(?:-\s+)?$/.test(prefix) : !1;
 }
-var ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/, CALL = /^[A-Za-z_$][\w$.]*\(/, MEMBER_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/, CODE_ROOTS = /^(?:process|os|env|config|conf|settings|this|self|ctx|args|params|options|opts|vars|secrets|props|state|req|request)\./i, CODE_WORDS = /* @__PURE__ */ new Set(["new", "null", "undefined", "nil", "none", "true", "false", "this", "self", "await", "async", "function", "return", "require", "string", "number", "boolean", "any", "unknown", "str", "int", "bool", "object", "void", "never", "optional", "required"]);
+var ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/, CALL = /^[A-Za-z_$][\w$.]*\(/, MEMBER_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/, CODE_ROOTS = /^(?:process|os|env|config|conf|settings|this|self|ctx|args|params|options|opts|vars|secrets|props|state|req|request|getpass|keyring|vault)\./i, CODE_WORDS = /* @__PURE__ */ new Set(["new", "null", "undefined", "nil", "none", "true", "false", "this", "self", "await", "async", "function", "return", "require", "string", "number", "boolean", "any", "unknown", "str", "int", "bool", "object", "void", "never", "optional", "required"]);
 function redactKeys(text2) {
   if (!text2) return text2;
   let out = text2.replace(PRIVATE_KEY_BLOCK, "-----PRIVATE KEY REDACTED-----");
-  out = out.replace(URL_CREDENTIALS, (_m, scheme) => `${scheme}${DOTS}@`), out = out.replace(JWT, `eyJ${DOTS}`), out = out.replace(AUTH_HEADER, (_m, head) => `${head}${DOTS}`), out = out.replace(BARE_SCHEME, (_m, scheme, sp) => `${scheme}${sp}${DOTS}`), out = out.replace(BARE_BASIC, (m, scheme, sp, b64) => basicCredential(b64) ? `${scheme}${sp}${DOTS}` : m);
+  out = out.replace(URL_CREDENTIALS, (_m, scheme) => `${scheme}${DOTS}@`), out = out.replace(JWT, `eyJ${DOTS}`), out = out.replace(AUTH_HEADER, (_m, head) => `${head}${DOTS}`), out = out.replace(BARE_SCHEME, (_m, scheme, sp) => `${scheme}${sp}${DOTS}`), out = out.replace(MYSQL_PASSWORD, (_m, prog, mid) => `${prog}${mid}-p${DOTS}`), out = out.replace(CURL_USER, (_m, head) => `${head}${DOTS}`), out = out.replace(BARE_BASIC, (m, scheme, sp, b64) => basicCredential(b64) ? `${scheme}${sp}${DOTS}` : m);
   for (let { re } of SECRET_RULES)
     re.source.includes("PRIVATE KEY") || (out = out.replace(new RegExp(re.source, "g"), (m) => `${m.slice(0, m.startsWith("sk-ant-") ? 7 : 4)}${DOTS}`));
   return out;
 }
-var STRICT_CODE_ROOTS = /^(?:(?:process|config|env|os|self|this|settings|event|req|res|response|body)\.|e\.target\.)/i;
+var STRICT_CODE_ROOTS = /^(?:(?:process|config|env|os|self|this|settings|event|req|res|response|body|getpass|keyring|vault|secrets)\.|e\.target\.)/i;
 function strictDotted(segs, v) {
   return EXACT_SECRET_NAMES.has(segs[segs.length - 1] ?? "") && !/\d/.test(v) && !STRICT_CODE_ROOTS.test(v);
 }
@@ -3664,14 +3664,15 @@ function redactSecrets(text2, mode = "strict") {
   let out = redactKeys(text2);
   return out = out.replace(NAME_VALUE, (m, head, q, name, op, dq, sq, bare, offset, str3) => {
     if (op === "==" || op === "===" || op === "!=" || op === "!==") return m;
-    let segs = nameSegments(name), strong = secretName(segs), quoted = dq ?? sq;
+    let segs = nameSegments(name), strong = secretName(segs) || /^[A-Z][A-Z0-9]*(?:PASSWORD|PASSWD|PASSPHRASE)$/.test(name), quoted = dq ?? sq;
     if (quoted !== void 0) {
       if (quoted === "" || ENV_REF.test(quoted) || !strong && !(secretSuffix(segs) && !/^\d+$/.test(quoted))) return m;
       let quote2 = dq !== void 0 ? '"' : "'";
       return `${head}${quote2}${DOTS}${quote2}`;
     }
-    let v = bare ?? "";
-    if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase())) return m;
+    if (ENV_REF.test(bare ?? "")) return m;
+    let v = (bare ?? "").replace(/[)\]}]+$/, "");
+    if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase()) || mode === "code" && op === ":" && /^[A-Z][a-z]+(?:[A-Z][a-z0-9]*)*$/.test(v)) return m;
     let dotted = MEMBER_PATH.test(v) && (mode === "strict" ? strictDotted(segs, v) : dottedSecret(segs, v, head, op, str3 ?? "", offset ?? 0, (offset ?? 0) + m.length));
     if (MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dotted || !strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
     if (op === ":" && /^[A-Za-z]+(?:\.[A-Za-z]+)*$/.test(v) && !(mode === "strict" && dotted)) {

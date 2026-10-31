@@ -13,7 +13,7 @@ export interface SecretRule {
 
 /** Well-known token formats. Shared with the `secret-like` label. */
 export const SECRET_RULES: readonly SecretRule[] = [
-  { re: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/, name: 'private key' },
+  { re: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/, name: 'private key' },
   { re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/, name: 'AWS access key' },
   { re: /\bsk-(?:proj-|ant-(?:api\d\d-)?)?[A-Za-z0-9_-]{20,}/, name: 'API secret key (sk-)' },
   { re: /\b(?:sk|rk)_live_[0-9a-zA-Z]{20,}/, name: 'Stripe live key' },
@@ -26,7 +26,7 @@ export const SECRET_RULES: readonly SecretRule[] = [
 ];
 
 const DOTS = '••••••••';
-const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g;
+const PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|$)/g;
 /** `scheme://user:password@host`; the password may itself contain `@` (the last `@` before the path wins). */
 const URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/'"`@:]{1,100}:[^\s/'"`]{1,200}@/gi;
 const JWT = /\beyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}/g;
@@ -51,7 +51,12 @@ function basicCredential(b64: string): boolean {
  * whether the value looks like a literal is decided in the callback.
  */
 const NAME_VALUE = /(?<![\w.])((["']?)([A-Za-z_][\w.-]{0,60})\2\s*(:=|=>|===?|!==?|=|:)[ \t]*)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'`,;]+))/g;
-const EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b/g;
+/** An e-mail address; `user@host:path` (an scp-style git remote) is not one. */
+const EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b(?![\w.-]*:[\w~/.-])/g;
+/** `mysql ... -pSECRET`: the password glued to -p (a bare `-p` prompts for it). */
+const MYSQL_PASSWORD = /\b(mysql(?:dump|admin|import|show|check)?|mariadb(?:-dump)?)\b([^\n|;&]{0,200}?\s)-p(?=[^\s-])([^\s'"`]+)/g;
+/** `curl -u user:password` / `--user user:password`. */
+const CURL_USER = /\b(curl\b[^\n|;&]{0,300}?\s(?:-u|--user)(?:\s+|=)["']?[^\s:"'`]{1,100}:)([^\s"'`@]{1,200})/g;
 
 const SECRET_WORDS = new Set(['password', 'passwd', 'pwd', 'passphrase', 'secret', 'token', 'credential', 'credentials', 'apikey']);
 /** Run-together names (DBPASSWORD, MYAPITOKEN): the keyword ends the name. */
@@ -102,7 +107,7 @@ const ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/;
 const CALL = /^[A-Za-z_$][\w$.]*\(/;
 const MEMBER_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/;
 /** Roots of obvious code references (`process.env.X2`), excluded even when they contain a digit. */
-const CODE_ROOTS = /^(?:process|os|env|config|conf|settings|this|self|ctx|args|params|options|opts|vars|secrets|props|state|req|request)\./i;
+const CODE_ROOTS = /^(?:process|os|env|config|conf|settings|this|self|ctx|args|params|options|opts|vars|secrets|props|state|req|request|getpass|keyring|vault)\./i;
 const CODE_WORDS = new Set(['new', 'null', 'undefined', 'nil', 'none', 'true', 'false', 'this', 'self', 'await', 'async', 'function', 'return', 'require', 'string', 'number', 'boolean', 'any', 'unknown', 'str', 'int', 'bool', 'object', 'void', 'never', 'optional', 'required']);
 
 /** Rules precise enough to run on source code: token formats, JWTs, auth headers, URL credentials, private keys. */
@@ -113,6 +118,8 @@ export function redactKeys(text: string): string {
   out = out.replace(JWT, `eyJ${DOTS}`);
   out = out.replace(AUTH_HEADER, (_m, head: string) => `${head}${DOTS}`);
   out = out.replace(BARE_SCHEME, (_m, scheme: string, sp: string) => `${scheme}${sp}${DOTS}`);
+  out = out.replace(MYSQL_PASSWORD, (_m, prog: string, mid: string) => `${prog}${mid}-p${DOTS}`);
+  out = out.replace(CURL_USER, (_m, head: string) => `${head}${DOTS}`);
   out = out.replace(BARE_BASIC, (m, scheme: string, sp: string, b64: string) => (basicCredential(b64) ? `${scheme}${sp}${DOTS}` : m));
   for (const { re } of SECRET_RULES) {
     if (re.source.includes('PRIVATE KEY')) continue;
@@ -131,7 +138,7 @@ export function redactKeys(text: string): string {
 export type RedactMode = 'strict' | 'code';
 
 /** Code roots that keep a dotted value in strict mode (`password = body.pass` names a field, not a secret). */
-const STRICT_CODE_ROOTS = /^(?:(?:process|config|env|os|self|this|settings|event|req|res|response|body)\.|e\.target\.)/i;
+const STRICT_CODE_ROOTS = /^(?:(?:process|config|env|os|self|this|settings|event|req|res|response|body|getpass|keyring|vault|secrets)\.|e\.target\.)/i;
 
 function strictDotted(segs: string[], v: string): boolean {
   return EXACT_SECRET_NAMES.has(segs[segs.length - 1] ?? '') && !/\d/.test(v) && !STRICT_CODE_ROOTS.test(v);
@@ -144,7 +151,7 @@ export function redactSecrets(text: string, mode: RedactMode = 'strict'): string
   out = out.replace(NAME_VALUE, (m: string, head: string, q: string, name: string, op: string, dq?: string, sq?: string, bare?: string, offset?: number, str?: string) => {
     if (op === '==' || op === '===' || op === '!=' || op === '!==') return m;
     const segs = nameSegments(name);
-    const strong = secretName(segs);
+    const strong = secretName(segs) || /^[A-Z][A-Z0-9]*(?:PASSWORD|PASSWD|PASSPHRASE)$/.test(name);
     const quoted = dq ?? sq;
     if (quoted !== undefined) {
       if (quoted === '' || ENV_REF.test(quoted)) return m;
@@ -152,8 +159,12 @@ export function redactSecrets(text: string, mode: RedactMode = 'strict'): string
       const quote = dq !== undefined ? '"' : "'";
       return `${head}${quote}${DOTS}${quote}`;
     }
-    const v = bare ?? '';
+    // Closing brackets after the value belong to the code around it (`f(password=getpass.getpass)`).
+    if (ENV_REF.test(bare ?? '')) return m;
+    const v = (bare ?? '').replace(/[)\]}]+$/, '');
     if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase())) return m;
+    // Code: `token: Token;`, `secret: SecretBox | null`: a PascalCase value after `:` is a type.
+    if (mode === 'code' && op === ':' && /^[A-Z][a-z]+(?:[A-Z][a-z0-9]*)*$/.test(v)) return m;
     const dotted = MEMBER_PATH.test(v) && (mode === 'strict'
       ? strictDotted(segs, v)
       : dottedSecret(segs, v, head, op, str ?? '', offset ?? 0, (offset ?? 0) + m.length));

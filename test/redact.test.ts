@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { bestOf, expectScalesSubQuadratically } from './helpers/perf.js';
 import type { AttributedHunk, Report } from '../src/types.js';
-import { redactReport, redactSecrets } from '../src/redact.js';
+import { redactKeys, redactReport, redactSecrets, SECRET_RULES } from '../src/redact.js';
 import { renderReport } from '../src/report/index.js';
 import { buildClassificationPrompt } from '../src/classify/prompt.js';
 
@@ -291,5 +291,56 @@ describe('redactSecrets: residuals (0.2.1)', () => {
     'Basic HelloWorldExample',
   ])('keeps prose: %s', (t) => {
     expect(redactSecrets(t)).toBe(t);
+  });
+});
+
+describe('redactSecrets: audit 2', () => {
+  it.each(['strict', 'code'] as const)('keeps module.function references after a secret name (%s)', (mode) => {
+    for (const t of ['db.connect(user="x", password=getpass.getpass)', 'password = getpass.getpass()', 'token=keyring.get_password', 'secret = vault.read', 'password=secrets.token_hex', 'password=os.environ']) {
+      expect(redactSecrets(t, mode), t).toBe(t);
+    }
+  });
+
+  it('keeps type annotations in code mode', () => {
+    for (const t of ['interface Auth {\n  token: Token;\n  password: Password;\n  secret: Buffer;\n}', 'def login(password: str) -> None:', 'class A:\n    password: str\n', 'type T = { token: AccessToken, secret: SecretBox | null }']) {
+      expect(redactSecrets(t, 'code'), t).toBe(t);
+    }
+  });
+
+  it('does not treat an scp-style git remote as an e-mail address, but still masks e-mail addresses', () => {
+    expect(redactSecrets('git clone git@github.com:acme/repo.git')).toBe('git clone git@github.com:acme/repo.git');
+    expect(redactSecrets('deploy to deploy@web1.example.com:/var/www')).toBe('deploy to deploy@web1.example.com:/var/www');
+    expect(redactSecrets('Contact ops@acme.com: thanks')).toBe('Contact [email redacted]: thanks');
+  });
+
+  it('masks a PGP private key block and labels it', () => {
+    const block = '-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBFsecretmaterial\n-----END PGP PRIVATE KEY BLOCK-----';
+    for (const mode of ['strict', 'code'] as const) expect(redactSecrets(block, mode)).not.toContain('lQOYBF');
+    expect(redactKeys(block)).not.toContain('lQOYBF');
+    expect(SECRET_RULES.some((r) => r.re.test('-----BEGIN PGP PRIVATE KEY BLOCK-----'))).toBe(true);
+  });
+
+  it.each(['strict', 'code'] as const)('masks credentials on mysql, curl and PGPASSWORD command lines (%s)', (mode) => {
+    expect(redactSecrets('mysql -u root -phunter2 db', mode)).not.toContain('hunter2');
+    expect(redactSecrets('mysqldump -h db -u root -pS3cr3t app', mode)).not.toContain('S3cr3t');
+    expect(redactSecrets('curl -u admin:S3cretPass https://x', mode)).not.toContain('S3cretPass');
+    expect(redactSecrets('curl --user admin:S3cretPass https://x', mode)).toContain('admin:');
+    expect(redactSecrets('curl --user admin:S3cretPass https://x', mode)).not.toContain('S3cretPass');
+    expect(redactSecrets('PGPASSWORD=x psql -h db', mode)).not.toMatch(/PGPASSWORD=x\b/);
+    expect(redactSecrets('export PGPASSWORD=hunter', mode)).not.toContain('hunter');
+  });
+
+  it('leaves look-alike command lines alone', () => {
+    for (const t of ['docker run -u 1000:1000 app', 'git push -u origin main', 'mysql -p db', 'ssh -p 2222 host', 'grep -pattern file']) {
+      expect(redactSecrets(t), t).toBe(t);
+      expect(redactSecrets(t, 'code'), t).toBe(t);
+    }
+  });
+
+  it.each(['mysql -phunter2 ', 'curl -u a:b ', 'git@github.com:', 'password=getpass.getpass ', 'token: Token;\n', 'PGPASSWORD=x ', 'curl '])('200 KB of %j is fast and scales sub-quadratically', (unit) => {
+    expectFastAndLinear(unit);
+    const small = unit.repeat(Math.ceil(50_000 / unit.length));
+    const large = unit.repeat(Math.ceil(200_000 / unit.length));
+    expectScalesSubQuadratically(() => redactSecrets(small, 'code'), () => redactSecrets(large, 'code'));
   });
 });

@@ -1149,3 +1149,10 @@ describe('prompt text performance (pasted blobs)', () => {
     expect(labelsOf(h, [prompt('please fix src/cart/total.ts')]).map((l) => l.kind)).not.toContain('out-of-scope');
   });
 });
+
+describe('secret-like: PGP private key blocks', () => {
+  it('flags an added PGP private key block', () => {
+    const h = hunk('keys/deploy.asc', ['+-----BEGIN PGP PRIVATE KEY BLOCK-----', '+lQOYBFsecret', '+-----END PGP PRIVATE KEY BLOCK-----']);
+    expect(kinds(h)).toContain('secret-like');
+  });
+});
