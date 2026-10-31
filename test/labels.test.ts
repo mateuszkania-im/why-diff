@@ -1011,3 +1011,26 @@ describe('tests-disabled with the full post-image (fileText)', () => {
   });
 });
 
+
+describe('out-of-scope performance', () => {
+  it('labels a 1000-file, 20-prompt diff in under a second', () => {
+    const prompts: Prompt[] = [];
+    const hunks: AttributedHunk[] = [];
+    // 20 prompts: one wanders over 981 files, the other 19 touch one file each
+    for (let p = 0; p < 20; p++) {
+      const id = `s1:${p}`;
+      prompts.push({ id, sessionId: 's1', harness: 'claude-code', index: p, at: '2026-10-31T09:59:00Z', text: `work on module${p} in the repository` });
+      for (let f = 0; f < (p === 0 ? 981 : 1); f++) {
+        const h = hunk(`pkg${p}/dir${f}/file${f}.ts`, ['+export const x = 1;']);
+        h.prompt = prompts[p];
+        h.edits = [{ ...h.edits[0]!, promptId: id }];
+        hunks.push(h);
+      }
+    }
+    const t0 = performance.now();
+    const out = labelHunks(hunks, { prompts, repoRoot: '/repo' });
+    const ms = performance.now() - t0;
+    expect(out).toHaveLength(1000);
+    expect(ms).toBeLessThan(1000);
+  });
+});

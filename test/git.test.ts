@@ -238,6 +238,32 @@ describe('base and window resolution', () => {
     await expect(buildReport({ cwd: clone, home: parent })).rejects.toThrow('fetch-depth: 0');
   });
 
+  it('shallow detached checkout with an explicit --base gives the fetch-depth hint, not "ref not found"', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'base');
+    sh(repo, 'checkout', '-q', '-b', 'feat');
+    commitFile(repo, 'a.txt', 'one\ntwo\n', 'two');
+    const parent = tempDir('why-diff-shallow-');
+    dirs.push(parent);
+    const clone = path.join(parent, 'clone');
+    execFileSync('git', ['clone', '-q', '--depth', '1', '--branch', 'feat', `file://${repo}`, clone], { env: ENV });
+    sh(clone, 'checkout', '-q', '--detach');
+    const err = await buildReport({ cwd: clone, base: 'main', home: parent }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain('fetch-depth: 0');
+    expect((err as Error).message).not.toContain('pass --base');
+    expect((err as Error).message).not.toContain('ref not found');
+  });
+
+  it('--base equal to the current branch falls back to the working tree instead of throwing', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'base');
+    put(repo, 'a.txt', 'one\nchanged\n');
+    const report = await buildReport({ cwd: repo, base: 'main', home: repo });
+    expect(report.range).toBe('working tree');
+    expect(report.hunks).toHaveLength(1);
+  });
+
   it('lists other worktrees but not the current root', async () => {
     const repo = freshRepo();
     commitFile(repo, 'a.txt', 'one\n', 'base');

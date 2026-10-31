@@ -233,7 +233,7 @@ export async function isShallow(cwd: string): Promise<boolean> {
   }
 }
 
-export const SHALLOW_HINT = 'this is a shallow clone; fetch full history (actions/checkout: fetch-depth: 0) or pass --base';
+export const SHALLOW_HINT = 'this is a shallow clone; fetch full history (actions/checkout: fetch-depth: 0)';
 
 /**
  * Build a `git diff`-shaped "new file" section for an untracked file. Returns

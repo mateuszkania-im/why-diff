@@ -1477,6 +1477,8 @@ interface ScopeIndex {
   promptDirs: Map<string, Set<string>>;
   /** Distinct repo paths of the agent-attributed hunks each prompt produced. */
   promptFiles: Map<string, string[]>;
+  /** Per prompt, the subset of its files that it anchors (computed once per prompt, on first use). */
+  anchoredFiles: Map<string, Set<string>>;
   /** Lower-cased text of each prompt, by id. */
   promptTexts: Map<string, string>;
   fileText?: LabelContext['fileText'];
@@ -1516,6 +1518,7 @@ function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex
   return {
     promptDirs,
     promptFiles,
+    anchoredFiles: new Map(),
     promptTexts: new Map(ctx.prompts.map((p) => [p.id, p.text.toLowerCase()])),
     promptText: ctx.prompts.map((p) => p.text).join('\n').toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
@@ -1593,6 +1596,15 @@ function anchoredBy(path: string, id: string, scope: ScopeIndex): boolean {
   return false;
 }
 
+function anchoredFilesOf(id: string, scope: ScopeIndex): Set<string> {
+  let set = scope.anchoredFiles.get(id);
+  if (!set) {
+    set = new Set((scope.promptFiles.get(id) ?? []).filter((f) => anchoredBy(f, id, scope)));
+    scope.anchoredFiles.set(id, set);
+  }
+  return set;
+}
+
 function outOfScopeReason(path: string, scope: ScopeIndex, ids: string[]): string | null {
   if (!scope.promptText || isLockfile(path) || isSnapshotFile(path)) return null;
   const dir = posix.dirname(path);
@@ -1602,7 +1614,7 @@ function outOfScopeReason(path: string, scope: ScopeIndex, ids: string[]): strin
   if (scope.agentFiles.every((f) => f === path)) return null;
   const others = uniq(ids.flatMap((id) => scope.promptFiles.get(id) ?? [])).filter((f) => f !== path);
   // A prompt that names some touched file is anchored: only anchored files vouch for their neighbours.
-  const anchored = others.filter((f) => ids.some((id) => (scope.promptFiles.get(id) ?? []).includes(f) && anchoredBy(f, id, scope)));
+  const anchored = others.filter((f) => ids.some((id) => anchoredFilesOf(id, scope).has(f)));
   const pool = anchored.length > 0 ? anchored : others;
   if (pool.length > 0) {
     const near = pool.filter((f) => related(posix.dirname(f), dir)).length;

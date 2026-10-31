@@ -94,8 +94,11 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
     rangeLabel = opts.range;
   } else {
     const resolved = await resolveDefaultTarget(root, process.env, opts.base);
-    if (opts.base && !resolved.base) throw new Error(`cannot compare against --base ${opts.base}: ref not found or no commits beyond it`);
-    if (!resolved.base && !resolved.onBase && (await isShallow(root))) throw new Error(SHALLOW_HINT);
+    if (!resolved.base && !resolved.onBase) {
+      // Shallow first: in a depth-1 checkout the base ref is merely missing, and fetching history is the fix.
+      if (await isShallow(root)) throw new Error(SHALLOW_HINT);
+      if (opts.base) throw new Error(`cannot compare against --base ${opts.base}: ref not found or no commits beyond it`);
+    }
     target = resolved.target;
     rangeLabel = resolved.label;
   }
