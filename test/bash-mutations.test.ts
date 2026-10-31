@@ -43,6 +43,17 @@ describe('detectBashMutations', () => {
     expect(paths(`git status && git diff`)).toEqual([]);
   });
 
+  it('handles mv/cp target-directory forms, git mv -k, rm -- and globs', () => {
+    expect(paths(`mv -t old test/a.test.js`)).toEqual([`move:${abs('test/a.test.js')}`, `write:${abs('old/a.test.js')}`]);
+    expect(paths(`mv --target-directory=old a.js b.js`)).toEqual([`move:${abs('a.js')}`, `write:${abs('old/a.js')}`, `move:${abs('b.js')}`, `write:${abs('old/b.js')}`]);
+    expect(paths(`mv test/a.js -t old`)).toEqual([`move:${abs('test/a.js')}`, `write:${abs('old/a.js')}`]);
+    expect(paths(`cp -t out src/a.js`)).toEqual([`copy:${abs('out/a.js')}`]);
+    expect(paths(`git mv -k test/a.test.js test/b.test.js`)).toEqual([`move:${abs('test/a.test.js')}`, `write:${abs('test/b.test.js')}`]);
+    expect(paths(`rm -- -weird.js`)).toEqual([`delete:${abs('-weird.js')}`]);
+    expect(paths(`rm test/*.test.js`)).toEqual([`delete:${abs('test/*.test.js')}`]);
+    expect(paths(`rm -f tests/**/*.spec.ts`)).toEqual([`delete:${abs('tests/**/*.spec.ts')}`]);
+  });
+
   it('maps package manager commands to manifest and lockfile', () => {
     expect(paths(`npm install picocolors`)).toEqual([`install:${abs('package.json')}`, `install:${abs('package-lock.json')}`]);
     expect(paths(`npm ci`)).toEqual([`install:${abs('package-lock.json')}`]);

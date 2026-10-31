@@ -7,15 +7,15 @@
  * hunks that the session's edits exactly explain can block. A human's uncommitted change in the
  * same file never does. Every internal error means "do not block".
  */
-import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
 import { git, hasHead, repoRoot, worktreeRoots } from './git.js';
-import { repoRelativePath, rootVariants } from './attribute.js';
+import { globToRegExp, repoRelativePath, rootVariants } from './attribute.js';
 import { loadConfig, type WhyDiffConfig } from './config.js';
-import type { LabelKind } from './types.js';
+import type { Hunk, LabelKind } from './types.js';
 
 export const DEFAULT_BLOCK_ON: readonly LabelKind[] = ['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path'];
 
@@ -59,11 +59,17 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   const session = await claudeCodeAdapter.parse(payload.transcript_path);
   const roots = [root, ...(await worktreeRoots(root))].flatMap(rootVariants).sort((a, b) => b.length - a.length);
   const cwdVariants = rootVariants(session.cwd);
+  // Shell commands can name globs (`rm test/*.test.js`): those become `:(glob)` pathspecs,
+  // whose `*`/`?` stay within a segment and `**` spans segments, like the shell.
   const paths = [...new Set(session.edits
     .filter((e) => !e.failed)
-    .map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants))
-    .filter((p): p is string => Boolean(p)))]
-    .map((p) => `:(literal)${p.split(path.sep).join('/')}`);
+    .map((e) => {
+      const rel = repoRelativePath(e.filePath, roots, session.cwd, cwdVariants);
+      if (!rel) return null;
+      const p = rel.split(path.sep).join('/');
+      return e.kind === 'bash' && SHELL_GLOB.test(p) ? `:(glob)${p}` : `:(literal)${p}`;
+    })
+    .filter((p): p is string => Boolean(p)))];
   if (!paths.length) return NO_BLOCK;
 
   let baseRev = 'HEAD';
@@ -97,7 +103,11 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
     .map((p) => p.split(path.sep).join('/').replace(/^(\.\/)+/, '').replace(/\/+$/, '')));
   const shellRemoved = (file: string): boolean => {
     const f = file.replace(/^(\.\/)+/, '');
-    for (const r of removedByShell) if (r && (f === r || f.startsWith(`${r}/`))) return true;
+    for (const r of removedByShell) {
+      if (!r) continue;
+      if (f === r || f.startsWith(`${r}/`)) return true;
+      if (SHELL_GLOB.test(r) && globToRegExp(r).test(f)) return true;
+    }
     return false;
   };
 
@@ -105,11 +115,11 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   const keys: string[] = [];
   for (const h of report.hunks) {
     if (h.match !== 'exact' && h.match !== 'partial') {
-      // A shell delete/rename leaves a file-only hunk with no added lines: it counts only when
-      // the session's own command explicitly targeted that path.
-      const gone = h.hunk.status === 'deleted' || h.hunk.status === 'renamed';
+      // A shell delete/rename leaves a file-only hunk: it counts only when the session's own
+      // command targeted that path AND the hunk is nothing but that operation (a pure rename with
+      // no changed lines, or a whole-file deletion). Line changes on top came from someone else.
       const source = h.hunk.oldFile ?? h.hunk.file;
-      if (!(h.match === 'file-only' && gone && !h.hunk.lines.some((l) => l.type === 'add') && shellRemoved(source))) continue;
+      if (!(h.match === 'file-only' && shellOnly(h.hunk) && shellRemoved(source))) continue;
     }
     if (!h.editIds.length || !h.editIds.every((id) => id.startsWith(`${session.id}:`))) continue;
     for (const l of h.labels) {
@@ -125,15 +135,9 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   const hash = createHash('sha256').update(keys.sort().join('\n')).digest('hex');
   // State only dedupes repeat blocks: any failure here must never change the decision below.
   try {
-    const state = await readState(stateFile);
-    const prev = state[sessionKey];
+    const prev = (await readState(stateFile))[sessionKey];
     if (prev?.hash === hash) return { block: false, hits };
-    if (hits.length || prev) {
-      state[sessionKey] = { hash, at: new Date().toISOString() };
-      const cutoff = Date.now() - STATE_TTL_MS;
-      for (const [k, v] of Object.entries(state)) if (!(Date.parse(v.at) >= cutoff)) delete state[k];
-      await writeState(stateDir, stateFile, state);
-    }
+    if (hits.length || prev) await recordState(stateDir, stateFile, sessionKey, { hash, at: new Date().toISOString() });
   } catch {
     // fall through with the computed decision
   }
@@ -147,6 +151,15 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
       'Before finishing: if you skipped, weakened or removed tests (or changed CI/secrets), either revert that change ' +
       'or tell the user explicitly what you changed and why, so they can decide. Do not hide it.\n',
   };
+}
+
+const SHELL_GLOB = /[*?[]/;
+
+/** The hunk is exactly a shell rename (no changed lines) or a shell deletion of the whole file. */
+function shellOnly(hunk: Hunk): boolean {
+  if (hunk.status === 'renamed') return !hunk.lines.some((l) => l.type === 'add' || l.type === 'del');
+  if (hunk.status === 'deleted') return hunk.newLines === 0 && hunk.oldStart <= 1 && hunk.lines.every((l) => l.type === 'del');
+  return false;
 }
 
 type GuardState = Record<string, { hash: string; at: string }>;
@@ -167,13 +180,33 @@ async function readState(file: string): Promise<GuardState> {
   }
 }
 
-async function writeState(dir: string, file: string, state: GuardState): Promise<void> {
+/**
+ * Store one session's entry. Other guards (parallel sessions) may write the same file, so the
+ * entry is merged into the latest on-disk state right before an atomic temp-file + rename write,
+ * and the write is retried a few times if a concurrent writer replaced our entry.
+ */
+async function recordState(dir: string, file: string, key: string, entry: { hash: string; at: string }): Promise<void> {
   try {
     await mkdir(dir, { recursive: true });
     if (path.basename(dir) === '.why-diff') {
       await writeFile(path.join(dir, '.gitignore'), '*\n', { flag: 'wx' }).catch(() => {});
     }
-    await writeFile(file, JSON.stringify(state));
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const state = await readState(file);
+      state[key] = entry;
+      const cutoff = Date.now() - STATE_TTL_MS;
+      for (const [k, v] of Object.entries(state)) if (!(Date.parse(v.at) >= cutoff)) delete state[k];
+      const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+      try {
+        await writeFile(tmp, JSON.stringify(state));
+        await rename(tmp, file);
+      } finally {
+        await rm(tmp, { force: true }).catch(() => {});
+      }
+      const now = (await readState(file))[key];
+      if (now?.hash === entry.hash && now.at === entry.at) return;
+      await new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 20)));
+    }
   } catch {
     // state is best effort; a failed write only means a possible repeat block
   }

@@ -4754,18 +4754,12 @@ function detectBashMutations(command, cwd) {
         break;
       }
       case "mv": {
-        let files = positional(args, /* @__PURE__ */ new Set(["-t", "--target-directory"]));
-        if (files.length < 2) break;
-        let dest = files[files.length - 1] ?? "";
-        for (let src of files.slice(0, -1))
-          push(src, "move"), push(destinationFor(src, dest, files.length > 2), "write");
+        for (let { src, dest } of moveTargets(args))
+          push(src, "move"), push(dest, "write");
         break;
       }
       case "cp": {
-        let files = positional(args, /* @__PURE__ */ new Set(["-t", "--target-directory"]));
-        if (files.length < 2) break;
-        let dest = files[files.length - 1] ?? "";
-        for (let src of files.slice(0, -1)) push(destinationFor(src, dest, files.length > 2), "copy");
+        for (let { dest } of moveTargets(args)) push(dest, "copy");
         break;
       }
       case "rm":
@@ -4904,6 +4898,33 @@ function perlFiles(args) {
     files.push(a);
   }
   return files;
+}
+function moveTargets(args) {
+  let targetDir, rest = [], endOfOptions = !1;
+  for (let i = 0; i < args.length; i++) {
+    let a = args[i] ?? "";
+    if (!endOfOptions && (a === "-t" || a === "--target-directory")) {
+      targetDir = args[++i];
+      continue;
+    }
+    if (!endOfOptions && a.startsWith("--target-directory=")) {
+      targetDir = a.slice(19);
+      continue;
+    }
+    if (!endOfOptions && /^-[A-Za-z]*t$/.test(a) && a.length > 2) {
+      targetDir = args[++i];
+      continue;
+    }
+    a === "--" && (endOfOptions = !0), rest.push(a);
+  }
+  let files = positional(rest);
+  if (targetDir !== void 0) {
+    let dir = targetDir;
+    return files.map((src) => ({ src, dest: path4.posix.join(dir, path4.posix.basename(src)) }));
+  }
+  if (files.length < 2) return [];
+  let dest = files[files.length - 1] ?? "";
+  return files.slice(0, -1).map((src) => ({ src, dest: destinationFor(src, dest, files.length > 2) }));
 }
 function destinationFor(src, dest, multiple) {
   return multiple || dest.endsWith("/") || dest === "." || dest === ".." ? path4.posix.join(dest, path4.posix.basename(src)) : dest;
@@ -8829,8 +8850,8 @@ function renderReport(report, format, opts = {}) {
 }
 
 // src/guard.ts
-import { createHash as createHash2 } from "node:crypto";
-import { mkdir as mkdir2, readFile as readFile7, writeFile as writeFile2 } from "node:fs/promises";
+import { createHash as createHash2, randomBytes } from "node:crypto";
+import { mkdir as mkdir2, readFile as readFile7, rename as rename2, rm, writeFile as writeFile2 } from "node:fs/promises";
 import path11 from "node:path";
 var DEFAULT_BLOCK_ON = ["test-skip-added", "tests-disabled", "assertion-removed", "secret-like", "ci-changed", "protected-path"], NO_BLOCK = { block: !1, hits: [] };
 async function runGuard(payload, opts) {
@@ -8842,7 +8863,12 @@ async function runGuard(payload, opts) {
 }
 async function guard(payload, opts) {
   if (payload.stop_hook_active || !payload.transcript_path) return NO_BLOCK;
-  let root = await repoRoot(payload.cwd ?? process.cwd()), session = await claudeCodeAdapter.parse(payload.transcript_path), roots = [root, ...await worktreeRoots(root)].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdVariants = rootVariants(session.cwd), paths = [...new Set(session.edits.filter((e) => !e.failed).map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants)).filter((p) => !!p))].map((p) => `:(literal)${p.split(path11.sep).join("/")}`);
+  let root = await repoRoot(payload.cwd ?? process.cwd()), session = await claudeCodeAdapter.parse(payload.transcript_path), roots = [root, ...await worktreeRoots(root)].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdVariants = rootVariants(session.cwd), paths = [...new Set(session.edits.filter((e) => !e.failed).map((e) => {
+    let rel = repoRelativePath(e.filePath, roots, session.cwd, cwdVariants);
+    if (!rel) return null;
+    let p = rel.split(path11.sep).join("/");
+    return e.kind === "bash" && SHELL_GLOB.test(p) ? `:(glob)${p}` : `:(literal)${p}`;
+  }).filter((p) => !!p))];
   if (!paths.length) return NO_BLOCK;
   let baseRev = "HEAD";
   if (await hasHead(root)) {
@@ -8861,13 +8887,15 @@ async function guard(payload, opts) {
     keepAgentIgnored: !0
   }), removedByShell = new Set(session.edits.filter((e) => !e.failed && e.kind === "bash" && (e.bashOp === "delete" || e.bashOp === "move")).map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants)).filter((p) => !!p).map((p) => p.split(path11.sep).join("/").replace(/^(\.\/)+/, "").replace(/\/+$/, ""))), shellRemoved = (file) => {
     let f = file.replace(/^(\.\/)+/, "");
-    for (let r of removedByShell) if (r && (f === r || f.startsWith(`${r}/`))) return !0;
+    for (let r of removedByShell)
+      if (r && (f === r || f.startsWith(`${r}/`) || SHELL_GLOB.test(r) && globToRegExp(r).test(f)))
+        return !0;
     return !1;
   }, hits = [], keys = [];
   for (let h of report.hunks) {
     if (h.match !== "exact" && h.match !== "partial") {
-      let gone = h.hunk.status === "deleted" || h.hunk.status === "renamed", source = h.hunk.oldFile ?? h.hunk.file;
-      if (!(h.match === "file-only" && gone && !h.hunk.lines.some((l) => l.type === "add") && shellRemoved(source))) continue;
+      let source = h.hunk.oldFile ?? h.hunk.file;
+      if (!(h.match === "file-only" && shellOnly(h.hunk) && shellRemoved(source))) continue;
     }
     if (!(!h.editIds.length || !h.editIds.every((id) => id.startsWith(`${session.id}:`))))
       for (let l of h.labels)
@@ -8876,14 +8904,9 @@ async function guard(payload, opts) {
   let stateDir = opts.stateDir ?? path11.join(root, ".why-diff"), stateFile = path11.join(stateDir, "guard-state.json"), sessionKey = payload.session_id ?? session.id, hash = createHash2("sha256").update(keys.sort().join(`
 `)).digest("hex");
   try {
-    let state = await readState(stateFile), prev = state[sessionKey];
+    let prev = (await readState(stateFile))[sessionKey];
     if (prev?.hash === hash) return { block: !1, hits };
-    if (hits.length || prev) {
-      state[sessionKey] = { hash, at: (/* @__PURE__ */ new Date()).toISOString() };
-      let cutoff = Date.now() - STATE_TTL_MS;
-      for (let [k, v] of Object.entries(state)) Date.parse(v.at) >= cutoff || delete state[k];
-      await writeState(stateDir, stateFile, state);
-    }
+    (hits.length || prev) && await recordState(stateDir, stateFile, sessionKey, { hash, at: (/* @__PURE__ */ new Date()).toISOString() });
   } catch {
   }
   return hits.length ? {
@@ -8896,6 +8919,10 @@ ${hits.join(`
 Before finishing: if you skipped, weakened or removed tests (or changed CI/secrets), either revert that change or tell the user explicitly what you changed and why, so they can decide. Do not hide it.
 `
   } : NO_BLOCK;
+}
+var SHELL_GLOB = /[*?[]/;
+function shellOnly(hunk) {
+  return hunk.status === "renamed" ? !hunk.lines.some((l) => l.type === "add" || l.type === "del") : hunk.status === "deleted" ? hunk.newLines === 0 && hunk.oldStart <= 1 && hunk.lines.every((l) => l.type === "del") : !1;
 }
 var STATE_TTL_MS = 30 * 864e5;
 async function readState(file) {
@@ -8912,11 +8939,27 @@ async function readState(file) {
     return {};
   }
 }
-async function writeState(dir, file, state) {
+async function recordState(dir, file, key, entry) {
   try {
     await mkdir2(dir, { recursive: !0 }), path11.basename(dir) === ".why-diff" && await writeFile2(path11.join(dir, ".gitignore"), `*
 `, { flag: "wx" }).catch(() => {
-    }), await writeFile2(file, JSON.stringify(state));
+    });
+    for (let attempt = 0; attempt < 5; attempt++) {
+      let state = await readState(file);
+      state[key] = entry;
+      let cutoff = Date.now() - STATE_TTL_MS;
+      for (let [k, v] of Object.entries(state)) Date.parse(v.at) >= cutoff || delete state[k];
+      let tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+      try {
+        await writeFile2(tmp, JSON.stringify(state)), await rename2(tmp, file);
+      } finally {
+        await rm(tmp, { force: !0 }).catch(() => {
+        });
+      }
+      let now = (await readState(file))[key];
+      if (now?.hash === entry.hash && now.at === entry.at) return;
+      await new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 20)));
+    }
   } catch {
   }
 }

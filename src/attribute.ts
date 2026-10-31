@@ -778,7 +778,8 @@ function bashPathMatches(editRel: string, file: string): boolean {
 
 const globCache = new Map<string, RegExp>();
 
-function globToRegExp(glob: string): RegExp {
+/** Shell glob to an anchored RegExp: `*` and `?` stay within one path segment, `**` spans segments. */
+export function globToRegExp(glob: string): RegExp {
   const cached = globCache.get(glob);
   if (cached) return cached;
   let re = '';

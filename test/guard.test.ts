@@ -116,10 +116,11 @@ describe('runGuard', () => {
 
   describe('shell deletes and renames of tests', () => {
     const BL = new Set<LabelKind>(['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path']);
-    async function run(cmd: string | null, act: (repo: string) => void, blocking = BL): Promise<{ block: boolean; message?: string }> {
+    async function run(cmd: string | null, act: (repo: string) => void, blocking = BL, seed?: (repo: string) => void): Promise<{ block: boolean; message?: string }> {
       const { repo, home, stateDir } = makeRepo();
       mkdirSync(path.join(repo, 'src'), { recursive: true });
       writeFileSync(path.join(repo, 'src', 'x.js'), 'export const x = 1;\n');
+      seed?.(repo);
       sh(repo, ['add', '-A']);
       sh(repo, ['commit', '-qm', 'more'], LONG_AGO);
       const calls: SyntheticCall[] = [{ tool: 'Edit', at: CALL_AT, input: { file_path: path.join(repo, 'src', 'x.js'), old_string: 'x = 1', new_string: 'x = 2' } }];
@@ -154,10 +155,64 @@ describe('runGuard', () => {
       const r = await run('cd $R && git mv test old-test', (repo) => sh(repo, ['mv', 'test', 'old-test']), new Set<LabelKind>(['test-modified']));
       expect(r.block).toBe(true);
     });
+    it('does not credit a shell rename when a human also changed lines in the renamed file', async () => {
+      const r = await run('mv $R/test/f.test.js $R/test/g.test.js', (repo) => {
+        sh(repo, ['mv', 'test/f.test.js', 'test/g.test.js']);
+        const g = path.join(repo, 'test', 'g.test.js');
+        writeFileSync(g, readFileSync(g, 'utf8').replace('  expect(f(7)).toBe(7);\n', ''));
+      });
+      expect(r.block).toBe(false);
+    });
+    it('blocks on rm with a glob that covers the test file', async () => {
+      const r = await run('cd $R && rm test/*.test.js', (repo) => rmSync(path.join(repo, 'test', 'f.test.js')));
+      expect(r.block).toBe(true);
+      expect(r.message).toContain('test/f.test.js');
+    });
+    it('blocks on rm -f with a ** glob across directories', async () => {
+      const r = await run('cd $R && rm -f tests/**/*.spec.ts', (repo) => rmSync(path.join(repo, 'tests', 'unit', 'a.spec.ts')), BL, (repo) => {
+        mkdirSync(path.join(repo, 'tests', 'unit'), { recursive: true });
+        writeFileSync(path.join(repo, 'tests', 'unit', 'a.spec.ts'), testFile());
+      });
+      expect(r.block).toBe(true);
+      expect(r.message).toContain('tests/unit/a.spec.ts');
+    });
+    it('blocks on mv -t into a target directory', async () => {
+      const r = await run('cd $R && mv -t old test/f.test.js', (repo) => {
+        mkdirSync(path.join(repo, 'old'));
+        sh(repo, ['mv', 'test/f.test.js', 'old/f.test.js']);
+      }, new Set<LabelKind>(['tests-disabled', 'test-modified']));
+      expect(r.block).toBe(true);
+    });
+    it('blocks on git mv -k', async () => {
+      const r = await run('cd $R && git mv -k test/f.test.js test/f.test.js.bak', (repo) => sh(repo, ['mv', 'test/f.test.js', 'test/f.test.js.bak']));
+      expect(r.block).toBe(true);
+    });
+    it('blocks on rm -- file', async () => {
+      const r = await run('cd $R && rm -- test/f.test.js', (repo) => rmSync(path.join(repo, 'test', 'f.test.js')));
+      expect(r.block).toBe(true);
+    });
+    it('does not block when the session only removed an unrelated file and a human deleted a test', async () => {
+      const r = await run('cd $R && rm src/tmp.js', (repo) => {
+        rmSync(path.join(repo, 'src', 'tmp.js'));
+        rmSync(path.join(repo, 'test', 'f.test.js'));
+      }, BL, (repo) => writeFileSync(path.join(repo, 'src', 'tmp.js'), 'export const t = 1;\n'));
+      expect(r.block).toBe(false);
+    });
     it('does not block on a human rm with no transcript edit', async () => {
       const r = await run(null, (repo) => rmSync(path.join(repo, 'test', 'f.test.js')));
       expect(r.block).toBe(false);
     });
+  });
+
+  it('keeps every session entry when guards for different sessions run in parallel', async () => {
+    const { repo, home, stateDir } = makeRepo();
+    const ids = ['s-par-1', 's-par-2', 's-par-3', 's-par-4', 's-par-5', 's-par-6'];
+    applyEdit(repo, SKIP_OLD, SKIP_NEW);
+    const transcripts = ids.map((id) => writeSyntheticTranscript(home, repo, id, [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]));
+    const results = await Promise.all(ids.map((id, i) => runGuard({ transcript_path: transcripts[i], cwd: repo, session_id: id }, { blocking: BLOCKING, home, stateDir })));
+    expect(results.every((r) => r.block)).toBe(true);
+    const state = JSON.parse(readFileSync(path.join(stateDir, 'guard-state.json'), 'utf8')) as Record<string, unknown>;
+    expect(Object.keys(state).sort()).toEqual(ids);
   });
 
   it('creates the state dir with a * .gitignore', async () => {

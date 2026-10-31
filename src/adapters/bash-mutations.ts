@@ -112,20 +112,14 @@ export function detectBashMutations(command: string, cwd: string): BashMutation[
         break;
       }
       case 'mv': {
-        const files = positional(args, new Set(['-t', '--target-directory']));
-        if (files.length < 2) break;
-        const dest = files[files.length - 1] ?? '';
-        for (const src of files.slice(0, -1)) {
+        for (const { src, dest } of moveTargets(args)) {
           push(src, 'move');
-          push(destinationFor(src, dest, files.length > 2), 'write');
+          push(dest, 'write');
         }
         break;
       }
       case 'cp': {
-        const files = positional(args, new Set(['-t', '--target-directory']));
-        if (files.length < 2) break;
-        const dest = files[files.length - 1] ?? '';
-        for (const src of files.slice(0, -1)) push(destinationFor(src, dest, files.length > 2), 'copy');
+        for (const { dest } of moveTargets(args)) push(dest, 'copy');
         break;
       }
       case 'rm':
@@ -299,6 +293,41 @@ function perlFiles(args: string[]): string[] {
     files.push(a);
   }
   return files;
+}
+
+/**
+ * Source/destination pairs of `mv`/`cp`: `mv a b`, `mv a b dir`, and the target-directory
+ * forms `mv -t dir a b`, `mv --target-directory=dir a`, `mv a -t dir`.
+ */
+function moveTargets(args: string[]): Array<{ src: string; dest: string }> {
+  let targetDir: string | undefined;
+  const rest: string[] = [];
+  let endOfOptions = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i] ?? '';
+    if (!endOfOptions && (a === '-t' || a === '--target-directory')) {
+      targetDir = args[++i];
+      continue;
+    }
+    if (!endOfOptions && a.startsWith('--target-directory=')) {
+      targetDir = a.slice('--target-directory='.length);
+      continue;
+    }
+    if (!endOfOptions && /^-[A-Za-z]*t$/.test(a) && a.length > 2) {
+      targetDir = args[++i]; // clustered `-ft dir`
+      continue;
+    }
+    if (a === '--') endOfOptions = true;
+    rest.push(a);
+  }
+  const files = positional(rest);
+  if (targetDir !== undefined) {
+    const dir = targetDir;
+    return files.map((src) => ({ src, dest: path.posix.join(dir, path.posix.basename(src)) }));
+  }
+  if (files.length < 2) return [];
+  const dest = files[files.length - 1] ?? '';
+  return files.slice(0, -1).map((src) => ({ src, dest: destinationFor(src, dest, files.length > 2) }));
 }
 
 /** `mv a dir/` → `dir/a`; `mv a b c dir` → `dir/a`, `dir/b`. */
