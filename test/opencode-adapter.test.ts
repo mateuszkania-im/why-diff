@@ -38,6 +38,12 @@ describe('opencode helpers', () => {
 });
 
 describe('opencodeAdapter (JSON storage)', () => {
+  it('includes sessions from extra roots (git worktrees)', async () => {
+    const found = await opencodeAdapter.discover(REPO, { home: HOME, extraRoots: ['/work/other-repo'] });
+    expect(found).toHaveLength(2);
+    expect(found).toContain(SESSION_FILE);
+  });
+
   it('discovers sessions inside the repo', async () => {
     expect(await opencodeAdapter.discover(REPO, { home: HOME })).toEqual([SESSION_FILE]);
     expect(await opencodeAdapter.discover(path.join(REPO, 'src'), { home: HOME })).toEqual([]);

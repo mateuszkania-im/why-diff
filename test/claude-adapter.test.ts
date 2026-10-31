@@ -18,6 +18,16 @@ describe('ClaudeCodeAdapter.discover', () => {
     expect(found.some((f) => f.includes('acme-shop-2'))).toBe(false);
   });
 
+  it('finds a session started in a sibling git worktree only when it is passed as an extra root', async () => {
+    const home = tempDir('why-diff-home-');
+    const repo = '/work/shop';
+    const wt = '/work/shop-wt';
+    writeSyntheticTranscript(home, wt, 'wt-1', [{ prompt: 'do it', at: '2026-10-20T10:00:00Z', calls: [{ tool: 'Write', at: '2026-10-20T10:00:05Z', input: { file_path: `${wt}/a.js`, content: 'x\n' } }] }]);
+    expect(await adapter.discover(repo, { home })).toEqual([]);
+    const found = await adapter.discover(repo, { home, extraRoots: [wt] });
+    expect(found.map((f) => path.basename(f))).toEqual(['wt-1.jsonl']);
+  });
+
   it('does not return subagent transcripts as sessions', async () => {
     const found = await adapter.discover(FIXTURE_CWD, { home: FIXTURE_HOME });
     expect(found.some((f) => f.includes('subagents'))).toBe(false);

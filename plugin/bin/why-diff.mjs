@@ -3064,10 +3064,10 @@ function attribute(hunks, sessions, repoRoot2, opts = {}) {
   return index.sinceMs = opts.since?.getTime(), hunks.flatMap((hunk) => attributeHunk(hunk, index, prompts));
 }
 function indexEdits(sessions, repoRoot2, diffFiles = /* @__PURE__ */ new Set(), extraRoots = []) {
-  let roots = [repoRoot2, ...extraRoots].flatMap(rootVariants), byFile = /* @__PURE__ */ new Map(), bash = [], shell = /* @__PURE__ */ new Map(), seq = 0, resolved = sessions.map((session) => {
+  let roots = [repoRoot2, ...extraRoots].flatMap(rootVariants).sort((a, b) => b.length - a.length), byFile = /* @__PURE__ */ new Map(), bash = [], shell = /* @__PURE__ */ new Map(), seq = 0, resolved = sessions.map((session) => {
     let cwdVariants = rootVariants(session.cwd);
     return session.edits.map((edit) => edit.failed ? null : repoRelativePath(edit.filePath, roots, session.cwd, cwdVariants));
-  }), worktrees = worktreeRoots2(sessions, resolved, diffFiles);
+  }), worktrees = nestedWorktreeRoots(sessions, resolved, diffFiles);
   for (let [si, session] of sessions.entries())
     for (let [ei, edit] of session.edits.entries()) {
       if (edit.failed) continue;
@@ -3117,7 +3117,7 @@ var NESTED_WORKTREE = /(?:^|\/)\.?(?:claude\/)?worktrees\/[^/]+\//;
 function absoluteEditPath(edit, cwd) {
   return path3.isAbsolute(edit.filePath) ? path3.normalize(edit.filePath) : cwd ? path3.resolve(cwd, edit.filePath) : null;
 }
-function worktreeRoots2(sessions, resolved, diffFiles) {
+function nestedWorktreeRoots(sessions, resolved, diffFiles) {
   let byBase = /* @__PURE__ */ new Map();
   for (let f of diffFiles) {
     if (!f.includes("/")) continue;

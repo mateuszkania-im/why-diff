@@ -201,7 +201,8 @@ interface ShellIndex {
 }
 
 function indexEdits(sessions: Session[], repoRoot: string, diffFiles: Set<string> = new Set(), extraRoots: string[] = []): EditIndex {
-  const roots = [repoRoot, ...extraRoots].flatMap(rootVariants);
+  // Longest first: a worktree nested in the repo (`.claude/worktrees/x`) must win over the repo root.
+  const roots = [repoRoot, ...extraRoots].flatMap(rootVariants).sort((a, b) => b.length - a.length);
   const byFile = new Map<string, IndexedEdit[]>();
   const bash: IndexedEdit[] = [];
   const shell = new Map<string, ShellCommand>();
@@ -211,7 +212,7 @@ function indexEdits(sessions: Session[], repoRoot: string, diffFiles: Set<string
     const cwdVariants = rootVariants(session.cwd);
     return session.edits.map((edit) => (edit.failed ? null : repoRelativePath(edit.filePath, roots, session.cwd, cwdVariants)));
   });
-  const worktrees = worktreeRoots(sessions, resolved, diffFiles);
+  const worktrees = nestedWorktreeRoots(sessions, resolved, diffFiles);
 
   for (const [si, session] of sessions.entries()) {
     for (const [ei, edit] of session.edits.entries()) {
@@ -305,7 +306,7 @@ function absoluteEditPath(edit: FileEdit, cwd: string): string | null {
  * a lone `package.json` in some other project is not enough. Line content
  * still has to match for any hunk to be attributed.
  */
-function worktreeRoots(sessions: Session[], resolved: Array<Array<string | null>>, diffFiles: Set<string>): string[] {
+function nestedWorktreeRoots(sessions: Session[], resolved: Array<Array<string | null>>, diffFiles: Set<string>): string[] {
   const byBase = new Map<string, string[]>();
   for (const f of diffFiles) {
     if (!f.includes('/')) continue;

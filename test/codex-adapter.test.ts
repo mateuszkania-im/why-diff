@@ -179,6 +179,10 @@ describe('codexAdapter.discover', () => {
     expect(until.sort()).toEqual([OLD, CLASSIC].sort());
   });
 
+  it('includes sessions from extra roots (git worktrees)', async () => {
+    expect(await codexAdapter.discover(REPO, { home: HOME, since: new Date('2026-10-01T00:00:00Z'), extraRoots: ['/work/other-repo'] }).then((f) => f.sort())).toEqual([CLASSIC, CODE_MODE, OTHER_REPO].sort());
+  });
+
   it('returns nothing for an unrelated repo or a missing home', async () => {
     expect(await codexAdapter.discover('/work/nope', { home: HOME })).toEqual([]);
     expect(await codexAdapter.discover(REPO, { home: path.join(HOME, 'missing') })).toEqual([]);

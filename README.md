@@ -163,7 +163,7 @@ Reports stay small on big diffs: every edit a hunk references is stored once in 
 - Transcript formats are not public contracts. Adapters are tested against current Claude Code (2.1.x) and Codex (0.16x) files and will need updates.
 - Lines written by scripts the agent ran (`node fix.js`, codegen, formatters) can't be traced line by line, and show as `file-only` matches.
 - Sessions started in another folder (a sibling project, a workspace root) that edited the repo by absolute path are found only with `--scan-all`, which byte-scans every transcript modified in the window.
-- Sessions run in a sibling `git worktree` are found while that worktree still exists (`git worktree list`). Once it is removed, its transcripts are only found with `--scan-all` when they lie outside the repo, so review before pruning worktrees.
+- Sessions run in a `git worktree` are found while that worktree still exists (`git worktree list`), or when it was nested under the repo. Once a worktree outside the repo is removed, its transcripts are generally not found (`--scan-all` only matches edits by absolute path under the repo root), so review before pruning worktrees.
 - If an agent edited a file earlier and those edits were later reverted, a line you then type by hand in that file can show as a `file-only` match to that old prompt. It still carries the `unattributed` label, so it doesn't pass as agent work.
 - Claude Code deletes transcripts after 30 days by default (`cleanupPeriodDays`). Review before that, or raise it.
 - The intent check is a model judgement (see accuracy above), not a gate. The deterministic labels are the gate.

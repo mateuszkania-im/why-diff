@@ -249,6 +249,32 @@ describe('base and window resolution', () => {
     expect(await worktreeRoots(wt)).toEqual([realpathSync(repo)]);
   });
 
+  it('attributes a top-level file edited in a worktree nested under the repo (.claude/worktrees/x)', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'README.md', 'hi\n', 'base');
+    put(repo, '.gitignore', '.claude/\n');
+    sh(repo, 'add', '.gitignore');
+    sh(repo, 'commit', '-q', '-m', 'ignore');
+    const wt = path.join(repo, '.claude', 'worktrees', 'x');
+    mkdirSync(path.dirname(wt), { recursive: true });
+    sh(repo, 'worktree', 'add', '-q', wt, '-b', 'wt');
+    const content = 'export const answer = 42;\n';
+    put(wt, 'a.js', content);
+    sh(wt, 'add', 'a.js');
+    sh(wt, 'commit', '-q', '-m', 'add a');
+    const at = new Date().toISOString();
+    const home = tempDir('why-diff-home-');
+    dirs.push(home);
+    const real = realpathSync(wt);
+    writeSyntheticTranscript(home, real, 'wt-session-0002', [
+      { prompt: 'create a.js exporting the answer', at, calls: [{ tool: 'Write', at, input: { file_path: path.join(real, 'a.js'), content } }] },
+    ]);
+    sh(repo, 'merge', '-q', '--ff-only', 'wt');
+    const report = await buildReport({ cwd: repo, range: 'HEAD~1...HEAD', home, harnesses: ['claude-code'], classify: 'none' });
+    expect(report.hunks).toHaveLength(1);
+    expect(report.hunks[0]?.match).toBe('exact');
+  });
+
   it('attributes a merged change to a session that ran in a sibling git worktree', async () => {
     const repo = freshRepo();
     commitFile(repo, 'README.md', 'hi\n', 'base');
