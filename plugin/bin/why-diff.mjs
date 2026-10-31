@@ -3558,14 +3558,34 @@ var SECRET_RULES = [
   { re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/, name: "Slack token" },
   { re: /\bAIza[0-9A-Za-z_-]{35}\b/, name: "Google API key" },
   { re: /\bnpm_[A-Za-z0-9]{36}\b/, name: "npm token" }
-], DOTS = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022", PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:'"`]+:[^\s/@'"`]+@/gi, ASSIGNMENT = /\b((?:[A-Za-z_][\w.-]*?)?(?:passw(?:or)?d|passwd|pwd|secret|token|api[_-]?key|credentials?)[\w-]*)(\s*=\s*)(["']?)([^\s"'`]+)\3/gi, EMAIL = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/g;
-function redactSecrets(text2) {
+], DOTS = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022", PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/'"`@:]{1,100}:[^\s/'"`]{1,200}@/gi, JWT = /\beyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}/g, AUTH_HEADER = /\b(authorization["']?\s*[:=]\s*["']?(?:Bearer|Basic|Token)\s+)[^\s"']{8,}/gi, BARE_SCHEME = /\b(Bearer|Basic)(\s+)(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/-]{8,}={0,2}/g, NAME_VALUE = /(?<![\w.])((["']?)([A-Za-z_][\w.-]{0,60})\2\s*(:=|=>|===?|!==?|=|:)\s*)(?:"([^"\n]{1,200})"|'([^'\n]{1,200})'|([^\s"'`,;]{8,}))/g, EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b/g, SECRET_WORDS = /* @__PURE__ */ new Set(["password", "passwd", "pwd", "passphrase", "secret", "token", "credential", "credentials", "apikey"]);
+function secretName(name) {
+  let segs = name.split(/[._-]+/).flatMap((p) => p.split(/(?<=[a-z0-9])(?=[A-Z])/)).map((x) => x.toLowerCase());
+  return segs.some((x, i) => SECRET_WORDS.has(x) || x === "api" && segs[i + 1] === "key");
+}
+var ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/;
+function redactKeys(text2) {
   if (!text2) return text2;
   let out = text2.replace(PRIVATE_KEY_BLOCK, "-----PRIVATE KEY REDACTED-----");
-  out = out.replace(URL_CREDENTIALS, (_m, scheme) => `${scheme}${DOTS}@`);
+  out = out.replace(URL_CREDENTIALS, (_m, scheme) => `${scheme}${DOTS}@`), out = out.replace(JWT, `eyJ${DOTS}`), out = out.replace(AUTH_HEADER, (_m, head) => `${head}${DOTS}`), out = out.replace(BARE_SCHEME, (_m, scheme, sp) => `${scheme}${sp}${DOTS}`);
   for (let { re } of SECRET_RULES)
     re.source.includes("PRIVATE KEY") || (out = out.replace(new RegExp(re.source, "g"), (m) => `${m.slice(0, m.startsWith("sk-ant-") ? 7 : 4)}${DOTS}`));
-  return out = out.replace(ASSIGNMENT, (m, name, eq, q, value) => /^[•$]|^\{\{|^process\.env|^os\.environ/.test(value) ? m : `${name}${eq}${q}${DOTS}${q}`), out = out.replace(EMAIL, "[email redacted]"), out;
+  return out;
+}
+function redactSecrets(text2) {
+  if (!text2) return text2;
+  let out = redactKeys(text2);
+  return out = out.replace(NAME_VALUE, (m, head, q, name, op, dq, sq, bare) => {
+    if (op === "==" || op === "===" || op === "!=" || op === "!==" || !secretName(name)) return m;
+    let quoted = dq ?? sq;
+    if (quoted !== void 0) {
+      if (ENV_REF.test(quoted)) return m;
+      let quote2 = dq !== void 0 ? '"' : "'";
+      return `${head}${quote2}${DOTS}${quote2}`;
+    }
+    let v = bare ?? "";
+    return ENV_REF.test(v) || /[().=]/.test(v) || op === ":" && /^[A-Za-z]+$/.test(v) ? m : `${head}${DOTS}`;
+  }), out.replace(EMAIL, "[email redacted]");
 }
 var mapOpt = (v, f) => typeof v == "string" ? f(v) : v;
 function redactReport(report, mode) {
@@ -3589,7 +3609,9 @@ function redactReport(report, mode) {
     edits,
     hunks: report.hunks.map((h) => ({
       ...h,
+      hunk: { ...h.hunk, lines: h.hunk.lines.map((l) => ({ ...l, text: redactKeys(l.text) })) },
       edits: h.edits.map(rationale),
+      ...h.intent ? { intent: { ...h.intent, reason: text2(h.intent.reason) } } : {},
       ...h.prompt ? { prompt: { ...h.prompt, text: promptText(h.prompt) } } : {}
     }))
   };
@@ -3969,11 +3991,11 @@ function parseAssertion(line, path12) {
   }
   return SHOULD.test(code2) ? { ...base, matcher: "should", display: "should", negated: /should_not|\.not\b/.test(code2), operands: [] } : null;
 }
-var ASSIGNMENT2 = /^\s*(?:(?:const|let|var|val|final|auto)\s+)?(?:[A-Z][\w<>[\],.?]*\s+)?([A-Za-z_$][\w$]*)(?:\s*:\s*[^=]+?)?\s*(?::=|=(?![=>]))\s*(.+?)\s*;?\s*$/;
+var ASSIGNMENT = /^\s*(?:(?:const|let|var|val|final|auto)\s+)?(?:[A-Z][\w<>[\],.?]*\s+)?([A-Za-z_$][\w$]*)(?:\s*:\s*[^=]+?)?\s*(?::=|=(?![=>]))\s*(.+?)\s*;?\s*$/;
 function collectAliases(lines, path12) {
   let style = commentStyle(path12), out = /* @__PURE__ */ new Map();
   for (let l of lines) {
-    let m = ASSIGNMENT2.exec(codeOf(l.text, style));
+    let m = ASSIGNMENT.exec(codeOf(l.text, style));
     m?.[1] && m[2] && !EXPECT_CALL.test(m[2]) && out.set(m[1], m[2].replace(/\s+/g, ""));
   }
   return out;

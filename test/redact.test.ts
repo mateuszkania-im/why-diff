@@ -91,3 +91,70 @@ describe('classifier input', () => {
     expect(built.user).not.toContain('XXXX');
   });
 });
+
+describe('redactSecrets: ordinary code stays unchanged', () => {
+  it.each([
+    'max_tokens=4096',
+    'if (token == x) go()',
+    'if (token === other) go()',
+    'const tokenizer = new Tokenizer()',
+    'const secretary = hire(person)',
+    'password=$ENV_PASS',
+    'password=${DB_PASSWORD}',
+    'the token: it expires daily',
+    'set tokenCount = items.length',
+    'passwordField = render(input)',
+  ])('%s', (t) => {
+    expect(redactSecrets(t)).toBe(t);
+  });
+});
+
+describe('redactSecrets: more secret shapes', () => {
+  it.each([
+    ['password="hunter 2 x"', 'hunter'],
+    ["password = 'my secret phrase'", 'phrase'],
+    ['{"apiKey": "abcd1234efgh"}', 'abcd1234efgh'],
+    ['api_key: abcd1234efgh', 'abcd1234efgh'],
+    ['token := "abcd1234efgh"', 'abcd1234efgh'],
+    ["secret => 'abcd1234efgh'", 'abcd1234efgh'],
+    ['Authorization: Bearer abcDEF123456xyz', 'abcDEF123456xyz'],
+    ['Authorization: Basic dXNlcjpwYXNzd29yZA==', 'dXNlcjpwYXNzd29yZA'],
+    ['jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.SflKxwRJSMeKKF2QT4fw ok', 'SflKxwRJSMeKKF2QT4fw'],
+    ['postgres://u:p@ss@host/db', 'ss@'],
+    ['password=$ecret123', 'ecret123'],
+    ['--token=abc123def', 'abc123def'],
+  ])('%s', (t, leak) => {
+    expect(redactSecrets(t)).not.toContain(leak);
+  });
+  it('keeps the host of a URL with an @ in the password', () => {
+    expect(redactSecrets('postgres://u:p@ss@host/db')).toContain('host/db');
+  });
+});
+
+describe('redactSecrets: performance', () => {
+  it.each(['a.', 'a-', 'ab_', 'token '])('200 KB of %j is fast', (unit) => {
+    const input = unit.repeat(Math.ceil(200_000 / unit.length));
+    const t0 = performance.now();
+    redactSecrets(input);
+    expect(performance.now() - t0).toBeLessThan(200);
+  });
+});
+
+describe('redaction of diff lines and intent reasons', () => {
+  it.each(['md', 'json', 'html'] as const)('diff line key is masked in %s', (fmt) => {
+    const r = clone(sample);
+    r.hunks[0]!.hunk.lines.push({ type: 'add', text: 'const k = "sk-ant-api03-XXXXXXXXXXXXXXXXXXXX"', newNo: 999 });
+    const out = renderReport(redactReport(r, 'secrets'), fmt, { verbose: true });
+    expect(out).not.toContain('XXXXXXXX');
+  });
+  it('does not mask assignments inside diff lines', () => {
+    const r = clone(sample);
+    r.hunks[0]!.hunk.lines.push({ type: 'add', text: 'password = readInput()', newNo: 999 });
+    expect(JSON.stringify(redactReport(r, 'secrets'))).toContain('password = readInput()');
+  });
+  it('masks secrets quoted in an intent reason', () => {
+    const r = clone(sample);
+    r.hunks[0]!.intent = { verdict: 'unclear', reason: 'prompt said password=hunter2xyz', model: 'm' };
+    expect(JSON.stringify(redactReport(r, 'prompts'))).not.toContain('hunter2xyz');
+  });
+});
