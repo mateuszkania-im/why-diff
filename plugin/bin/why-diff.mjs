@@ -2684,6 +2684,13 @@ async function hasHead(cwd) {
   return revExists(cwd, "HEAD");
 }
 async function getDiff(cwd, target, opts = {}) {
+  try {
+    return await getDiffUnwrapped(cwd, target, opts);
+  } catch (err) {
+    throw err instanceof GitError && await isShallow(cwd) ? new Error(`${SHALLOW_HINT} (${err.stderr.trim()})`) : err;
+  }
+}
+async function getDiffUnwrapped(cwd, target, opts) {
   let common = ["diff", "--no-color", "--no-ext-diff", "-M", `--unified=${opts.unified ?? 3}`];
   if (typeof target == "string") {
     if (target.startsWith("-")) throw new Error(`invalid range "${target}"`);
@@ -2713,8 +2720,16 @@ async function mergeBase(cwd, a, b) {
 }
 async function listUntracked(cwd) {
   let root = await repoRoot(cwd);
-  return (await git(root, ["ls-files", "--others", "--exclude-standard", "-z"], { trim: !1 })).split("\0").filter((p) => p.length > 0);
+  return (await git(root, ["ls-files", "--others", "--exclude-standard", "-z"], { trim: !1 })).split("\0").filter((p) => p.length > 0 && !p.startsWith(".why-diff/"));
 }
+async function isShallow(cwd) {
+  try {
+    return await git(cwd, ["rev-parse", "--is-shallow-repository"]) === "true";
+  } catch {
+    return !1;
+  }
+}
+var SHALLOW_HINT = "this is a shallow clone; fetch full history (actions/checkout: fetch-depth: 0) or pass --base";
 async function syntheticAddedFileDiff(root, rel) {
   let abs = path2.join(root, rel), buf;
   try {
@@ -2754,14 +2769,21 @@ function quotePathIfNeeded(p) {
   }
   return `${out}"`;
 }
-async function resolveDefaultTarget(cwd) {
+async function resolveDefaultTarget(cwd, env = process.env, explicitBase) {
   let workingTree = {
     target: { workingTree: !0, includeUntracked: !0 },
     label: "working tree"
   };
   if (!await hasHead(cwd)) return workingTree;
-  let branch = await currentBranch(cwd), head = await git(cwd, ["rev-parse", "HEAD"]);
-  for (let base of ["origin/HEAD", "origin/main", "origin/master", "main", "master"]) {
+  let branch = await currentBranch(cwd), head = await git(cwd, ["rev-parse", "HEAD"]), candidates = [], named = [explicitBase, env.GITHUB_BASE_REF, env.CI_MERGE_REQUEST_TARGET_BRANCH_NAME, env.BITBUCKET_PR_DESTINATION_BRANCH];
+  for (let x of named)
+    x && candidates.push(`origin/${x}`, x);
+  try {
+    candidates.push(await git(cwd, ["rev-parse", "--abbrev-ref", "refs/remotes/origin/HEAD"]));
+  } catch {
+  }
+  candidates.push("origin/main", "origin/master", "main", "master", "origin/develop", "develop", "origin/trunk", "trunk");
+  for (let base of candidates) {
     if (base === branch || !await revExists(cwd, base)) continue;
     let mb;
     try {
@@ -2798,6 +2820,13 @@ async function commitTimes(cwd, target) {
     let headTime = await git(cwd, ["log", "-1", "--format=%cI", "HEAD"]);
     since = new Date(headTime);
   }
+  if (countRange)
+    try {
+      let authored = (await git(cwd, ["log", "--format=%aI", countRange])).split(`
+`).map((l) => Date.parse(l)).filter((n) => !Number.isNaN(n));
+      authored.length && (since = new Date(Math.min(since.getTime(), ...authored)));
+    } catch {
+    }
   let commits = 0;
   if (countRange)
     try {
@@ -6858,7 +6887,9 @@ async function buildReport(opts = {}) {
   else if (opts.range)
     target = opts.range, rangeLabel = opts.range;
   else {
-    let resolved = await resolveDefaultTarget(root);
+    let resolved = await resolveDefaultTarget(root, process.env, opts.base);
+    if (!resolved.base && await isShallow(root)) throw new Error(SHALLOW_HINT);
+    if (opts.base && !resolved.base) throw new Error(`cannot compare against --base ${opts.base}: ref not found or no commits beyond it`);
     target = resolved.target, rangeLabel = resolved.label;
   }
   log(`diffing ${rangeLabel}`);
@@ -6976,10 +7007,10 @@ function describeSessions(report) {
 }
 var NO_SESSIONS_HINT = "check the harness (--harness), the time window (--since), pass --session <file>, or use --scan-all for sessions run from another folder";
 function headline(report) {
-  let s = report.summary, tracedPct = s.addedLines > 0 ? Math.round(s.agentLines / s.addedLines * 100) : 100, intentRan = !!s.intent || report.hunks.some((h) => h.intent), unrequestedHunks = s.intent?.unrequested ?? report.hunks.filter((h) => h.intent?.verdict === "unrequested").length, unattributedHunks = report.hunks.filter((h) => !h.prompt || h.match === "none").length, riskLabels = 0, warnLabels = 0;
+  let s = report.summary, tracedPct = s.addedLines > 0 ? Math.round(s.agentLines / s.addedLines * 100) : 0, intentRan = !!s.intent || report.hunks.some((h) => h.intent), unrequestedHunks = s.intent?.unrequested ?? report.hunks.filter((h) => h.intent?.verdict === "unrequested").length, unattributedHunks = report.hunks.filter((h) => !h.prompt || h.match === "none").length, riskLabels = 0, warnLabels = 0;
   for (let r of collectRisks(report, "warn"))
     r.label.severity === "risk" ? riskLabels++ : warnLabels++;
-  let harnesses = [...new Set(report.sessions.map((x) => x.harness))], classifierModel = report.hunks.find((h) => h.intent)?.intent?.model, out = { tracedPct, unrequestedHunks, intentRan, unattributedHunks, riskLabels, warnLabels, touchedTests: s.touchedTests, harnesses };
+  let harnesses = [...new Set(report.sessions.map((x) => x.harness))], classifierModel = report.hunks.find((h) => h.intent)?.intent?.model, out = { tracedPct, noAddedLines: s.addedLines === 0, unrequestedHunks, intentRan, unattributedHunks, riskLabels, warnLabels, touchedTests: s.touchedTests, harnesses };
   return classifierModel && (out.classifierModel = classifierModel), out;
 }
 function truncate2(text2, max, ellipsis = "\u2026") {
@@ -7032,7 +7063,7 @@ function escapeHtml(s) {
 // src/report/html.ts
 function renderHtml(report) {
   let hash = reportHash(report), h = headline(report), s = report.summary, title = `${report.repo.name} \xB7 ${report.range} \xB7 why-diff`, payload = safeJson({ report, hash }), summaryLine = [
-    `${h.tracedPct}% of added lines trace to a prompt`,
+    h.noAddedLines ? "no added lines" : `${h.tracedPct}% of added lines trace to a prompt`,
     h.intentRan ? `${plural(h.unrequestedHunks, "hunk")} nobody asked for` : null,
     h.touchedTests ? "tests touched" : "tests untouched",
     `${plural(s.hunks, "hunk")} in ${plural(s.files, "file")}`
@@ -7477,9 +7508,10 @@ kbd{display:inline-block;min-width:18px;padding:0 5px;border-radius:4px;border:1
     inner.appendChild(el('div', { class: 'brand-row' }, brand, crumbs, el('div', { class: 'top-actions' }, themeBtn, helpBtn)));
 
     // stats
-    var tone = tracedPct >= 90 ? 'ok' : tracedPct >= 60 ? 'warn' : 'risk';
+    var noAdded = S.addedLines === 0;
+    var tone = noAdded ? 'ok' : tracedPct >= 90 ? 'ok' : tracedPct >= 60 ? 'warn' : 'risk';
     var stats = el('div', { class: 'stats', role: 'group', 'aria-label': 'Headline numbers' });
-    stats.appendChild(stat('Agent-traced', tracedPct + '%', S.agentLines + ' of ' + S.addedLines + ' added lines explained by an agent edit', tone, tracedPct));
+    stats.appendChild(stat('Agent-traced', noAdded ? 'n/a' : tracedPct + '%', S.agentLines + ' of ' + S.addedLines + ' added lines explained by an agent edit', tone, tracedPct));
     if (intentRan) {
       var classified = allHunks.filter(function (a) { return a.intent; }).length;
       stats.appendChild(stat('Unrequested', String(verdictCounts.unrequested), (verdictCounts.unrequested === 0 ? 'nothing the prompts did not ask for' : plural(verdictCounts.unrequested, 'hunk') + ' nobody asked for') + ' \\u00b7 ' + classified + ' of ' + allHunks.length + ' classified', verdictCounts.unrequested > 0 ? 'risk' : 'ok'));
@@ -7881,7 +7913,7 @@ _Report truncated to fit the size limit._
 function build(report, o) {
   let H = "#".repeat(o.headingLevel ?? 2), sub = H + "#", h = headline(report), s = report.summary, out = [];
   out.push(`${H} Provenance`), out.push("");
-  let headlineBits = [`**${h.tracedPct}%** of added lines trace to a prompt`];
+  let headlineBits = [h.noAddedLines ? "no added lines" : `**${h.tracedPct}%** of added lines trace to a prompt`];
   h.intentRan && headlineBits.push(h.unrequestedHunks === 0 ? "nothing unrequested" : `**${h.unrequestedHunks}** ${h.unrequestedHunks === 1 ? "hunk" : "hunks"} nobody asked for`), headlineBits.push(h.touchedTests ? "**tests touched**" : "tests untouched"), h.unattributedHunks > 0 && headlineBits.push(`**${h.unattributedHunks}** unattributed ${h.unattributedHunks === 1 ? "hunk" : "hunks"}`), out.push(`> ${headlineBits.join(" \xB7 ")}`), out.push("");
   let risks = collectRisks(report, "warn");
   if (risks.length > 0) {
@@ -7890,7 +7922,7 @@ function build(report, o) {
       out.push(`| ${badge(r.label.severity)} | ${riskCell(r)} | \`${code(r.label.kind)}\` | ${cell(r.label.detail)} |`);
     risks.length > o.maxRisks && out.push(`| | | | _\u2026 ${risks.length - o.maxRisks} more not shown_ |`), out.push("");
   }
-  if (out.push(`${sub} Summary`), out.push(""), out.push("| | |"), out.push("|---|---|"), out.push(`| Diff | \`${code(report.range)}\` in \`${code(report.repo.name)}\`${report.repo.branch ? ` (\`${code(report.repo.branch)}\`)` : ""} |`), out.push(`| Sessions | ${text(describeSessions(report))}${s.sessions === 0 ? `; ${text(NO_SESSIONS_HINT)}` : ""} |`), out.push(`| Prompts | ${s.prompts} |`), out.push(`| Hunks | ${s.hunks} in ${plural(s.files, "file")} (+${s.addedLines} \u2212${s.removedLines}) |`), out.push(`| Agent-traced lines | ${s.agentLines} of ${s.addedLines} added (${h.tracedPct}%) |`), out.push(`| Unattributed lines | ${s.unattributedLines}${h.unattributedHunks > 0 ? ` in ${plural(h.unattributedHunks, "hunk")}` : ""} |`), s.intent) {
+  if (out.push(`${sub} Summary`), out.push(""), out.push("| | |"), out.push("|---|---|"), out.push(`| Diff | \`${code(report.range)}\` in \`${code(report.repo.name)}\`${report.repo.branch ? ` (\`${code(report.repo.branch)}\`)` : ""} |`), out.push(`| Sessions | ${text(describeSessions(report))}${s.sessions === 0 ? `; ${text(NO_SESSIONS_HINT)}` : ""} |`), out.push(`| Prompts | ${s.prompts} |`), out.push(`| Hunks | ${s.hunks} in ${plural(s.files, "file")} (+${s.addedLines} \u2212${s.removedLines}) |`), out.push(`| Agent-traced lines | ${s.agentLines} of ${s.addedLines} added${h.noAddedLines ? "" : ` (${h.tracedPct}%)`} |`), out.push(`| Unattributed lines | ${s.unattributedLines}${h.unattributedHunks > 0 ? ` in ${plural(h.unattributedHunks, "hunk")}` : ""} |`), s.intent) {
     let i = s.intent;
     out.push(`| Intent | ${i.requested} requested \xB7 ${i.implied} implied \xB7 ${i.unrequested} unrequested \xB7 ${i.unclear} unclear${h.classifierModel ? ` (${code(h.classifierModel)})` : ""} |`);
   }
@@ -8011,7 +8043,7 @@ function renderTerminal(report, opts = {}) {
   blank();
   {
     let pctStyle = h.tracedPct >= 90 ? c.green : h.tracedPct >= 60 ? c.yellow : c.red, parts = [];
-    if (parts.push([[`${h.tracedPct}%`, (t) => bold(pctStyle(t))], [" of added lines trace to a prompt", id]]), h.intentRan) {
+    if (parts.push(h.noAddedLines ? [["no added lines", dim]] : [[`${h.tracedPct}%`, (t) => bold(pctStyle(t))], [" of added lines trace to a prompt", id]]), h.intentRan) {
       let n = h.unrequestedHunks;
       parts.push(
         n === 0 ? [["nothing unrequested", c.green]] : [[String(n), (t) => bold(c.red(t))], [` ${n === 1 ? "hunk" : "hunks"} nobody asked for`, c.red]]
@@ -8202,7 +8234,7 @@ function renderReport(report, format, opts = {}) {
 
 // src/cli.ts
 var HARNESSES = ["claude-code", "codex", "opencode"], VERSION = "0.1.0", program2 = new Command();
-program2.name("why-diff").version(VERSION, "-V, --version").description("Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it.").argument("[range]", "git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree").option("-w, --working-tree", "only uncommitted changes vs HEAD").addOption(new Option("-f, --format <format>", "output format").choices(["terminal", "md", "html", "json"])).option("--html", "shortcut for --format html (writes .why-diff/report.html and opens it)").option("-o, --out <file>", "write output to a file instead of stdout").option("--no-open", "do not open the HTML report in a browser").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo (sibling folders, workspace roots) that edited files in it; slower").option("-v, --verbose", "show rationale, commands and label details").option("--fail-on <what>", "exit 1 if: risk | unrequested | tests | unattributed (comma list) \u2014 for CI and hooks").option("-q, --quiet", "no progress output").action(async (range, o) => {
+program2.name("why-diff").version(VERSION, "-V, --version").description("Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it.").argument("[range]", "git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree").option("--base <ref>", "branch or ref to compare against (default: auto-detected, incl. CI pull request targets)").option("-w, --working-tree", "only uncommitted changes vs HEAD").addOption(new Option("-f, --format <format>", "output format").choices(["terminal", "md", "html", "json"])).option("--html", "shortcut for --format html (writes .why-diff/report.html and opens it)").option("-o, --out <file>", "write output to a file instead of stdout").option("--no-open", "do not open the HTML report in a browser").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo (sibling folders, workspace roots) that edited files in it; slower").option("-v, --verbose", "show rationale, commands and label details").option("--fail-on <what>", "exit 1 if: risk | unrequested | tests | unattributed (comma list) \u2014 for CI and hooks").option("-q, --quiet", "no progress output").action(async (range, o) => {
   let progress = (msg) => {
     o.quiet || process.stderr.write(import_picocolors2.default.dim(`\xB7 ${msg}
 `));
@@ -8212,6 +8244,7 @@ program2.name("why-diff").version(VERSION, "-V, --version").description("Trace e
   if (unknownHarness) throw new Error(`unknown harness "${unknownHarness}" (use ${HARNESSES.join(", ")})`);
   let classify = o.classify === !1 || o.classify === void 0 ? "none" : o.classify === !0 ? "auto" : o.classify, report = await buildReport({
     range,
+    base: o.base,
     workingTree: !!o.workingTree,
     harnesses,
     sessionFiles: o.session,
@@ -8221,10 +8254,17 @@ program2.name("why-diff").version(VERSION, "-V, --version").description("Trace e
     model: o.model,
     onProgress: progress
   }), out = renderReport(report, format, { verbose: !!o.verbose }), outFile = o.out;
-  if (format === "html" && !outFile && (outFile = path10.join(report.repo.root, ".why-diff", "report.html")), outFile ? (await mkdir2(path10.dirname(path10.resolve(outFile)), { recursive: !0 }), await writeFile2(outFile, out), progress(`wrote ${path10.relative(process.cwd(), path10.resolve(outFile)) || outFile}`), format === "html" && o.open !== !1 && process.stdout.isTTY && openFile(path10.resolve(outFile)), format === "html" && process.stdout.write(renderReport(report, "terminal", {}) + `
-`)) : process.stdout.write(out.endsWith(`
+  if (format === "html" && !outFile && (outFile = path10.join(report.repo.root, ".why-diff", "report.html")), outFile) {
+    await mkdir2(path10.dirname(path10.resolve(outFile)), { recursive: !0 }), await writeFile2(outFile, out);
+    let outDir = path10.dirname(path10.resolve(outFile));
+    path10.basename(outDir) === ".why-diff" && await writeFile2(path10.join(outDir, ".gitignore"), `*
+`), progress(`wrote ${path10.relative(process.cwd(), path10.resolve(outFile)) || outFile}`), format === "html" && o.open !== !1 && process.stdout.isTTY && openFile(path10.resolve(outFile)), format === "html" && process.stdout.write(renderReport(report, "terminal", {}) + `
+`);
+  } else
+    process.stdout.write(out.endsWith(`
 `) ? out : out + `
-`), o.failOn) {
+`);
+  if (o.failOn) {
     let s = report.summary, failed = String(o.failOn).split(",").map((x) => x.trim()).filter((c) => c === "risk" && report.hunks.some((h) => h.labels.some((l) => l.severity === "risk")) || c === "unrequested" && (s.intent?.unrequested ?? 0) > 0 || c === "tests" && s.touchedTests || c === "unattributed" && s.unattributedLines > 0);
     failed.length && (process.stderr.write(import_picocolors2.default.red(`why-diff: failing on ${failed.join(", ")}
 `)), process.exitCode = 1);

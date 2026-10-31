@@ -268,7 +268,8 @@ describe('renderTerminal', () => {
 
     const empty: Report = { ...clone(sample), hunks: [], summary: { ...r.summary, hunks: 0, files: 0, addedLines: 0, removedLines: 0, agentLines: 0, unattributedLines: 0, labels: {}, touchedTests: false } };
     const e = renderTerminal(empty, { color: false, width: 100 });
-    expect(e).toContain('100% of added lines trace to a prompt');
+    expect(e).toContain('no added lines');
+    expect(e).not.toContain('100%');
     expect(e).toContain('RISKS  none');
     expect(e).toContain('no hunks in this diff');
   });
@@ -276,6 +277,18 @@ describe('renderTerminal', () => {
   it('passes hostile text through untouched (terminal needs no escaping)', () => {
     const out = renderTerminal(withHostileContent(), { color: false, width: 200, verbose: true });
     expect(out).toContain('<script>alert(1)</script>');
+  });
+});
+
+describe('headline with no added lines', () => {
+  it('headline does not claim 100% with no added lines', () => {
+    const r = clone(sample);
+    r.hunks = [];
+    r.summary = { ...r.summary, hunks: 0, files: 0, addedLines: 0, removedLines: 0, agentLines: 0, unattributedLines: 0, labels: {}, touchedTests: false };
+    const md = renderMarkdown(r);
+    expect(md).toContain('no added lines');
+    expect(md).not.toContain('100%');
+    expect(renderTerminal(r, { color: false, width: 100 })).toContain('no added lines');
   });
 });
 

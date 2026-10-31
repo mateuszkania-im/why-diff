@@ -131,6 +131,15 @@ export async function hasHead(cwd: string): Promise<boolean> {
  *   "new file" sections for untracked files, read from disk (binary skipped).
  */
 export async function getDiff(cwd: string, target: DiffTarget, opts: DiffOptions = {}): Promise<string> {
+  try {
+    return await getDiffUnwrapped(cwd, target, opts);
+  } catch (err) {
+    if (err instanceof GitError && (await isShallow(cwd))) throw new Error(`${SHALLOW_HINT} (${err.stderr.trim()})`);
+    throw err;
+  }
+}
+
+async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptions): Promise<string> {
   const unified = `--unified=${opts.unified ?? 3}`;
   const common = ['diff', '--no-color', '--no-ext-diff', '-M', unified];
 
@@ -180,8 +189,19 @@ export async function mergeBase(cwd: string, a: string, b: string): Promise<stri
 export async function listUntracked(cwd: string): Promise<string[]> {
   const root = await repoRoot(cwd);
   const out = await git(root, ['ls-files', '--others', '--exclude-standard', '-z'], { trim: false });
-  return out.split('\0').filter((p) => p.length > 0);
+  return out.split('\0').filter((p) => p.length > 0 && !p.startsWith('.why-diff/'));
 }
+
+/** True in a shallow clone (`git clone --depth N`, default `actions/checkout`). */
+export async function isShallow(cwd: string): Promise<boolean> {
+  try {
+    return (await git(cwd, ['rev-parse', '--is-shallow-repository'])) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export const SHALLOW_HINT = 'this is a shallow clone; fetch full history (actions/checkout: fetch-depth: 0) or pass --base';
 
 /**
  * Build a `git diff`-shaped "new file" section for an untracked file. Returns
@@ -234,12 +254,17 @@ function quotePathIfNeeded(p: string): string {
 
 /**
  * Pick what to diff when the user gave no range:
- * 1. On a branch that has a merge base with `origin/HEAD`, `origin/main`,
- *    `origin/master`, `main` or `master` (and is not that base itself):
+ * 1. On a branch that has a merge base with a base candidate (explicit `base`,
+ *    CI target-branch variables, origin's default branch, then `origin/main`,
+ *    `main`, `master`, `develop`, `trunk`) and is not that base itself:
  *    everything since the merge base, including uncommitted work.
  * 2. Otherwise: working tree vs HEAD (plus untracked files).
  */
-export async function resolveDefaultTarget(cwd: string): Promise<ResolvedTarget> {
+export async function resolveDefaultTarget(
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+  explicitBase?: string,
+): Promise<ResolvedTarget> {
   const workingTree: ResolvedTarget = {
     target: { workingTree: true, includeUntracked: true },
     label: 'working tree',
@@ -248,7 +273,20 @@ export async function resolveDefaultTarget(cwd: string): Promise<ResolvedTarget>
 
   const branch = await currentBranch(cwd);
   const head = await git(cwd, ['rev-parse', 'HEAD']);
-  for (const base of ['origin/HEAD', 'origin/main', 'origin/master', 'main', 'master']) {
+
+  const candidates: string[] = [];
+  const named = [explicitBase, env.GITHUB_BASE_REF, env.CI_MERGE_REQUEST_TARGET_BRANCH_NAME, env.BITBUCKET_PR_DESTINATION_BRANCH];
+  for (const x of named) {
+    if (x) candidates.push(`origin/${x}`, x);
+  }
+  try {
+    candidates.push(await git(cwd, ['rev-parse', '--abbrev-ref', 'refs/remotes/origin/HEAD']));
+  } catch {
+    // no origin/HEAD
+  }
+  candidates.push('origin/main', 'origin/master', 'main', 'master', 'origin/develop', 'develop', 'origin/trunk', 'trunk');
+
+  for (const base of candidates) {
     if (base === branch) continue;
     if (!(await revExists(cwd, base))) continue;
     let mb: string;
@@ -312,6 +350,18 @@ export async function commitTimes(cwd: string, target: DiffTarget): Promise<Time
   } catch {
     const headTime = await git(cwd, ['log', '-1', '--format=%cI', 'HEAD']);
     since = new Date(headTime);
+  }
+
+  if (countRange) {
+    try {
+      const authored = (await git(cwd, ['log', '--format=%aI', countRange]))
+        .split('\n')
+        .map((l) => Date.parse(l))
+        .filter((n) => !Number.isNaN(n));
+      if (authored.length) since = new Date(Math.min(since.getTime(), ...authored));
+    } catch {
+      // keep the base time
+    }
   }
 
   let commits = 0;

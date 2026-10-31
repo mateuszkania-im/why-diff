@@ -124,7 +124,9 @@ export function renderTerminal(report: Report, opts: TerminalOptions = {}): stri
   {
     const pctStyle: Style = h.tracedPct >= 90 ? c.green : h.tracedPct >= 60 ? c.yellow : c.red;
     const parts: Seg[][] = [];
-    parts.push([[`${h.tracedPct}%`, (t) => bold(pctStyle(t))], [' of added lines trace to a prompt', id]]);
+    parts.push(h.noAddedLines
+      ? [['no added lines', dim]]
+      : [[`${h.tracedPct}%`, (t) => bold(pctStyle(t))], [' of added lines trace to a prompt', id]]);
     if (h.intentRan) {
       const n = h.unrequestedHunks;
       parts.push(

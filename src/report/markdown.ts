@@ -69,7 +69,7 @@ function build(report: Report, o: BuildOpts): string {
 
   out.push(`${H} Provenance`);
   out.push('');
-  const headlineBits = [`**${h.tracedPct}%** of added lines trace to a prompt`];
+  const headlineBits = [h.noAddedLines ? 'no added lines' : `**${h.tracedPct}%** of added lines trace to a prompt`];
   if (h.intentRan) headlineBits.push(h.unrequestedHunks === 0 ? 'nothing unrequested' : `**${h.unrequestedHunks}** ${h.unrequestedHunks === 1 ? 'hunk' : 'hunks'} nobody asked for`);
   headlineBits.push(h.touchedTests ? '**tests touched**' : 'tests untouched');
   if (h.unattributedHunks > 0) headlineBits.push(`**${h.unattributedHunks}** unattributed ${h.unattributedHunks === 1 ? 'hunk' : 'hunks'}`);
@@ -99,7 +99,7 @@ function build(report: Report, o: BuildOpts): string {
   out.push(`| Sessions | ${text(describeSessions(report))}${s.sessions === 0 ? `; ${text(NO_SESSIONS_HINT)}` : ''} |`);
   out.push(`| Prompts | ${s.prompts} |`);
   out.push(`| Hunks | ${s.hunks} in ${plural(s.files, 'file')} (+${s.addedLines} −${s.removedLines}) |`);
-  out.push(`| Agent-traced lines | ${s.agentLines} of ${s.addedLines} added (${h.tracedPct}%) |`);
+  out.push(`| Agent-traced lines | ${s.agentLines} of ${s.addedLines} added${h.noAddedLines ? '' : ` (${h.tracedPct}%)`} |`);
   out.push(`| Unattributed lines | ${s.unattributedLines}${h.unattributedHunks > 0 ? ` in ${plural(h.unattributedHunks, 'hunk')}` : ''} |`);
   if (s.intent) {
     const i = s.intent;

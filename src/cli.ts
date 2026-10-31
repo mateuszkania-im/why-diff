@@ -29,6 +29,7 @@ program
   .version(VERSION, '-V, --version')
   .description('Trace every hunk of an AI agent\'s diff back to the prompt and tool call that wrote it.')
   .argument('[range]', 'git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree')
+  .option('--base <ref>', 'branch or ref to compare against (default: auto-detected, incl. CI pull request targets)')
   .option('-w, --working-tree', 'only uncommitted changes vs HEAD')
   .addOption(new Option('-f, --format <format>', 'output format').choices(['terminal', 'md', 'html', 'json']))
   .option('--html', 'shortcut for --format html (writes .why-diff/report.html and opens it)')
@@ -55,6 +56,7 @@ program
     const classify: ClassifierKind = o.classify === false || o.classify === undefined ? 'none' : o.classify === true ? 'auto' : (o.classify as ClassifierKind);
     const report = await buildReport({
       range,
+      base: o.base as string | undefined,
       workingTree: Boolean(o.workingTree),
       harnesses,
       sessionFiles: o.session as string[] | undefined,
@@ -72,6 +74,8 @@ program
     if (outFile) {
       await mkdir(path.dirname(path.resolve(outFile)), { recursive: true });
       await writeFile(outFile, out);
+      const outDir = path.dirname(path.resolve(outFile));
+      if (path.basename(outDir) === '.why-diff') await writeFile(path.join(outDir, '.gitignore'), '*\n');
       progress(`wrote ${path.relative(process.cwd(), path.resolve(outFile)) || outFile}`);
       if (format === 'html' && o.open !== false && process.stdout.isTTY) openFile(path.resolve(outFile));
       if (format === 'html') process.stdout.write(renderReport(report, 'terminal', {}) + '\n');

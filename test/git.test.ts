@@ -4,7 +4,8 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { parseUnifiedDiff } from '../src/diff-parse.js';
-import { GitError, commitTimes, currentBranch, getDiff, hasHead, listUntracked, repoName, repoRoot, resolveDefaultTarget } from '../src/git.js';
+import { buildReport } from '../src/pipeline.js';
+import { GitError, commitTimes, currentBranch, getDiff, hasHead, isShallow, listUntracked, repoName, repoRoot, resolveDefaultTarget } from '../src/git.js';
 import { tempDir } from './helpers/claude-fixture.js';
 
 const ENV = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
@@ -120,5 +121,84 @@ describe('git helpers', () => {
     // A range that looks like an option is rejected, not handed to git (`--output=` writes files).
     await expect(getDiff(repo, `--output=${path.join(repo, 'pwned.txt')}`)).rejects.toThrow(/invalid range/);
     expect(existsSync(path.join(repo, 'pwned.txt'))).toBe(false);
+  });
+});
+
+describe('base and window resolution', () => {
+  const commitFile = (repo: string, rel: string, content: string, msg: string, env: Record<string, string> = {}): void => {
+    put(repo, rel, content);
+    execFileSync('git', ['add', '-A'], { cwd: repo, env: ENV });
+    execFileSync('git', ['commit', '-q', '-m', msg], { cwd: repo, env: { ...ENV, ...env } });
+  };
+
+  it('resolveDefaultTarget uses GITHUB_BASE_REF', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'base');
+    sh(repo, 'checkout', '-q', '-b', 'feat');
+    commitFile(repo, 'a.txt', 'one\ntwo\n', 'two');
+    sh(repo, 'checkout', '-q', '--detach', 'feat');
+    const r = await resolveDefaultTarget(repo, { GITHUB_BASE_REF: 'main' });
+    expect(['main', 'origin/main']).toContain(r.base);
+    expect(r.label).toBe(`${r.base}...HEAD + working tree`);
+    expect(r.label).toBe('main...HEAD + working tree');
+  });
+
+  it.each(['develop', 'trunk'])('resolveDefaultTarget finds develop and trunk (%s)', async (name) => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'base');
+    sh(repo, 'branch', name);
+    sh(repo, 'checkout', '-q', '-b', 'feat');
+    sh(repo, 'branch', '-D', 'main');
+    commitFile(repo, 'a.txt', 'one\ntwo\n', 'two');
+    const r = await resolveDefaultTarget(repo, {});
+    expect(r.base).toBe(name);
+  });
+
+  it("resolveDefaultTarget prefers origin's default branch", async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'base');
+    sh(repo, 'update-ref', 'refs/remotes/origin/develop', 'HEAD');
+    sh(repo, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop');
+    sh(repo, 'checkout', '-q', '-b', 'feat');
+    commitFile(repo, 'a.txt', 'one\ntwo\n', 'two');
+    const r = await resolveDefaultTarget(repo, {});
+    expect(r.base).toBe('origin/develop');
+  });
+
+  it('commitTimes uses the earliest author date in the range', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'root');
+    sh(repo, 'checkout', '-q', '-b', 'feat');
+    const twoDaysAgo = new Date(Date.now() - 2 * 86400_000).toISOString();
+    commitFile(repo, 'b.txt', 'b\n', 'A', { GIT_AUTHOR_DATE: twoDaysAgo, GIT_COMMITTER_DATE: twoDaysAgo });
+    sh(repo, 'checkout', '-q', 'main');
+    commitFile(repo, 'c.txt', 'c\n', 'main moves on');
+    sh(repo, 'checkout', '-q', 'feat');
+    execFileSync('git', ['rebase', '-q', 'main'], { cwd: repo, env: ENV });
+    const w = await commitTimes(repo, { workingTree: true, base: 'main' });
+    expect(w.since.getTime()).toBeLessThanOrEqual(Date.parse(twoDaysAgo));
+    expect(w.commits).toBe(1);
+  });
+
+  it('listUntracked ignores .why-diff/', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'base');
+    put(repo, '.why-diff/report.html', '<html>');
+    put(repo, 'x.js', 'x\n');
+    expect(await listUntracked(repo)).toEqual(['x.js']);
+  });
+
+  it('shallow clone gives a fetch-depth hint', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'base');
+    sh(repo, 'checkout', '-q', '-b', 'feat');
+    commitFile(repo, 'a.txt', 'one\ntwo\n', 'two');
+    const parent = tempDir('why-diff-shallow-');
+    dirs.push(parent);
+    const clone = path.join(parent, 'clone');
+    execFileSync('git', ['clone', '-q', '--depth', '1', '--branch', 'feat', `file://${repo}`, clone], { env: ENV });
+    expect(await isShallow(clone)).toBe(true);
+    await expect(buildReport({ cwd: clone, range: 'origin/main...HEAD', home: parent })).rejects.toThrow('fetch-depth: 0');
+    await expect(buildReport({ cwd: clone, home: parent })).rejects.toThrow('fetch-depth: 0');
   });
 });

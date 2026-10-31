@@ -4,7 +4,7 @@
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import type { Harness, Report, Session, SessionAdapter } from './types.js';
-import { getDiff, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, type DiffTarget } from './git.js';
+import { getDiff, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, SHALLOW_HINT, type DiffTarget } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
 import { attribute } from './attribute.js';
 import { labelHunks } from './labels.js';
@@ -26,6 +26,8 @@ export interface BuildOptions {
   cwd?: string;
   /** Git range like `main...HEAD`, a commit, or undefined for auto (branch + working tree) */
   range?: string;
+  /** Base ref to compare the branch against (overrides CI/default-branch detection) */
+  base?: string;
   /** Only the uncommitted working tree vs HEAD */
   workingTree?: boolean;
   /** Harnesses to read; default all */
@@ -80,7 +82,9 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
     target = opts.range;
     rangeLabel = opts.range;
   } else {
-    const resolved = await resolveDefaultTarget(root);
+    const resolved = await resolveDefaultTarget(root, process.env, opts.base);
+    if (!resolved.base && (await isShallow(root))) throw new Error(SHALLOW_HINT);
+    if (opts.base && !resolved.base) throw new Error(`cannot compare against --base ${opts.base}: ref not found or no commits beyond it`);
     target = resolved.target;
     rangeLabel = resolved.label;
   }

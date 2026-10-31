@@ -18,7 +18,7 @@ export function renderHtml(report: Report): string {
   const title = `${report.repo.name} · ${report.range} · why-diff`;
   const payload = safeJson({ report, hash });
   const summaryLine = [
-    `${h.tracedPct}% of added lines trace to a prompt`,
+    h.noAddedLines ? 'no added lines' : `${h.tracedPct}% of added lines trace to a prompt`,
     h.intentRan ? `${plural(h.unrequestedHunks, 'hunk')} nobody asked for` : null,
     h.touchedTests ? 'tests touched' : 'tests untouched',
     `${plural(s.hunks, 'hunk')} in ${plural(s.files, 'file')}`,
@@ -479,9 +479,10 @@ const APP_JS = `
     inner.appendChild(el('div', { class: 'brand-row' }, brand, crumbs, el('div', { class: 'top-actions' }, themeBtn, helpBtn)));
 
     // stats
-    var tone = tracedPct >= 90 ? 'ok' : tracedPct >= 60 ? 'warn' : 'risk';
+    var noAdded = S.addedLines === 0;
+    var tone = noAdded ? 'ok' : tracedPct >= 90 ? 'ok' : tracedPct >= 60 ? 'warn' : 'risk';
     var stats = el('div', { class: 'stats', role: 'group', 'aria-label': 'Headline numbers' });
-    stats.appendChild(stat('Agent-traced', tracedPct + '%', S.agentLines + ' of ' + S.addedLines + ' added lines explained by an agent edit', tone, tracedPct));
+    stats.appendChild(stat('Agent-traced', noAdded ? 'n/a' : tracedPct + '%', S.agentLines + ' of ' + S.addedLines + ' added lines explained by an agent edit', tone, tracedPct));
     if (intentRan) {
       var classified = allHunks.filter(function (a) { return a.intent; }).length;
       stats.appendChild(stat('Unrequested', String(verdictCounts.unrequested), (verdictCounts.unrequested === 0 ? 'nothing the prompts did not ask for' : plural(verdictCounts.unrequested, 'hunk') + ' nobody asked for') + ' \\u00b7 ' + classified + ' of ' + allHunks.length + ' classified', verdictCounts.unrequested > 0 ? 'risk' : 'ok'));

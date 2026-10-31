@@ -147,6 +147,8 @@ export function isRisky(h: AttributedHunk): boolean {
 export interface Headline {
   /** 0..100, share of added lines explained by an agent edit */
   tracedPct: number;
+  /** true when the diff adds no lines, so tracedPct is meaningless */
+  noAddedLines: boolean;
   unrequestedHunks: number;
   /** undefined when the intent classifier did not run */
   intentRan: boolean;
@@ -161,7 +163,7 @@ export interface Headline {
 
 export function headline(report: Report): Headline {
   const s = report.summary;
-  const tracedPct = s.addedLines > 0 ? Math.round((s.agentLines / s.addedLines) * 100) : 100;
+  const tracedPct = s.addedLines > 0 ? Math.round((s.agentLines / s.addedLines) * 100) : 0;
   const intentRan = Boolean(s.intent) || report.hunks.some((h) => h.intent);
   const unrequestedHunks = s.intent?.unrequested ?? report.hunks.filter((h) => h.intent?.verdict === 'unrequested').length;
   const unattributedHunks = report.hunks.filter((h) => !h.prompt || h.match === 'none').length;
@@ -173,7 +175,7 @@ export function headline(report: Report): Headline {
   }
   const harnesses = [...new Set(report.sessions.map((x) => x.harness))];
   const classifierModel = report.hunks.find((h) => h.intent)?.intent?.model;
-  const out: Headline = { tracedPct, unrequestedHunks, intentRan, unattributedHunks, riskLabels, warnLabels, touchedTests: s.touchedTests, harnesses };
+  const out: Headline = { tracedPct, noAddedLines: s.addedLines === 0, unrequestedHunks, intentRan, unattributedHunks, riskLabels, warnLabels, touchedTests: s.touchedTests, harnesses };
   if (classifierModel) out.classifierModel = classifierModel;
   return out;
 }
