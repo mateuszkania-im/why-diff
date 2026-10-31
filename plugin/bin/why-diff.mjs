@@ -2631,11 +2631,11 @@ import { spawn as spawn2 } from "node:child_process";
 // src/pipeline.ts
 import os5 from "node:os";
 import path10 from "node:path";
-import { readFile as readFile6 } from "node:fs/promises";
+import { lstat as lstat2, readFile as readFile6 } from "node:fs/promises";
 
 // src/git.ts
 import { execFile } from "node:child_process";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { lstat, readFile, readlink, realpath } from "node:fs/promises";
 import path2 from "node:path";
 import { promisify } from "node:util";
 var execFileAsync = promisify(execFile), GitError = class extends Error {
@@ -2747,11 +2747,15 @@ async function isShallow(cwd) {
 }
 var SHALLOW_HINT = "this is a shallow clone; fetch full history (actions/checkout: fetch-depth: 0)";
 async function syntheticAddedFileDiff(root, rel) {
-  let abs = path2.join(root, rel), buf;
+  let abs = path2.join(root, rel), buf, mode = "100644";
   try {
-    let st = await stat(abs);
-    if (!st.isFile() || st.size > MAX_UNTRACKED_BYTES) return null;
-    buf = await readFile(abs);
+    let st = await lstat(abs);
+    if (st.isSymbolicLink())
+      buf = Buffer.from(await readlink(abs, { encoding: "buffer" })), mode = "120000";
+    else {
+      if (!st.isFile() || st.size > MAX_UNTRACKED_BYTES) return null;
+      buf = await readFile(abs);
+    }
   } catch {
     return null;
   }
@@ -2764,7 +2768,7 @@ Binary files /dev/null and ${side} differ
 `;
   }
   let content = buf.toString("utf8"), oldSide = quotePathIfNeeded(`a/${rel}`), newSide = quotePathIfNeeded(`b/${rel}`), header = `diff --git ${oldSide} ${newSide}
-new file mode 100644
+new file mode ${mode}
 index 0000000..0000000
 --- /dev/null
 +++ ${newSide}
@@ -7660,8 +7664,8 @@ async function loadConfigTexts(root, target, files) {
   for (let rel of files)
     if (needsFileText(rel))
       try {
-        let text2 = rev === null ? await readFile6(path10.join(root, rel), "utf8") : await git(root, ["show", `${rev}:${rel}`], { trim: !1 });
-        text2.length <= FILE_TEXT_CAP && out.set(rel, text2);
+        let text2 = rev === null ? (await lstat2(path10.join(root, rel))).isSymbolicLink() ? null : await readFile6(path10.join(root, rel), "utf8") : await git(root, ["show", `${rev}:${rel}`], { trim: !1 });
+        text2 !== null && text2.length <= FILE_TEXT_CAP && out.set(rel, text2);
       } catch {
       }
   return out;
@@ -9026,7 +9030,7 @@ function renderReport(report, format, opts = {}) {
 
 // src/guard.ts
 import { createHash as createHash2, randomBytes } from "node:crypto";
-import { lstat, mkdir as mkdir2, readFile as readFile7, rename as rename2, rm, writeFile as writeFile2 } from "node:fs/promises";
+import { lstat as lstat3, mkdir as mkdir2, readFile as readFile7, rename as rename2, rm, writeFile as writeFile2 } from "node:fs/promises";
 import path11 from "node:path";
 var DEFAULT_BLOCK_ON = ["test-skip-added", "tests-disabled", "assertion-removed", "secret-like", "ci-changed", "protected-path"], NO_BLOCK = { block: !1, hits: [] };
 async function runGuard(payload, opts) {
@@ -9151,7 +9155,7 @@ async function acquireLock(lock, opts = {}) {
     }
     let info;
     try {
-      info = await lstat(lock);
+      info = await lstat3(lock);
     } catch (err) {
       if (err.code !== "ENOENT") return null;
       await pause();

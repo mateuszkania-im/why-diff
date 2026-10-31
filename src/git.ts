@@ -7,7 +7,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { readFile, realpath, stat } from 'node:fs/promises';
+import { lstat, readFile, readlink, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
@@ -247,10 +247,18 @@ export const SHALLOW_HINT = 'this is a shallow clone; fetch full history (action
 async function syntheticAddedFileDiff(root: string, rel: string): Promise<string | null> {
   const abs = path.join(root, rel);
   let buf: Buffer;
+  let mode = '100644';
   try {
-    const st = await stat(abs);
-    if (!st.isFile() || st.size > MAX_UNTRACKED_BYTES) return null;
-    buf = await readFile(abs);
+    // lstat: a symlink is shown as git shows it (its target text, mode 120000); what it points at
+    // (possibly outside the repo) is never read.
+    const st = await lstat(abs);
+    if (st.isSymbolicLink()) {
+      buf = Buffer.from(await readlink(abs, { encoding: 'buffer' }));
+      mode = '120000';
+    } else {
+      if (!st.isFile() || st.size > MAX_UNTRACKED_BYTES) return null;
+      buf = await readFile(abs);
+    }
   } catch {
     return null;
   }
@@ -262,7 +270,7 @@ async function syntheticAddedFileDiff(root: string, rel: string): Promise<string
   // git quotes the whole prefixed path: `"a/weird \"name\".txt"`.
   const oldSide = quotePathIfNeeded(`a/${rel}`);
   const newSide = quotePathIfNeeded(`b/${rel}`);
-  const header = `diff --git ${oldSide} ${newSide}\nnew file mode 100644\nindex 0000000..0000000\n--- /dev/null\n+++ ${newSide}\n`;
+  const header = `diff --git ${oldSide} ${newSide}\nnew file mode ${mode}\nindex 0000000..0000000\n--- /dev/null\n+++ ${newSide}\n`;
   if (content.length === 0) return header;
   const endsWithNewline = content.endsWith('\n');
   const lines = (endsWithNewline ? content.slice(0, -1) : content).split('\n');

@@ -1,6 +1,6 @@
 import { realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -391,6 +391,32 @@ describe('base and window resolution', () => {
     expect(report.hunks).toHaveLength(1);
     expect(report.hunks[0]?.match).toBe('exact');
     expect(report.hunks[0]?.prompt?.text).toContain('create a.js');
+  });
+});
+
+describe('untracked symlinks', () => {
+  it('shows an untracked symlink as git does (its target, mode 120000) and never reads what it points at', async () => {
+    const repo = freshRepo();
+    put(repo, 'base.txt', 'base\n');
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-q', '-m', 'base');
+    const outside = tempDir('why-diff-outside-');
+    dirs.push(outside);
+    writeFileSync(path.join(outside, 'secret.txt'), 'TOP SECRET CONTENT\n');
+    symlinkSync(path.join(outside, 'secret.txt'), path.join(repo, 'leak.txt'));
+    symlinkSync(path.join(outside, 'missing.txt'), path.join(repo, 'dangling.txt'));
+    const diff = await getDiff(repo, { workingTree: true });
+    expect(diff).not.toContain('TOP SECRET');
+    const hunks = parseUnifiedDiff(diff);
+    const leak = hunks.find((h) => h.file === 'leak.txt');
+    expect(leak?.status).toBe('added');
+    expect(leak?.lines.map((l) => l.text)).toEqual([path.join(outside, 'secret.txt')]);
+    expect(diff).toContain('new file mode 120000');
+    expect(hunks.find((h) => h.file === 'dangling.txt')?.lines.map((l) => l.text)).toEqual([path.join(outside, 'missing.txt')]);
+    // Same lines as git's own view of the link.
+    sh(repo, 'add', '-N', 'leak.txt');
+    const own = parseUnifiedDiff(sh(repo, 'diff', '--', 'leak.txt') + '\n');
+    expect(own[0]?.lines.map((l) => l.text)).toEqual(leak?.lines.map((l) => l.text));
   });
 });
 

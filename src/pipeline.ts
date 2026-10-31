@@ -3,7 +3,7 @@
  */
 import os from 'node:os';
 import path from 'node:path';
-import { readFile } from 'node:fs/promises';
+import { lstat, readFile } from 'node:fs/promises';
 import type { Harness, Hunk, Report, Session, SessionAdapter } from './types.js';
 import { getDiff, git, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
@@ -274,10 +274,11 @@ async function loadConfigTexts(root: string, target: DiffTarget, files: string[]
   for (const rel of files) {
     if (!needsFileText(rel)) continue;
     try {
+      // A symlink on disk is never followed (it may point outside the repo).
       const text = rev === null
-        ? await readFile(path.join(root, rel), 'utf8')
+        ? ((await lstat(path.join(root, rel))).isSymbolicLink() ? null : await readFile(path.join(root, rel), 'utf8'))
         : await git(root, ['show', `${rev}:${rel}`], { trim: false });
-      if (text.length <= FILE_TEXT_CAP) out.set(rel, text);
+      if (text !== null && text.length <= FILE_TEXT_CAP) out.set(rel, text);
     } catch { /* absent on that side */ }
   }
   return out;
