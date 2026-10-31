@@ -19,7 +19,19 @@ body="$RUNNER_TEMP/why-diff-comment.md"
 # Only a comment written by this token's identity counts, so a marker planted by
 # someone else is never edited. GITHUB_TOKEN cannot call /user; a PAT can.
 login='github-actions[bot]'
-if [ -n "${COMMENT_AUTHOR:-}" ] && [[ "$COMMENT_AUTHOR" =~ ^[A-Za-z0-9-]+(\[bot\])?$ ]]; then
+author_ok=false
+if [ -n "${COMMENT_AUTHOR:-}" ]; then
+  if [[ "$COMMENT_AUTHOR" =~ ^[A-Za-z0-9-]+(\[bot\])?$ ]]; then
+    author_ok=true
+  else
+    # Workflow-command escaping, so the value cannot start a command of its own.
+    shown=${COMMENT_AUTHOR//%/%25}
+    shown=${shown//$'\r'/%0D}
+    shown=${shown//$'\n'/%0A}
+    echo "::warning::invalid comment-author \"$shown\", using the default"
+  fi
+fi
+if [ "$author_ok" = true ]; then
   login="$COMMENT_AUTHOR"
 elif me=$(gh api user --jq .login 2>/dev/null) && [[ "$me" =~ ^[A-Za-z0-9-]+(\[bot\])?$ ]]; then
   login="$me"

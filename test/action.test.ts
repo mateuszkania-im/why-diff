@@ -138,6 +138,26 @@ describe.skipIf(!hasJq)('action comment script', () => {
     expect(writes[0]?.args).toContain('repos/acme/app/issues/comments/9');
   });
 
+  it('warns about an invalid COMMENT_AUTHOR and falls back to the default identity', () => {
+    comments([
+      { id: 10, login: 'github-actions[bot]', body: `${MARKER}\nours` },
+      { id: 11, login: 'x"y', body: `${MARKER}\nnot ours` },
+    ]);
+    const r = run({ COMMENT_AUTHOR: 'x"y' });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('::warning::invalid comment-author "x"y", using the default');
+    const writes = r.calls.filter((c) => c.args.includes('PATCH') || c.args.includes('POST'));
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.args).toContain('repos/acme/app/issues/comments/10');
+  });
+
+  it('escapes a multi-line COMMENT_AUTHOR so it cannot inject a workflow command', () => {
+    const r = run({ COMMENT_AUTHOR: 'a\n::error::boom%' });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('::warning::invalid comment-author "a%0A::error::boom%25", using the default');
+    expect(r.stdout.split('\n').some((l) => l.startsWith('::error::'))).toBe(false);
+  });
+
   it('a failing write is a warning, not a failed step', () => {
     const r = run({ GH_STUB_WRITE_FAIL: '1' });
     expect(r.status).toBe(0);

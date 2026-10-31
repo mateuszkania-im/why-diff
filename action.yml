@@ -34,7 +34,7 @@ inputs:
   comment-author:
     description: >-
       Login of the identity that owns the sticky comment (for example `my-app[bot]`), used to find
-      the comment to update. Empty: the token's own login when `gh api user` works, else github-actions[bot].
+      the comment to update. Empty: the token's own login when `gh api user` works, else github-actions[bot]. An invalid login is ignored with a warning.
     required: false
     default: ''
 

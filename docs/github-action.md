@@ -56,7 +56,7 @@ no `npm install` step.
 | `comment` | `'true'` | Post or update the sticky comment. Set `'false'` to only write the job summary. |
 | `base` | `${{ github.base_ref }}` | Branch the PR targets. why-diff compares `origin/<base>...HEAD`. |
 | `token` | `${{ github.token }}` | Token used to post the comment (becomes `GH_TOKEN`). Pass a personal access token or a GitHub App token to post as another identity. |
-| `comment-author` | `''` | Login that owns the sticky comment, for example `my-app[bot]`. Empty: the token's own login when `gh api user` works, else `github-actions[bot]`. |
+| `comment-author` | `''` | Login that owns the sticky comment, for example `my-app[bot]`. Empty: the token's own login when `gh api user` works, else `github-actions[bot]`. An invalid login is ignored with a warning and the default is used. |
 
 ## Outputs
 
