@@ -4,10 +4,10 @@
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import type { Harness, Report, Session, SessionAdapter } from './types.js';
-import { getDiff, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
+import { getDiff, git, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
 import { attribute } from './attribute.js';
-import { labelHunks } from './labels.js';
+import { labelHunks, needsFileText } from './labels.js';
 import { contributingSessionIds, summarize } from './summary.js';
 import { compactHunks, editTable } from './compact.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
@@ -132,7 +132,8 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
 
   const prompts = sessions.flatMap((s) => s.prompts);
   let attributed = attribute(hunks, sessions, root, { since, extraRoots });
-  attributed = labelHunks(attributed, { prompts, repoRoot: root });
+  const texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== 'deleted').map((h) => h.file))]);
+  attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p) });
 
   const kind = opts.classify ?? 'none';
   if (kind !== 'none' && attributed.length) {
@@ -169,4 +170,33 @@ function guessAdapter(file: string): SessionAdapter {
   if (file.includes('.codex') || /rollout-.*\.jsonl$/.test(file)) return codexAdapter;
   if (file.includes('opencode')) return opencodeAdapter;
   return claudeCodeAdapter;
+}
+
+const FILE_TEXT_CAP = 512 * 1024;
+
+/**
+ * Post-image text of the runner-config files in the diff (vitest/jest/pytest
+ * config, package.json, CI workflows), so labels can see the keys around a
+ * change. Working-tree targets and single-revision ranges read the disk;
+ * `a..b` / `a...b` ranges read `b` (default HEAD) from git. Best effort:
+ * unreadable or oversized files are simply absent.
+ */
+async function loadConfigTexts(root: string, target: DiffTarget, files: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  let rev: string | null = null;
+  if (typeof target === 'string') {
+    const m = /^(?:.*?)\.\.\.?(.*)$/.exec(target);
+    if (m) rev = m[1] || 'HEAD';
+    if (rev?.startsWith('-')) return out;
+  }
+  for (const rel of files) {
+    if (!needsFileText(rel)) continue;
+    try {
+      const text = rev === null
+        ? await readFile(path.join(root, rel), 'utf8')
+        : await git(root, ['show', `${rev}:${rel}`], { trim: false });
+      if (text.length <= FILE_TEXT_CAP) out.set(rel, text);
+    } catch { /* absent on that side */ }
+  }
+  return out;
 }

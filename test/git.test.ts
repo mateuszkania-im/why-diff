@@ -325,5 +325,22 @@ describe('tests-disabled end to end', () => {
     expect(h?.hunk.status).toBe('deleted');
     expect(h?.labels.map((l) => l.kind)).toEqual(expect.arrayContaining(['tests-disabled', 'test-modified']));
   });
+
+  it('flags a vitest test.exclude added far below the test key (full file read from the working tree)', async () => {
+    const repo = freshRepo();
+    const cfg = (extra: string): string => [
+      "import { defineConfig } from 'vitest/config';", 'export default defineConfig({', '  test: {', "    environment: 'node',", '    globals: true,',
+      "    include: ['src/**/*.ts'],", "    setupFiles: ['./setup.ts'],", '    retry: 1,', extra, "    reporters: ['default'],", '    testTimeout: 5000,', '    hookTimeout: 5000,', '  },', '});', '',
+    ].join('\n');
+    put(repo, 'vitest.config.ts', cfg("    bail: 1,"));
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-q', '-m', 'init');
+    put(repo, 'vitest.config.ts', cfg("    bail: 1,\n    exclude: ['**/*.test.ts'],"));
+    const home = tempDir('why-diff-home-');
+    dirs.push(home);
+    const report = await buildReport({ cwd: repo, workingTree: true, home, harnesses: ['claude-code'] });
+    const h = report.hunks.find((x) => x.hunk.file === 'vitest.config.ts');
+    expect(h?.labels.map((l) => l.kind)).toContain('tests-disabled');
+  });
 });
 

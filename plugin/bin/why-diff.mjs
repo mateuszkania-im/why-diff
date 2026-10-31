@@ -3650,6 +3650,10 @@ function redactReport(report, mode) {
 
 // src/labels.ts
 var DETAIL_MAX = 120;
+function needsFileText(path12) {
+  let p = normalisePath(path12), base = posix.basename(p);
+  return RUNNER_CONFIG.test(base) || PYTEST_CONFIG.test(base) || isCiFile(p);
+}
 function labelHunks(hunks, ctx) {
   let scope = buildScopeIndex(hunks, ctx);
   return hunks.map((h) => {
@@ -4020,8 +4024,34 @@ function detectTestsDisabled(path12, hunk, lines, scope) {
       (suffixed || markerDropped) && hits.push(`Renames test file ${oldBase} to ${base}`);
     }
   }
-  let added = new Set(netAdded(lines));
-  return RUNNER_CONFIG.test(base) && hits.push(...detectConfigIgnores(lines, added, base)), base === "package.json" && hits.push(...detectTestScripts(lines, added)), PYTEST_CONFIG.test(base) && hits.push(...detectPytestOptions(lines, added, base)), isCiFile(path12) && hits.push(...detectCiSwallowedTests(lines, added)), uniq(hits);
+  let added = new Set(netAdded(lines)), full = fullFileView(path12, lines, added, scope), wide = full?.lines ?? lines, wideAdded = full?.added ?? added;
+  return RUNNER_CONFIG.test(base) && hits.push(...detectConfigIgnores(wide, wideAdded, base)), base === "package.json" && hits.push(...detectTestScripts(lines, added)), PYTEST_CONFIG.test(base) && hits.push(...detectPytestOptions(wide, wideAdded, base)), isCiFile(path12) && hits.push(...detectCiSwallowedTests(wide, wideAdded)), uniq(hits);
+}
+function fullFileView(path12, lines, added, scope) {
+  if (!scope.fileText || !needsFileText(path12)) return null;
+  let text2;
+  try {
+    text2 = scope.fileText(path12);
+  } catch {
+    return null;
+  }
+  if (text2 === void 0) return null;
+  let rows = text2.split(`
+`).map((t) => t.replace(/\r$/, "")), addedNos = /* @__PURE__ */ new Set();
+  for (let l of added) {
+    if (l.newNo === void 0 || rows[l.newNo - 1] !== l.text.replace(/\r$/, "")) return null;
+    addedNos.add(l.newNo);
+  }
+  if (addedNos.size === 0) return null;
+  let out = [], wideAdded = /* @__PURE__ */ new Set();
+  return rows.forEach((t, i) => {
+    let n = i + 1;
+    if (addedNos.has(n)) {
+      let l = { type: "add", text: t, newNo: n };
+      out.push(l), wideAdded.add(l);
+    } else
+      out.push({ type: "ctx", text: t, oldNo: n, newNo: n });
+  }), { lines: out, added: wideAdded };
 }
 function goneSourceStems(hunks, repoRoot2) {
   let out = /* @__PURE__ */ new Set();
@@ -4475,7 +4505,8 @@ function buildScopeIndex(hunks, ctx) {
     promptText: ctx.prompts.map((p) => p.text).join(`
 `).toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
-    goneSourceStems: goneSourceStems(hunks, ctx.repoRoot)
+    goneSourceStems: goneSourceStems(hunks, ctx.repoRoot),
+    ...ctx.fileText ? { fileText: ctx.fileText } : {}
   };
 }
 function mentioned(token, text2) {
@@ -7172,8 +7203,8 @@ async function buildReport(opts = {}) {
     sessions.length === 0 && hunks.length > 0 && !opts.scanAll && log("no agent sessions found for this repo in the time window; if the agent ran from another folder, try --scan-all (or --since / --session)");
   }
   log(`found ${sessions.length} agent session(s), ${hunks.length} hunk(s)`);
-  let prompts = sessions.flatMap((s) => s.prompts), attributed = attribute(hunks, sessions, root, { since, extraRoots });
-  attributed = labelHunks(attributed, { prompts, repoRoot: root });
+  let prompts = sessions.flatMap((s) => s.prompts), attributed = attribute(hunks, sessions, root, { since, extraRoots }), texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== "deleted").map((h) => h.file))]);
+  attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p) });
   let kind = opts.classify ?? "none";
   if (kind !== "none" && attributed.length) {
     let classifier = createClassifier(kind, { model: opts.model, onProgress: (done, total) => log(`intent check ${done}/${total} batches`) });
@@ -7196,6 +7227,22 @@ async function buildReport(opts = {}) {
 }
 function guessAdapter(file) {
   return file.includes(".codex") || /rollout-.*\.jsonl$/.test(file) ? codexAdapter : file.includes("opencode") ? opencodeAdapter : claudeCodeAdapter;
+}
+var FILE_TEXT_CAP = 512 * 1024;
+async function loadConfigTexts(root, target, files) {
+  let out = /* @__PURE__ */ new Map(), rev = null;
+  if (typeof target == "string") {
+    let m = /^(?:.*?)\.\.\.?(.*)$/.exec(target);
+    if (m && (rev = m[1] || "HEAD"), rev?.startsWith("-")) return out;
+  }
+  for (let rel of files)
+    if (needsFileText(rel))
+      try {
+        let text2 = rev === null ? await readFile5(path9.join(root, rel), "utf8") : await git(root, ["show", `${rev}:${rel}`], { trim: !1 });
+        text2.length <= FILE_TEXT_CAP && out.set(rel, text2);
+      } catch {
+      }
+  return out;
 }
 
 // src/report/shared.ts

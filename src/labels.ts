@@ -19,6 +19,13 @@ import { SECRET_RULES } from './redact.js';
 export interface LabelContext {
   prompts: Prompt[];
   repoRoot: string;
+  /**
+   * Post-image text of a repo-relative path, supplied for runner-config files
+   * only (see {@link needsFileText}). Lets the tests-disabled rule resolve the
+   * keys around a changed line even when the hunk shows too little context.
+   * Absent in pure/unit use: the rule then works from the hunk alone.
+   */
+  fileText?: (repoRelPath: string) => string | undefined;
 }
 
 /** Hard cap for `Label.detail`. */
@@ -27,6 +34,13 @@ const DETAIL_MAX = 120;
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/** True for files whose full text improves the tests-disabled rule (runner config, pytest config, CI workflows). */
+export function needsFileText(path: string): boolean {
+  const p = normalisePath(path);
+  const base = posix.basename(p);
+  return RUNNER_CONFIG.test(base) || PYTEST_CONFIG.test(base) || isCiFile(p);
+}
 
 /**
  * Attach deterministic labels to every hunk.
@@ -617,11 +631,47 @@ function detectTestsDisabled(path: string, hunk: AttributedHunk['hunk'], lines: 
   }
 
   const added = new Set(netAdded(lines));
-  if (RUNNER_CONFIG.test(base)) hits.push(...detectConfigIgnores(lines, added, base));
+  // Prefer the whole file: the keys around a changed line are often outside the hunk.
+  const full = fullFileView(path, lines, added, scope);
+  const wide = full?.lines ?? lines;
+  const wideAdded = full?.added ?? added;
+  if (RUNNER_CONFIG.test(base)) hits.push(...detectConfigIgnores(wide, wideAdded, base));
   if (base === 'package.json') hits.push(...detectTestScripts(lines, added));
-  if (PYTEST_CONFIG.test(base)) hits.push(...detectPytestOptions(lines, added, base));
-  if (isCiFile(path)) hits.push(...detectCiSwallowedTests(lines, added));
+  if (PYTEST_CONFIG.test(base)) hits.push(...detectPytestOptions(wide, wideAdded, base));
+  if (isCiFile(path)) hits.push(...detectCiSwallowedTests(wide, wideAdded));
   return uniq(hits);
+}
+
+/**
+ * The post-image as diff lines (all context except the hunk's net-added lines,
+ * matched by line number). Null when no text is available or it does not match
+ * the hunk, in which case callers use the hunk alone.
+ */
+function fullFileView(path: string, lines: DiffLine[], added: Set<DiffLine>, scope: ScopeIndex): { lines: DiffLine[]; added: Set<DiffLine> } | null {
+  if (!scope.fileText || !needsFileText(path)) return null;
+  let text: string | undefined;
+  try { text = scope.fileText(path); } catch { return null; }
+  if (text === undefined) return null;
+  const rows = text.split('\n').map((t) => t.replace(/\r$/, ''));
+  const addedNos = new Set<number>();
+  for (const l of added) {
+    if (l.newNo === undefined || rows[l.newNo - 1] !== l.text.replace(/\r$/, '')) return null;
+    addedNos.add(l.newNo);
+  }
+  if (addedNos.size === 0) return null;
+  const out: DiffLine[] = [];
+  const wideAdded = new Set<DiffLine>();
+  rows.forEach((t, i) => {
+    const n = i + 1;
+    if (addedNos.has(n)) {
+      const l: DiffLine = { type: 'add', text: t, newNo: n };
+      out.push(l);
+      wideAdded.add(l);
+    } else {
+      out.push({ type: 'ctx', text: t, oldNo: n, newNo: n });
+    }
+  });
+  return { lines: out, added: wideAdded };
 }
 
 /** Stems of non-test source files deleted or renamed away anywhere in the diff. */
@@ -1409,6 +1459,7 @@ interface ScopeIndex {
   agentFiles: string[];
   /** Stems of source files deleted or renamed away anywhere in the diff. */
   goneSourceStems: Set<string>;
+  fileText?: LabelContext['fileText'];
 }
 
 function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex {
@@ -1416,6 +1467,7 @@ function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex
     promptText: ctx.prompts.map((p) => p.text).join('\n').toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
     goneSourceStems: goneSourceStems(hunks, ctx.repoRoot),
+    ...(ctx.fileText ? { fileText: ctx.fileText } : {}),
   };
 }
 

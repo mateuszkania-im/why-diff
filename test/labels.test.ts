@@ -866,3 +866,75 @@ describe('tests-disabled', () => {
     expect(t?.labels.map((l) => l.kind)).toContain('tests-disabled');
   });
 });
+
+describe('tests-disabled with the full post-image (fileText)', () => {
+  /** Hunk whose lines carry real new-file line numbers, starting at `startNew`. */
+  function hunkAt(file: string, startNew: number, lines: string[]): AttributedHunk {
+    const h = hunk(file, []);
+    let n = startNew;
+    h.hunk = {
+      ...h.hunk,
+      newStart: startNew,
+      lines: lines.map((raw) => {
+        const sign = raw.charAt(0);
+        const text = raw.slice(1);
+        return sign === '+' ? { type: 'add' as const, text, newNo: n++ } : { type: 'ctx' as const, text, oldNo: n, newNo: n++ };
+      }),
+    };
+    return h;
+  }
+  const kindsWith = (h: AttributedHunk, files: Record<string, string>): LabelKind[] =>
+    labelHunks([h], { ...ctx, fileText: (p) => files[p] })[0]?.labels.map((l) => l.kind) ?? [];
+
+  const vitest = (scope: string): string => [
+    "import { defineConfig } from 'vitest/config';", //1
+    'export default defineConfig({', //2
+    `  ${scope}: {`, //3
+    "    environment: 'node',", //4
+    '    globals: true,', //5
+    "    include: ['src/**/*.ts'],", //6
+    "    setupFiles: ['./setup.ts'],", //7
+    '    retry: 1,', //8
+    "    exclude: ['**/*.test.ts'],", //9
+    "    reporters: ['default'],", //10
+    '    testTimeout: 5000,', //11
+    '    hookTimeout: 5000,', //12
+    '  },', //13
+    '});', //14
+  ].join('\n');
+  const vitestHunk = (): AttributedHunk => hunkAt('vitest.config.ts', 6, [
+    "     include: ['src/**/*.ts'],", "     setupFiles: ['./setup.ts'],", '     retry: 1,',
+    "+    exclude: ['**/*.test.ts'],",
+    "     reporters: ['default'],", '     testTimeout: 5000,', '     hookTimeout: 5000,',
+  ].map((l) => (l.startsWith('+') ? l : l)));
+
+  it('flags a test.exclude whose test: key is outside the hunk', () => {
+    expect(kindsWith(vitestHunk(), { 'vitest.config.ts': vitest('test') })).toContain('tests-disabled');
+  });
+
+  it('does not flag the same shape under coverage', () => {
+    expect(kindsWith(vitestHunk(), { 'vitest.config.ts': vitest('coverage') })).not.toContain('tests-disabled');
+  });
+
+  it('stays quiet without fileText (hunk only)', () => {
+    expect(kinds(vitestHunk())).not.toContain('tests-disabled');
+  });
+
+  it('falls back to the hunk when the file text does not match the hunk', () => {
+    expect(kindsWith(vitestHunk(), { 'vitest.config.ts': 'export default {};' })).not.toContain('tests-disabled');
+  });
+
+  it('flags pytest addopts when the hunk starts mid-continuation', () => {
+    const text = ['[pytest]', 'testpaths = tests', 'addopts =', '    -q', '    --strict-markers', '    -k "not network"', '    --tb=short', 'markers =', '    slow'].join('\n');
+    const h = hunkAt('pytest.ini', 4, ['     -q', '     --strict-markers', '+    -k "not network"', '     --tb=short', ' markers =']);
+    expect(kindsWith(h, { 'pytest.ini': text })).toContain('tests-disabled');
+    expect(kinds(h)).not.toContain('tests-disabled');
+  });
+
+  it('bounds a CI step to its job using the full file', () => {
+    const text = ['jobs:', '  test:', '    steps:', '      - uses: actions/checkout@v4', '      - name: Run', '        run: npm test', '        env:', '          A: 1', '          B: 2', '        continue-on-error: true'].join('\n');
+    const h = hunkAt('.github/workflows/ci.yml', 8, ['           A: 1', '           B: 2', '+        continue-on-error: true']);
+    expect(kindsWith(h, { '.github/workflows/ci.yml': text })).toContain('tests-disabled');
+  });
+});
+
