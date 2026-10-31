@@ -89,10 +89,23 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
     keepAgentIgnored: true,
   });
 
+  // Paths the session's own shell commands removed or moved away (rm, git rm, mv, git mv).
+  const removedByShell = new Set(session.edits
+    .filter((e) => !e.failed && e.kind === 'bash' && (e.bashOp === 'delete' || e.bashOp === 'move'))
+    .map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants))
+    .filter((p): p is string => Boolean(p))
+    .map((p) => p.split(path.sep).join('/')));
+
   const hits: string[] = [];
   const keys: string[] = [];
   for (const h of report.hunks) {
-    if (h.match !== 'exact' && h.match !== 'partial') continue;
+    if (h.match !== 'exact' && h.match !== 'partial') {
+      // A shell delete/rename leaves a file-only hunk with no added lines: it counts only when
+      // the session's own command explicitly targeted that path.
+      const gone = h.hunk.status === 'deleted' || h.hunk.status === 'renamed';
+      const source = h.hunk.oldFile ?? h.hunk.file;
+      if (!(h.match === 'file-only' && gone && !h.hunk.lines.some((l) => l.kind === 'add') && removedByShell.has(source))) continue;
+    }
     if (!h.editIds.length || !h.editIds.every((id) => id.startsWith(`${session.id}:`))) continue;
     for (const l of h.labels) {
       if (!blocking.has(l.kind)) continue;

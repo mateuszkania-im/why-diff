@@ -114,6 +114,40 @@ describe('runGuard', () => {
     expect(r.block).toBe(true);
   });
 
+  describe('shell deletes and renames of tests', () => {
+    const BL = new Set<LabelKind>(['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path']);
+    async function run(cmd: string | null, act: (repo: string) => void): Promise<{ block: boolean; message?: string }> {
+      const { repo, home, stateDir } = makeRepo();
+      mkdirSync(path.join(repo, 'src'), { recursive: true });
+      writeFileSync(path.join(repo, 'src', 'x.js'), 'export const x = 1;\n');
+      sh(repo, ['add', '-A']);
+      sh(repo, ['commit', '-qm', 'more'], LONG_AGO);
+      const calls: SyntheticCall[] = [{ tool: 'Edit', at: CALL_AT, input: { file_path: path.join(repo, 'src', 'x.js'), old_string: 'x = 1', new_string: 'x = 2' } }];
+      if (cmd) calls.push({ tool: 'Bash', at: CALL_AT, input: { command: cmd.replaceAll('$R', repo), description: 'x' } });
+      const transcript = writeSyntheticTranscript(home, repo, 's-sh', [{ prompt: 'tidy up', at: SESSION_AT, calls }]);
+      writeFileSync(path.join(repo, 'src', 'x.js'), 'export const x = 2;\n');
+      act(repo);
+      return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sh' }, { blocking: BL, home, stateDir });
+    }
+    it('blocks on rm of a test file', async () => {
+      const r = await run('rm $R/test/f.test.js', (repo) => rmSync(path.join(repo, 'test', 'f.test.js')));
+      expect(r.block).toBe(true);
+      expect(r.message).toContain('test/f.test.js');
+    });
+    it('blocks on git rm of a test file', async () => {
+      const r = await run('cd $R && git rm test/f.test.js', (repo) => sh(repo, ['rm', '-q', 'test/f.test.js']));
+      expect(r.block).toBe(true);
+    });
+    it('blocks on mv that disables a test file', async () => {
+      const r = await run('mv $R/test/f.test.js $R/test/f.test.js.disabled', (repo) => sh(repo, ['mv', 'test/f.test.js', 'test/f.test.js.disabled']));
+      expect(r.block).toBe(true);
+    });
+    it('does not block on a human rm with no transcript edit', async () => {
+      const r = await run(null, (repo) => rmSync(path.join(repo, 'test', 'f.test.js')));
+      expect(r.block).toBe(false);
+    });
+  });
+
   it('creates the state dir with a * .gitignore', async () => {
     const { repo, home } = makeRepo();
     const transcript = writeSyntheticTranscript(home, repo, 's-ign', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);

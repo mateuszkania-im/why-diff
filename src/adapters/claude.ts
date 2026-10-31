@@ -550,7 +550,7 @@ class SessionBuilder {
         const command = str(input.command);
         if (!command) return;
         detectBashMutations(command, call.cwd).forEach((m, n) => {
-          this.edits.push(make(n, 'bash', m.path, null, m.content ?? null, { command }));
+          this.edits.push(make(n, 'bash', m.path, null, m.content ?? null, { command, bashOp: m.op }));
         });
         return;
       }

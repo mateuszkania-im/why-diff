@@ -49,6 +49,8 @@ export interface FileEdit {
   newText: string | null;
   /** For bash: the command line */
   command?: string;
+  /** For bash: what the command did to this path (delete, move, write, ...) */
+  bashOp?: string;
   /** The assistant's own short explanation right before/with the call, if any (<= 500 chars) */
   rationale?: string;
   /** True when the tool call failed / was rejected (should not be attributed) */
