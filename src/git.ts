@@ -35,6 +35,8 @@ export interface WorkingTreeTarget {
    * "everything on this branch plus uncommitted work" in one pass.
    */
   base?: string;
+  /** Diff against this exact revision instead of HEAD / the merge base (wins over `base`). */
+  baseRev?: string;
 }
 
 /**
@@ -47,6 +49,8 @@ export type DiffTarget = string | WorkingTreeTarget;
 export interface DiffOptions {
   /** Context lines (`--unified=N`). Default 3. */
   unified?: number;
+  /** Git pathspecs limiting both the tracked diff and the untracked files (e.g. `:(literal)src/a.ts`). */
+  paths?: string[];
 }
 
 /** Output of `resolveDefaultTarget`. */
@@ -74,6 +78,8 @@ export interface TimeWindow {
 
 const MAX_BUFFER = 512 * 1024 * 1024;
 const BINARY_SNIFF_BYTES = 8000;
+/** Untracked files above this size are not diffed (build outputs, dumps, media). */
+const MAX_UNTRACKED_BYTES = 2 * 1024 * 1024;
 
 /**
  * Run git in `cwd` without a shell. Resolves with trimmed-right stdout.
@@ -173,16 +179,19 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
   }
 
   let baseRev: string;
-  if (await hasHead(cwd)) {
+  if (target.baseRev && (await hasHead(cwd))) {
+    baseRev = target.baseRev;
+  } else if (await hasHead(cwd)) {
     baseRev = target.base ? await mergeBase(cwd, target.base, 'HEAD') : 'HEAD';
   } else {
     baseRev = await emptyTree(cwd); // unborn branch: everything tracked is "added"
   }
-  let diff = await git(cwd, [...common, baseRev], { trim: false });
+  const pathspec = opts.paths?.length ? ['--', ...opts.paths] : [];
+  let diff = await git(cwd, [...common, baseRev, ...pathspec], { trim: false });
 
   if (target.includeUntracked !== false) {
     const root = await repoRoot(cwd);
-    const untracked = await listUntracked(cwd);
+    const untracked = await listUntracked(cwd, opts.paths);
     for (const rel of untracked) {
       const synthetic = await syntheticAddedFileDiff(root, rel);
       if (synthetic) diff += synthetic;
@@ -209,9 +218,9 @@ export async function mergeBase(cwd: string, a: string, b: string): Promise<stri
 }
 
 /** Untracked, non-ignored files relative to the repo root. */
-export async function listUntracked(cwd: string): Promise<string[]> {
+export async function listUntracked(cwd: string, paths?: string[]): Promise<string[]> {
   const root = await repoRoot(cwd);
-  const out = await git(root, ['ls-files', '--others', '--exclude-standard', '-z'], { trim: false });
+  const out = await git(root, ['ls-files', '--others', '--exclude-standard', '-z', ...(paths?.length ? ['--', ...paths] : [])], { trim: false });
   return out.split('\0').filter((p) => p.length > 0 && !p.startsWith('.why-diff/'));
 }
 
@@ -235,7 +244,7 @@ async function syntheticAddedFileDiff(root: string, rel: string): Promise<string
   let buf: Buffer;
   try {
     const st = await stat(abs);
-    if (!st.isFile()) return null;
+    if (!st.isFile() || st.size > MAX_UNTRACKED_BYTES) return null;
     buf = await readFile(abs);
   } catch {
     return null;
@@ -372,6 +381,8 @@ export async function commitTimes(cwd: string, target: DiffTarget): Promise<Time
       baseRev = target;
       countRange = `${target}..HEAD`;
     }
+  } else if (target.baseRev) {
+    baseRev = target.baseRev;
   } else if (target.base) {
     baseRev = await mergeBase(cwd, target.base, 'HEAD');
     countRange = `${baseRev}..HEAD`;

@@ -30,6 +30,10 @@ export interface BuildOptions {
   base?: string;
   /** Only the uncommitted working tree vs HEAD */
   workingTree?: boolean;
+  /** With `workingTree`: diff against this exact revision instead of HEAD */
+  baseRev?: string;
+  /** Git pathspecs limiting the diff to these paths (tracked and untracked) */
+  paths?: string[];
   /** Harnesses to read; default all */
   harnesses?: Harness[];
   /** Explicit transcript files (skips discovery) */
@@ -76,7 +80,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   let target: DiffTarget;
   let rangeLabel: string;
   if (opts.workingTree) {
-    target = { workingTree: true, includeUntracked: true };
+    target = { workingTree: true, includeUntracked: true, ...(opts.baseRev ? { baseRev: opts.baseRev } : {}) };
     rangeLabel = 'working tree';
   } else if (opts.range) {
     target = opts.range;
@@ -90,7 +94,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   }
 
   log(`diffing ${rangeLabel}`);
-  const hunks = parseUnifiedDiff(await getDiff(root, target));
+  const hunks = parseUnifiedDiff(await getDiff(root, target, { paths: opts.paths }));
 
   const window = await commitTimes(root, target).catch(() => undefined);
   const since = opts.since ?? (window ? new Date(new Date(window.since).getTime() - 6 * 3600_000) : undefined);

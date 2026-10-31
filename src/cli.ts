@@ -13,7 +13,8 @@ import { spawn } from 'node:child_process';
 import pc from 'picocolors';
 import { buildReport } from './pipeline.js';
 import { renderReport, isReportFormat, type ReportFormat } from './report/index.js';
-import type { Harness } from './types.js';
+import type { Harness, LabelKind } from './types.js';
+import { runGuard, type GuardPayload } from './guard.js';
 import type { ClassifierKind } from './classify/index.js';
 
 const HARNESSES: Harness[] = ['claude-code', 'codex', 'opencode'];
@@ -109,28 +110,12 @@ program
   .option('--on <kinds>', 'labels that block (comma list)', 'test-skip-added,assertion-removed,secret-like,ci-changed')
   .action(async (o: { on: string }) => {
     const raw = await readStdin();
-    let payload: { transcript_path?: string; stop_hook_active?: boolean; cwd?: string } = {};
+    let payload: GuardPayload = {};
     try { payload = raw.trim() ? JSON.parse(raw) : {}; } catch { /* not a hook payload */ }
-    if (payload.stop_hook_active) return; // already blocked once this turn: let the agent explain and stop
-    const blocking = new Set(o.on.split(',').map((s) => s.trim()));
-    let report;
-    try {
-      report = await buildReport({
-        cwd: payload.cwd ?? process.cwd(),
-        workingTree: true,
-        sessionFiles: payload.transcript_path ? [payload.transcript_path] : undefined,
-        harnesses: ['claude-code'],
-      });
-    } catch {
-      return; // never break the user's session because of why-diff itself (e.g. not a git repo)
-    }
-    const hits = report.hunks.flatMap((h) =>
-      h.match === 'none' ? [] : h.labels.filter((l) => blocking.has(l.kind)).map((l) => `- ${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`));
-    if (!hits.length) return;
-    process.stderr.write(
-      `why-diff guard: your changes in this session include risky edits:\n${hits.join('\n')}\n\n` +
-      'Before finishing: if you skipped, weakened or removed tests (or changed CI/secrets), either revert that change ' +
-      'or tell the user explicitly what you changed and why, so they can decide. Do not hide it.\n');
+    const blocking = new Set(o.on.split(',').map((s) => s.trim()).filter(Boolean)) as Set<LabelKind>;
+    const result = await runGuard(payload, { blocking });
+    if (!result.block) return;
+    process.stderr.write(result.message ?? '');
     process.exitCode = 2;
   });
 

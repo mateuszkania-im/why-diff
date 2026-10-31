@@ -298,3 +298,14 @@ describe('base and window resolution', () => {
     expect(report.hunks[0]?.prompt?.text).toContain('create a.js');
   });
 });
+
+describe('untracked size cap', () => {
+  it('skips untracked files over 2 MB but keeps small ones', async () => {
+    const dir = freshRepo();
+    put(dir, 'big.txt', 'a'.repeat(3 * 1024 * 1024));
+    put(dir, 'small.txt', 'hi\n');
+    const diff = await getDiff(dir, { workingTree: true });
+    expect(diff).toContain('small.txt');
+    expect(diff).not.toContain('big.txt');
+  });
+});

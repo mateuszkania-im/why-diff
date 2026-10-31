@@ -2455,8 +2455,8 @@ Expecting one of '${allowedValues.join("', '")}'`);
    * @param {string} [path]
    * @return {(string|null|Command)}
    */
-  executableDir(path11) {
-    return path11 === void 0 ? this._executableDir : (this._executableDir = path11, this);
+  executableDir(path12) {
+    return path12 === void 0 ? this._executableDir : (this._executableDir = path12, this);
   }
   /**
    * Return program help documentation.
@@ -2624,8 +2624,8 @@ var program = new Command();
 
 // src/cli.ts
 var import_picocolors2 = __toESM(require_picocolors(), 1);
-import { mkdir as mkdir2, writeFile as writeFile2 } from "node:fs/promises";
-import path10 from "node:path";
+import { mkdir as mkdir3, writeFile as writeFile3 } from "node:fs/promises";
+import path11 from "node:path";
 import { spawn } from "node:child_process";
 
 // src/pipeline.ts
@@ -2648,7 +2648,7 @@ var execFileAsync = promisify(execFile), GitError = class extends Error {
   args;
   stderr;
   exitCode;
-}, MAX_BUFFER = 512 * 1024 * 1024, BINARY_SNIFF_BYTES = 8e3;
+}, MAX_BUFFER = 512 * 1024 * 1024, BINARY_SNIFF_BYTES = 8e3, MAX_UNTRACKED_BYTES = 2 * 1024 * 1024;
 async function git(cwd, args, opts = {}) {
   try {
     let { stdout } = await execFileAsync("git", ["-c", "core.quotePath=false", ...args], {
@@ -2711,10 +2711,10 @@ async function getDiffUnwrapped(cwd, target, opts) {
     return git(cwd, [...common, target], { trim: !1 });
   }
   let baseRev;
-  await hasHead(cwd) ? baseRev = target.base ? await mergeBase(cwd, target.base, "HEAD") : "HEAD" : baseRev = await emptyTree(cwd);
-  let diff = await git(cwd, [...common, baseRev], { trim: !1 });
+  target.baseRev && await hasHead(cwd) ? baseRev = target.baseRev : await hasHead(cwd) ? baseRev = target.base ? await mergeBase(cwd, target.base, "HEAD") : "HEAD" : baseRev = await emptyTree(cwd);
+  let pathspec = opts.paths?.length ? ["--", ...opts.paths] : [], diff = await git(cwd, [...common, baseRev, ...pathspec], { trim: !1 });
   if (target.includeUntracked !== !1) {
-    let root = await repoRoot(cwd), untracked = await listUntracked(cwd);
+    let root = await repoRoot(cwd), untracked = await listUntracked(cwd, opts.paths);
     for (let rel of untracked) {
       let synthetic = await syntheticAddedFileDiff(root, rel);
       synthetic && (diff += synthetic);
@@ -2732,9 +2732,9 @@ async function mergeBase(cwd, a, b) {
     return git(cwd, ["rev-parse", "--verify", a]);
   }
 }
-async function listUntracked(cwd) {
+async function listUntracked(cwd, paths) {
   let root = await repoRoot(cwd);
-  return (await git(root, ["ls-files", "--others", "--exclude-standard", "-z"], { trim: !1 })).split("\0").filter((p) => p.length > 0 && !p.startsWith(".why-diff/"));
+  return (await git(root, ["ls-files", "--others", "--exclude-standard", "-z", ...paths?.length ? ["--", ...paths] : []], { trim: !1 })).split("\0").filter((p) => p.length > 0 && !p.startsWith(".why-diff/"));
 }
 async function isShallow(cwd) {
   try {
@@ -2747,7 +2747,8 @@ var SHALLOW_HINT = "this is a shallow clone; fetch full history (actions/checkou
 async function syntheticAddedFileDiff(root, rel) {
   let abs = path2.join(root, rel), buf;
   try {
-    if (!(await stat(abs)).isFile()) return null;
+    let st = await stat(abs);
+    if (!st.isFile() || st.size > MAX_UNTRACKED_BYTES) return null;
     buf = await readFile(abs);
   } catch {
     return null;
@@ -2838,7 +2839,7 @@ async function commitTimes(cwd, target) {
       let left = target.slice(0, symmetric) || "HEAD", right = target.slice(symmetric + 3) || "HEAD";
       baseRev = await mergeBase(cwd, left, right), countRange = target;
     } else twoDot !== -1 ? (baseRev = target.slice(0, twoDot) || "HEAD", countRange = target) : (baseRev = target, countRange = `${target}..HEAD`);
-  } else target.base && (baseRev = await mergeBase(cwd, target.base, "HEAD"), countRange = `${baseRev}..HEAD`);
+  } else target.baseRev ? baseRev = target.baseRev : target.base && (baseRev = await mergeBase(cwd, target.base, "HEAD"), countRange = `${baseRev}..HEAD`);
   let since;
   try {
     let stamps = (await git(cwd, ["log", "-1", "--format=%aI%n%cI", baseRev])).split(`
@@ -2910,10 +2911,10 @@ function parseUnifiedDiff(diff) {
     let hunkMatch = HUNK_HEADER.exec(line);
     if (hunkMatch) {
       if (file.binary) continue;
-      let oldStart = Number(hunkMatch[1]), oldLines = hunkMatch[2] === void 0 ? 1 : Number(hunkMatch[2]), newStart = Number(hunkMatch[3]), newLines = hunkMatch[4] === void 0 ? 1 : Number(hunkMatch[4]), path11 = displayPath(file), hunk = {
+      let oldStart = Number(hunkMatch[1]), oldLines = hunkMatch[2] === void 0 ? 1 : Number(hunkMatch[2]), newStart = Number(hunkMatch[3]), newLines = hunkMatch[4] === void 0 ? 1 : Number(hunkMatch[4]), path12 = displayPath(file), hunk = {
         id: `h${hunks.length + 1}`,
-        file: path11,
-        ...file.oldPath && file.oldPath !== path11 ? { oldFile: file.oldPath } : {},
+        file: path12,
+        ...file.oldPath && file.oldPath !== path12 ? { oldFile: file.oldPath } : {},
         status: file.status,
         oldStart,
         oldLines,
@@ -3548,41 +3549,41 @@ var DETAIL_MAX = 120;
 function labelHunks(hunks, ctx) {
   let scope = buildScopeIndex(hunks, ctx);
   return hunks.map((h) => {
-    let path11 = toRepoPath(h.hunk.file, ctx.repoRoot), fresh = computeLabels(h, path11, scope);
+    let path12 = toRepoPath(h.hunk.file, ctx.repoRoot), fresh = computeLabels(h, path12, scope);
     return { ...h, labels: mergeLabels(h.labels, fresh) };
   });
 }
-function isTestFile(path11) {
-  let p = normalisePath(path11);
+function isTestFile(path12) {
+  let p = normalisePath(path12);
   return isSnapshotFile(p) ? !1 : TEST_FILE_PATTERNS.some((re) => re.test(p));
 }
-function isLockfile(path11) {
-  return LOCKFILES.has(posix.basename(normalisePath(path11)));
+function isLockfile(path12) {
+  return LOCKFILES.has(posix.basename(normalisePath(path12)));
 }
-function computeLabels(h, path11, scope) {
+function computeLabels(h, path12, scope) {
   let out = [], agent = isAgentAttributed(h), lines = h.hunk.lines, push = (kind, severity, detail) => {
     out.push({ kind, severity, detail: clip(detail) });
   };
-  isTestFile(path11) && push(
+  isTestFile(path12) && push(
     "test-modified",
     agent ? "risk" : "info",
     agent ? "Agent changed a test file" : "Test file changed (not by the agent)"
   );
-  let skips = detectTestSkips(path11, lines);
+  let skips = detectTestSkips(path12, lines);
   skips.length > 0 && push("test-skip-added", "risk", `Adds ${listOf(skips)}`);
-  let assertions = detectAssertionChanges(path11, lines);
-  assertions.length > 0 && push("assertion-removed", "risk", assertions.join("; ")), isSnapshotFile(path11) && push("snapshot-updated", "warn", "Snapshot file changed");
-  let deps = detectNewDependencies(path11, lines);
-  deps.length > 0 && push("dependency-added", "warn", `New ${deps.length === 1 ? "dependency" : "dependencies"}: ${listOf(deps)}`), isLockfile(path11) && push("lockfile", "info", `Lockfile churn (${posix.basename(path11)})`);
-  let config = detectConfigChange(path11, lines);
-  config && push("config-changed", "warn", config), isCiFile(path11) && push("ci-changed", "risk", `CI pipeline changed (${path11})`);
-  let suppressions = detectLintSuppressions(path11, lines);
+  let assertions = detectAssertionChanges(path12, lines);
+  assertions.length > 0 && push("assertion-removed", "risk", assertions.join("; ")), isSnapshotFile(path12) && push("snapshot-updated", "warn", "Snapshot file changed");
+  let deps = detectNewDependencies(path12, lines);
+  deps.length > 0 && push("dependency-added", "warn", `New ${deps.length === 1 ? "dependency" : "dependencies"}: ${listOf(deps)}`), isLockfile(path12) && push("lockfile", "info", `Lockfile churn (${posix.basename(path12)})`);
+  let config = detectConfigChange(path12, lines);
+  config && push("config-changed", "warn", config), isCiFile(path12) && push("ci-changed", "risk", `CI pipeline changed (${path12})`);
+  let suppressions = detectLintSuppressions(path12, lines);
   suppressions.length > 0 && push("lint-suppressed", "warn", `Adds ${listOf(suppressions)}`);
-  let anys = detectTypeAny(path11, lines);
+  let anys = detectTypeAny(path12, lines);
   anys.length > 0 && push("type-any-added", "warn", `Adds ${listOf(anys)}`);
-  let secrets = detectSecrets(path11, lines);
+  let secrets = detectSecrets(path12, lines);
   if (secrets.length > 0 && push("secret-like", "risk", secrets.join("; ")), agent) {
-    let why = outOfScopeReason(path11, scope);
+    let why = outOfScopeReason(path12, scope);
     why && push("out-of-scope", "warn", why);
   }
   return out;
@@ -3596,15 +3597,15 @@ function mergeLabels(existing, fresh) {
 function isAgentAttributed(h) {
   return h.match !== "none" && (h.prompt !== void 0 || h.coverage >= 0.5) && h.edits.some((e) => e.failed !== !0);
 }
-function normalisePath(path11) {
-  return path11.replace(/\\/g, "/").replace(/^\.\//, "");
+function normalisePath(path12) {
+  return path12.replace(/\\/g, "/").replace(/^\.\//, "");
 }
 function toRepoPath(file, repoRoot2) {
   let p = normalisePath(file), root = normalisePath(repoRoot2).replace(/\/+$/, "");
   return root && p.startsWith(`${root}/`) ? p.slice(root.length + 1) : p;
 }
-function extOf(path11) {
-  let base = posix.basename(path11), dot = base.lastIndexOf(".");
+function extOf(path12) {
+  let base = posix.basename(path12), dot = base.lastIndexOf(".");
   return dot <= 0 ? "" : base.slice(dot + 1).toLowerCase();
 }
 var TEST_FILE_PATTERNS = [
@@ -3650,8 +3651,8 @@ var TEST_FILE_PATTERNS = [
   "Podfile.lock",
   "packages.lock.json"
 ]);
-function isSnapshotFile(path11) {
-  let p = normalisePath(path11);
+function isSnapshotFile(path12) {
+  let p = normalisePath(path12);
   return /(?:^|\/)__snapshots__\//.test(p) || /\.snap$/.test(p);
 }
 var CI_PATTERNS = [
@@ -3667,8 +3668,8 @@ var CI_PATTERNS = [
   /(?:^|\/)\.buildkite\//,
   /(?:^|\/)\.travis\.ya?ml$/
 ];
-function isCiFile(path11) {
-  return CI_PATTERNS.some((re) => re.test(path11));
+function isCiFile(path12) {
+  return CI_PATTERNS.some((re) => re.test(path12));
 }
 var CONFIG_BASENAMES = [
   /^[jt]sconfig(?:\.[\w-]+)*\.json$/,
@@ -3723,8 +3724,8 @@ var CONFIG_BASENAMES = [
   "vue",
   "svelte"
 ]), PROSE_EXT = /* @__PURE__ */ new Set(["md", "mdx", "markdown", "rst", "txt", "adoc"]), TS_EXT = /* @__PURE__ */ new Set(["ts", "tsx", "mts", "cts"]);
-function commentStyle(path11) {
-  let ext = extOf(path11);
+function commentStyle(path12) {
+  let ext = extOf(path12);
   return HASH_COMMENT_EXT.has(ext) ? "hash" : SLASH_COMMENT_EXT.has(ext) ? "slash" : "none";
 }
 var STRING_LITERAL = /"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\\n]|\\.)*`/g;
@@ -3800,8 +3801,8 @@ var SKIP_PATTERNS = [
   // Last: generic member call, e.g. `suite.skip(` or `bench.only(` in a test file.
   { re: /\.\s*(skip|only)\s*\(/, name: ".$1()", testOnly: !0 }
 ];
-function matchPatterns(text2, patterns, path11, inTest, firstOnly = !1) {
-  let ext = extOf(path11), hits = [];
+function matchPatterns(text2, patterns, path12, inTest, firstOnly = !1) {
+  let ext = extOf(path12), hits = [];
   for (let p of patterns) {
     if (p.testOnly && !inTest || p.ext && !p.ext.includes(ext)) continue;
     let m = p.re.exec(text2);
@@ -3810,13 +3811,13 @@ function matchPatterns(text2, patterns, path11, inTest, firstOnly = !1) {
   }
   return hits;
 }
-function detectTestSkips(path11, lines) {
-  let style = commentStyle(path11);
-  if (PROSE_EXT.has(extOf(path11))) return [];
-  let inTest = isTestFile(path11), hits = [];
+function detectTestSkips(path12, lines) {
+  let style = commentStyle(path12);
+  if (PROSE_EXT.has(extOf(path12))) return [];
+  let inTest = isTestFile(path12), hits = [];
   for (let l of netAdded(lines)) {
-    let text2 = extOf(path11) === "rb" ? l.text.replace(/#.*$/, "") : codeOf(l.text, style);
-    hits.push(...matchPatterns(text2, SKIP_PATTERNS, path11, inTest, !0));
+    let text2 = extOf(path12) === "rb" ? l.text.replace(/#.*$/, "") : codeOf(l.text, style);
+    hits.push(...matchPatterns(text2, SKIP_PATTERNS, path12, inTest, !0));
   }
   return uniq(hits);
 }
@@ -3877,11 +3878,11 @@ function rankOf(a) {
   return a.negated && /^tobe(?:null|undefined|falsy|nan)$/.test(a.matcher) ? 0 : a.negated ? null : /^tobe(?:greater|less)than(?:orequal)?$/.test(a.matcher) ? a.operands.some((o) => /^-?[01]$/.test(o)) ? 0 : 1 : a.matcher === "tothrow" && a.operands.length < 2 ? 0 : MATCHER_RANK[a.matcher] ?? null;
 }
 var FUNCTION_ASSERT = /(?<![\w$.])((?:self\.|this\.)?(?:assert|refute)\w*!?|assert\.\w+|require\.[A-Z]\w*|Assert(?:ions)?\.\w+|t\.(?:Error|Errorf|Fatal|Fatalf|Fail|FailNow))\s*\(/, EXPECT_CALL = /(?<![\w$.])expect\s*([({])/, CHAINED_MATCHER = /^\s*\)*\s*\.\s*(?:(not)\s*\.\s*)?(?:resolves\s*\.\s*|rejects\s*\.\s*)?(to[A-Z]\w*)\s*\(/, CHAIN_MODIFIER = /^\s*\.?\s*(not_to|to_not|not|resolves|rejects|to)(?=[\s.]|$)/, SHOULD = /\.should(?:_not)?\b|\bshould(?:_not)?\s*(?:==|\(|be\b|eq\b|equal\b)/, PY_COMPARE = /\s(==|!=|is not|is|not in|in|<=|>=|<|>)\s/;
-function assertionsApply(path11) {
-  return isTestFile(path11) || extOf(path11) === "rs";
+function assertionsApply(path12) {
+  return isTestFile(path12) || extOf(path12) === "rs";
 }
-function parseAssertion(line, path11) {
-  let style = commentStyle(path11), code2 = codeOf(line, style).trim();
+function parseAssertion(line, path12) {
+  let style = commentStyle(path12), code2 = codeOf(line, style).trim();
   if (!code2 || /^(?:def|function|func|fn|public|private|protected)\b/.test(code2)) return null;
   let literals = [...line.matchAll(STRING_LITERAL)].map((m) => m[0].slice(1, -1)).filter((x) => x.trim() !== ""), base = { raw: line.trim(), key: normaliseLine(line), literals }, norm = (s) => s.replace(/\s+/g, ""), ex = EXPECT_CALL.exec(code2);
   if (ex) {
@@ -3909,7 +3910,7 @@ function parseAssertion(line, path11) {
     return (matcher === "assert" || matcher === "") && (matcher = "truthy"), { ...base, matcher, display, negated: !1, operands: args };
   }
   let py = /^assert\s+(.+)$/.exec(code2);
-  if (py?.[1] && /^(?:py|pyi)$/.test(extOf(path11))) {
+  if (py?.[1] && /^(?:py|pyi)$/.test(extOf(path12))) {
     let expr = ` ${splitTopLevel(py[1])[0] ?? ""} `, cmp = PY_COMPARE.exec(expr);
     if (!cmp?.[1]) return { ...base, matcher: "truthy", display: "bare assert", negated: !1, operands: [norm(expr)] };
     let lhs = norm(expr.slice(0, cmp.index)), rhs = norm(expr.slice(cmp.index + cmp[0].length));
@@ -3918,8 +3919,8 @@ function parseAssertion(line, path11) {
   return SHOULD.test(code2) ? { ...base, matcher: "should", display: "should", negated: /should_not|\.not\b/.test(code2), operands: [] } : null;
 }
 var ASSIGNMENT = /^\s*(?:(?:const|let|var|val|final|auto)\s+)?(?:[A-Z][\w<>[\],.?]*\s+)?([A-Za-z_$][\w$]*)(?:\s*:\s*[^=]+?)?\s*(?::=|=(?![=>]))\s*(.+?)\s*;?\s*$/;
-function collectAliases(lines, path11) {
-  let style = commentStyle(path11), out = /* @__PURE__ */ new Map();
+function collectAliases(lines, path12) {
+  let style = commentStyle(path12), out = /* @__PURE__ */ new Map();
   for (let l of lines) {
     let m = ASSIGNMENT.exec(codeOf(l.text, style));
     m?.[1] && m[2] && !EXPECT_CALL.test(m[2]) && out.set(m[1], m[2].replace(/\s+/g, ""));
@@ -3963,12 +3964,12 @@ function literalChange(d, a, aliases) {
   let [from, to] = [onlyD[0] ?? "", onlyA[0] ?? ""];
   return NUMERIC_OR_BOOL.test(from) && NUMERIC_OR_BOOL.test(to) ? { from, to } : null;
 }
-function detectAssertionChanges(path11, lines) {
-  if (!assertionsApply(path11)) return [];
-  let aliases = collectAliases(lines, path11), dels = [], adds = [];
+function detectAssertionChanges(path12, lines) {
+  if (!assertionsApply(path12)) return [];
+  let aliases = collectAliases(lines, path12), dels = [], adds = [];
   for (let l of lines) {
     if (l.type === "ctx") continue;
-    let a = parseAssertion(l.text, path11);
+    let a = parseAssertion(l.text, path12);
     a && (l.type === "del" ? dels : adds).push(a);
   }
   if (dels.length === 0) return [];
@@ -3998,9 +3999,9 @@ function detectAssertionChanges(path11, lines) {
   }
   return findings;
 }
-function detectNewDependencies(path11, lines) {
-  let base = posix.basename(path11), scan = null;
-  if (base === "package.json" ? scan = scanJsonManifest(lines, NPM_DEP_SECTIONS, NPM_SCALAR_FIELDS) : base === "composer.json" ? scan = scanJsonManifest(lines, COMPOSER_DEP_SECTIONS, COMPOSER_SCALAR_FIELDS) : /^requirements[\w.-]*\.(?:txt|in)$/.test(base) || /(?:^|\/)requirements\/[^/]+\.(?:txt|in)$/.test(path11) ? scan = scanRequirements(lines) : base === "pyproject.toml" ? scan = scanPyproject(lines) : base === "Cargo.toml" ? scan = scanCargo(lines) : base === "go.mod" ? scan = scanGoMod(lines) : (base === "Gemfile" || base.endsWith(".gemspec")) && (scan = scanGemfile(lines)), !scan) return [];
+function detectNewDependencies(path12, lines) {
+  let base = posix.basename(path12), scan = null;
+  if (base === "package.json" ? scan = scanJsonManifest(lines, NPM_DEP_SECTIONS, NPM_SCALAR_FIELDS) : base === "composer.json" ? scan = scanJsonManifest(lines, COMPOSER_DEP_SECTIONS, COMPOSER_SCALAR_FIELDS) : /^requirements[\w.-]*\.(?:txt|in)$/.test(base) || /(?:^|\/)requirements\/[^/]+\.(?:txt|in)$/.test(path12) ? scan = scanRequirements(lines) : base === "pyproject.toml" ? scan = scanPyproject(lines) : base === "Cargo.toml" ? scan = scanCargo(lines) : base === "go.mod" ? scan = scanGoMod(lines) : (base === "Gemfile" || base.endsWith(".gemspec")) && (scan = scanGemfile(lines)), !scan) return [];
   let removed = new Set(scan.removed);
   return uniq(scan.added.filter((n) => !removed.has(n)));
 }
@@ -4139,9 +4140,9 @@ function scanGemfile(lines) {
   }
   return scan;
 }
-function detectConfigChange(path11, lines) {
-  let base = posix.basename(path11);
-  if (isCiFile(path11)) return null;
+function detectConfigChange(path12, lines) {
+  let base = posix.basename(path12);
+  if (isCiFile(path12)) return null;
   if (CONFIG_BASENAMES.some((re) => re.test(base))) return `Config changed (${base})`;
   if (base === "pyproject.toml") {
     let tools = /* @__PURE__ */ new Set();
@@ -4174,10 +4175,10 @@ var PKG_CONFIG_SECTIONS = /* @__PURE__ */ new Set(["scripts", "jest", "eslintCon
   { re: /(#pragma\s+warning\s+disable)\b/, name: "#pragma warning disable", ext: ["cs", "c", "cpp", "h", "hpp"] },
   { re: /(?:\/\/|\/\*)\s*((?:istanbul|c8|v8)\s+ignore)\b/, name: "$1" }
 ];
-function detectLintSuppressions(path11, lines) {
-  if (PROSE_EXT.has(extOf(path11)) || isLockfile(path11)) return [];
+function detectLintSuppressions(path12, lines) {
+  if (PROSE_EXT.has(extOf(path12)) || isLockfile(path12)) return [];
   let hits = [];
-  for (let l of netAdded(lines)) hits.push(...matchPatterns(stripStrings(l.text), LINT_PATTERNS, path11, !1));
+  for (let l of netAdded(lines)) hits.push(...matchPatterns(stripStrings(l.text), LINT_PATTERNS, path12, !1));
   return uniq(hits);
 }
 var ANY_PATTERNS = [
@@ -4188,11 +4189,11 @@ var ANY_PATTERNS = [
   { re: /[:|&]\s*any(?![\w$])/, name: "`: any`" },
   { re: /[<,]\s*any\s*(?=[,>])/, name: "`any` type argument" }
 ];
-function detectTypeAny(path11, lines) {
-  if (!TS_EXT.has(extOf(path11))) return [];
+function detectTypeAny(path12, lines) {
+  if (!TS_EXT.has(extOf(path12))) return [];
   let hits = [];
   for (let l of netAdded(lines)) {
-    let code2 = codeOf(l.text, "slash"), lineHits = matchPatterns(code2, ANY_PATTERNS, path11, !1);
+    let code2 = codeOf(l.text, "slash"), lineHits = matchPatterns(code2, ANY_PATTERNS, path12, !1);
     hits.push(...lineHits.includes("`<any>`") ? lineHits.filter((h) => h !== "`any` type argument") : lineHits);
   }
   return uniq(hits);
@@ -4230,8 +4231,8 @@ function entropy(s) {
 function looksLikeSecretValue(v) {
   return /^[A-Za-z0-9+/=_.-]+$/.test(v) && /\d/.test(v) && /[A-Za-z]/.test(v) && !PLACEHOLDER.test(v) && !/^[a-z]+(?:[._-][a-z]+)+$/.test(v) && entropy(v) >= 3.5;
 }
-function detectSecrets(path11, lines) {
-  if (isLockfile(path11)) return [];
+function detectSecrets(path12, lines) {
+  if (isLockfile(path12)) return [];
   let found = [];
   for (let l of netAdded(lines)) {
     let where = l.newNo !== void 0 ? ` on line ${l.newNo}` : "", matched = !1;
@@ -4270,13 +4271,13 @@ function mentioned(token, text2) {
 function related(a, b) {
   return a === b ? !0 : a === "." || b === "." ? !1 : a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
-function outOfScopeReason(path11, scope) {
-  if (!scope.promptText || isLockfile(path11) || isSnapshotFile(path11)) return null;
-  let base = posix.basename(path11), stem = base.replace(/\.[^.]+$/, ""), segments = posix.dirname(path11).split("/").filter((s) => s.length >= 4 && s !== ".");
+function outOfScopeReason(path12, scope) {
+  if (!scope.promptText || isLockfile(path12) || isSnapshotFile(path12)) return null;
+  let base = posix.basename(path12), stem = base.replace(/\.[^.]+$/, ""), segments = posix.dirname(path12).split("/").filter((s) => s.length >= 4 && s !== ".");
   if ([base, ...stem.length >= 4 ? [stem] : [], ...segments].some((t) => mentioned(t, scope.promptText))) return null;
-  let others = scope.agentFiles.filter((f) => f !== path11);
+  let others = scope.agentFiles.filter((f) => f !== path12);
   if (others.length === 0) return null;
-  let dir = posix.dirname(path11);
+  let dir = posix.dirname(path12);
   return others.filter((f) => related(posix.dirname(f), dir)).length / others.length >= 0.5 ? null : `Not mentioned in any prompt and away from the agent's other edits (${dir === "." ? "repo root" : `${dir}/`})`;
 }
 
@@ -6636,23 +6637,23 @@ function cacheKey(classifierName, h) {
   return createHash("sha256").update(JSON.stringify([classifierName, h.prompt?.text ?? "", rationale, h.hunk.file, renderHunkDiff(h.hunk)])).digest("hex");
 }
 var VerdictCache = class _VerdictCache {
-  constructor(path11, entries) {
-    this.path = path11;
+  constructor(path12, entries) {
+    this.path = path12;
     this.entries = entries;
   }
   path;
   entries;
   dirty = !1;
   /** Load the cache; a missing or corrupt file yields an empty cache. */
-  static async load(path11) {
+  static async load(path12) {
     let entries = /* @__PURE__ */ new Map();
     try {
-      let raw = JSON.parse(await readFile4(path11, "utf8"));
+      let raw = JSON.parse(await readFile4(path12, "utf8"));
       if (isRecord3(raw) && raw.version === CACHE_VERSION && isRecord3(raw.entries))
         for (let [k, v] of Object.entries(raw.entries)) isEntry(v) && entries.set(k, v);
     } catch {
     }
-    return new _VerdictCache(path11, entries);
+    return new _VerdictCache(path12, entries);
   }
   get(key) {
     let e = this.entries.get(key);
@@ -6694,9 +6695,9 @@ function findOnPath(name, envPath = process.env.PATH ?? "") {
         if (isExecutable(candidate)) return candidate;
       }
 }
-function isExecutable(path11) {
+function isExecutable(path12) {
   try {
-    return accessSync(path11, constants.X_OK), !0;
+    return accessSync(path12, constants.X_OK), !0;
   } catch {
     return !1;
   }
@@ -6917,7 +6918,7 @@ async function buildReport(opts = {}) {
   let log = opts.onProgress ?? (() => {
   }), root = await repoRoot(opts.cwd ?? process.cwd()), target, rangeLabel;
   if (opts.workingTree)
-    target = { workingTree: !0, includeUntracked: !0 }, rangeLabel = "working tree";
+    target = { workingTree: !0, includeUntracked: !0, ...opts.baseRev ? { baseRev: opts.baseRev } : {} }, rangeLabel = "working tree";
   else if (opts.range)
     target = opts.range, rangeLabel = opts.range;
   else {
@@ -6927,7 +6928,7 @@ async function buildReport(opts = {}) {
     target = resolved.target, rangeLabel = resolved.label;
   }
   log(`diffing ${rangeLabel}`);
-  let hunks = parseUnifiedDiff(await getDiff(root, target)), window = await commitTimes(root, target).catch(() => {
+  let hunks = parseUnifiedDiff(await getDiff(root, target, { paths: opts.paths })), window = await commitTimes(root, target).catch(() => {
   }), since = opts.since ?? (window ? new Date(new Date(window.since).getTime() - 6 * 36e5) : void 0), sessions = [], extraRoots = await worktreeRoots(root);
   if (opts.sessionFiles?.length)
     for (let file of opts.sessionFiles) {
@@ -8266,6 +8267,69 @@ function renderReport(report, format, opts = {}) {
   }
 }
 
+// src/guard.ts
+import { createHash as createHash2 } from "node:crypto";
+import { mkdir as mkdir2, readFile as readFile6, writeFile as writeFile2 } from "node:fs/promises";
+import path10 from "node:path";
+var NO_BLOCK = { block: !1, hits: [] };
+async function runGuard(payload, opts) {
+  try {
+    return await guard(payload, opts);
+  } catch {
+    return NO_BLOCK;
+  }
+}
+async function guard(payload, opts) {
+  if (payload.stop_hook_active || !payload.transcript_path) return NO_BLOCK;
+  let root = await repoRoot(payload.cwd ?? process.cwd()), session = await claudeCodeAdapter.parse(payload.transcript_path), paths = [...new Set(session.edits.filter((e) => !e.failed).map((e) => path10.relative(root, e.filePath)).filter((p) => p && !p.startsWith("..") && !path10.isAbsolute(p)))].map((p) => `:(literal)${p.split(path10.sep).join("/")}`);
+  if (!paths.length) return NO_BLOCK;
+  let baseRev = "HEAD";
+  if (await hasHead(root)) {
+    let before = await git(root, ["rev-list", "-1", `--before=${session.startedAt}`, "HEAD"]).catch(() => "");
+    before && (baseRev = before);
+  }
+  let report = await buildReport({
+    cwd: root,
+    workingTree: !0,
+    baseRev,
+    paths,
+    sessionFiles: [payload.transcript_path],
+    harnesses: ["claude-code"],
+    home: opts.home
+  }), hits = [], keys = [];
+  for (let h of report.hunks)
+    if (!(h.match !== "exact" && h.match !== "partial") && !(!h.editIds.length || !h.editIds.every((id) => id.startsWith(`${session.id}:`))))
+      for (let l of h.labels)
+        opts.blocking.has(l.kind) && (hits.push(`- ${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`), keys.push(`${h.hunk.file}	${l.kind}	${l.detail}`));
+  let stateDir = opts.stateDir ?? path10.join(root, ".why-diff"), stateFile = path10.join(stateDir, "guard-state.json"), sessionKey = payload.session_id ?? session.id, hash = createHash2("sha256").update(keys.sort().join(`
+`)).digest("hex"), state = await readState(stateFile);
+  return state[sessionKey] === hash ? { block: !1, hits } : (state[sessionKey] = hash, await writeState(stateDir, stateFile, state), hits.length ? {
+    block: !0,
+    hits,
+    message: `why-diff guard: your changes in this session include risky edits:
+${hits.join(`
+`)}
+
+Before finishing: if you skipped, weakened or removed tests (or changed CI/secrets), either revert that change or tell the user explicitly what you changed and why, so they can decide. Do not hide it.
+`
+  } : NO_BLOCK);
+}
+async function readState(file) {
+  try {
+    let parsed = JSON.parse(await readFile6(file, "utf8"));
+    return parsed && typeof parsed == "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+async function writeState(dir, file, state) {
+  try {
+    await mkdir2(dir, { recursive: !0 }), path10.basename(dir) === ".why-diff" && await writeFile2(path10.join(dir, ".gitignore"), `*
+`), await writeFile2(file, JSON.stringify(state));
+  } catch {
+  }
+}
+
 // src/cli.ts
 var HARNESSES = ["claude-code", "codex", "opencode"], VERSION = "0.1.0", program2 = new Command();
 program2.name("why-diff").version(VERSION, "-V, --version").description("Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it.").argument("[range]", "git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree").option("--base <ref>", "branch or ref to compare against (default: auto-detected, incl. CI pull request targets)").option("-w, --working-tree", "only uncommitted changes vs HEAD").addOption(new Option("-f, --format <format>", "output format").choices(["terminal", "md", "html", "json"])).option("--html", "shortcut for --format html (writes .why-diff/report.html and opens it)").option("-o, --out <file>", "write output to a file instead of stdout").option("--no-open", "do not open the HTML report in a browser").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo (sibling folders, workspace roots) that edited files in it; slower").option("-v, --verbose", "show rationale, commands and label details").option("--fail-on <what>", "exit 1 if: risk | unrequested | tests | unattributed (comma list) \u2014 for CI and hooks").option("-q, --quiet", "no progress output").action(async (range, o) => {
@@ -8288,11 +8352,11 @@ program2.name("why-diff").version(VERSION, "-V, --version").description("Trace e
     model: o.model,
     onProgress: progress
   }), out = renderReport(report, format, { verbose: !!o.verbose }), outFile = o.out;
-  if (format === "html" && !outFile && (outFile = path10.join(report.repo.root, ".why-diff", "report.html")), outFile) {
-    await mkdir2(path10.dirname(path10.resolve(outFile)), { recursive: !0 }), await writeFile2(outFile, out);
-    let outDir = path10.dirname(path10.resolve(outFile));
-    path10.basename(outDir) === ".why-diff" && await writeFile2(path10.join(outDir, ".gitignore"), `*
-`), progress(`wrote ${path10.relative(process.cwd(), path10.resolve(outFile)) || outFile}`), format === "html" && o.open !== !1 && process.stdout.isTTY && openFile(path10.resolve(outFile)), format === "html" && process.stdout.write(renderReport(report, "terminal", {}) + `
+  if (format === "html" && !outFile && (outFile = path11.join(report.repo.root, ".why-diff", "report.html")), outFile) {
+    await mkdir3(path11.dirname(path11.resolve(outFile)), { recursive: !0 }), await writeFile3(outFile, out);
+    let outDir = path11.dirname(path11.resolve(outFile));
+    path11.basename(outDir) === ".why-diff" && await writeFile3(path11.join(outDir, ".gitignore"), `*
+`), progress(`wrote ${path11.relative(process.cwd(), path11.resolve(outFile)) || outFile}`), format === "html" && o.open !== !1 && process.stdout.isTTY && openFile(path11.resolve(outFile)), format === "html" && process.stdout.write(renderReport(report, "terminal", {}) + `
 `);
   } else
     process.stdout.write(out.endsWith(`
@@ -8310,27 +8374,8 @@ program2.command("guard").description("Claude Code Stop hook: block the agent fr
     payload = raw.trim() ? JSON.parse(raw) : {};
   } catch {
   }
-  if (payload.stop_hook_active) return;
-  let blocking = new Set(o.on.split(",").map((s) => s.trim())), report;
-  try {
-    report = await buildReport({
-      cwd: payload.cwd ?? process.cwd(),
-      workingTree: !0,
-      sessionFiles: payload.transcript_path ? [payload.transcript_path] : void 0,
-      harnesses: ["claude-code"]
-    });
-  } catch {
-    return;
-  }
-  let hits = report.hunks.flatMap((h) => h.match === "none" ? [] : h.labels.filter((l) => blocking.has(l.kind)).map((l) => `- ${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`));
-  hits.length && (process.stderr.write(
-    `why-diff guard: your changes in this session include risky edits:
-${hits.join(`
-`)}
-
-Before finishing: if you skipped, weakened or removed tests (or changed CI/secrets), either revert that change or tell the user explicitly what you changed and why, so they can decide. Do not hide it.
-`
-  ), process.exitCode = 2);
+  let blocking = new Set(o.on.split(",").map((s) => s.trim()).filter(Boolean)), result = await runGuard(payload, { blocking });
+  result.block && (process.stderr.write(result.message ?? ""), process.exitCode = 2);
 });
 function readStdin() {
   return process.stdin.isTTY ? Promise.resolve("") : new Promise((resolve) => {
