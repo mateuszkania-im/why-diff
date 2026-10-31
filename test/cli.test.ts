@@ -128,3 +128,11 @@ describe('pathspec after --', () => {
     expect(files).toEqual(['src/a.js']);
   });
 });
+
+describe('positional arguments', () => {
+  it('rejects an extra positional before -- instead of dropping it', () => {
+    const r = cli(['HEAD~1', 'extra', '--', 'src/a.js']);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('too many arguments');
+  });
+});

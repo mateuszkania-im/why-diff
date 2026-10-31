@@ -167,18 +167,27 @@ describe('why-diff pr', () => {
 
   it('--dry-run prints the new body and makes no gh write', () => {
     const r = cli(['pr', '--dry-run', '-q'], env());
-    expect(r.stderr).toBe('');
+    expect(r.stderr).toContain('uncommitted changes are not included');
     expect(r.status).toBe(0);
     expect(r.stdout.startsWith('Fixes #3.\n\nSome notes.\n\n<!-- why-diff:start -->\n## why-diff risk scan')).toBe(true);
-    expect(r.stdout).toContain('src/b.js');
+    expect(r.stdout).toContain('src/a.js');
+    expect(r.stdout).not.toContain('src/b.js'); // uncommitted: only with --working-tree
     expect(r.stdout).toContain('main...HEAD');
     expect(calls().map((c) => c.args.slice(0, 2).join(' '))).toEqual(['pr view']);
     expect(readFileSync(path.join(stubDir, 'body.md'), 'utf8')).toBe('Fixes #3.\n\nSome notes.\n');
   });
 
+  it('--working-tree includes uncommitted changes and does not warn', () => {
+    const r = cli(['pr', '--dry-run', '-q', '--working-tree'], env());
+    expect(r.stderr).toBe('');
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('src/b.js');
+    expect(r.stdout).toContain('src/a.js');
+  });
+
   it('edits the existing PR body via gh pr edit --body-file -, and replaces its own section on the next run', () => {
     const r = cli(['pr', '--base', 'main', '-q'], env());
-    expect(r.stderr).toBe('');
+    expect(r.stderr).toContain('uncommitted');
     expect(r.status).toBe(0);
     const c = calls();
     expect(c.map((x) => x.args)).toEqual([['pr', 'view', '--json', 'body'], ['pr', 'edit', '--body-file', '-']]);
@@ -203,7 +212,7 @@ describe('why-diff pr', () => {
   it('shrinks the section to keep the body within the GitHub limit', () => {
     writeFileSync(path.join(stubDir, 'body.md'), 'x'.repeat(63_000) + '\n');
     const r = cli(['pr', '-q'], env());
-    expect(r.stderr).toBe('');
+    expect(r.stderr).toContain('uncommitted');
     expect(r.status).toBe(0);
     const body = readFileSync(path.join(stubDir, 'body.md'), 'utf8');
     expect(body.length).toBeLessThanOrEqual(65_536);
@@ -234,7 +243,7 @@ describe('why-diff pr', () => {
       const file = writeSyntheticTranscript(elsewhere, repo, 'dddddddd-1111-4222-8333-444444444444', [
         { prompt: 'add b', at: new Date(now - 60_000).toISOString(), calls: [{ tool: 'Write', at: new Date(now - 50_000).toISOString(), input: { file_path: path.join(repo, 'src/b.js'), content: 'export const b = 1;\n' } }] },
       ]);
-      const r = cli(['pr', '--dry-run', '-q', '--session', file], env());
+      const r = cli(['pr', '--dry-run', '-q', '--working-tree', '--session', file], env());
       expect(r.status).toBe(0);
       expect(r.stdout).toContain('<!-- why-diff:start -->\n## Provenance');
       expect(r.stdout).toContain('add b');

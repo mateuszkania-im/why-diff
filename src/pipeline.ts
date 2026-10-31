@@ -31,6 +31,8 @@ export interface BuildOptions {
   range?: string;
   /** Base ref to compare the branch against (overrides CI/default-branch detection) */
   base?: string;
+  /** With auto base detection: diff `<base>...HEAD` only (committed work), not the working tree on top */
+  committedOnly?: boolean;
   /** Only the uncommitted working tree vs HEAD */
   workingTree?: boolean;
   /** With `workingTree`: diff against this exact revision instead of HEAD */
@@ -99,8 +101,13 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
       if (await isShallow(root)) throw new Error(SHALLOW_HINT);
       if (opts.base) throw new Error(`cannot compare against --base ${opts.base}: ref not found or no commits beyond it`);
     }
-    target = resolved.target;
-    rangeLabel = resolved.label;
+    if (opts.committedOnly && resolved.base) {
+      target = `${resolved.base}...HEAD`;
+      rangeLabel = target;
+    } else {
+      target = resolved.target;
+      rangeLabel = resolved.label;
+    }
   }
 
   const baseRev = await policyRev(root, target);

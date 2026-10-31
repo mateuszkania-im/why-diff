@@ -15,6 +15,7 @@ import { buildReport } from './pipeline.js';
 import { redactReport } from './redact.js';
 import { renderReport, isReportFormat, type ReportFormat } from './report/index.js';
 import type { Harness, LabelKind } from './types.js';
+import { git } from './git.js';
 import { runGuard, type GuardPayload } from './guard.js';
 import type { ClassifierKind } from './classify/index.js';
 import { ghRunner, PR_BODY_LIMIT, readPrBody, sectionBudget, upsertSection, writePrBody } from './pr.js';
@@ -63,13 +64,12 @@ program
     // Everything after a literal `--` is a pathspec; the optional range must come before it.
     const dd = process.argv.indexOf('--');
     const paths = dd >= 0 ? process.argv.slice(dd + 1) : [];
-    let range: string | undefined = rangeArg;
-    if (paths.length) {
-      if (pathArgs.length + (rangeArg === undefined ? 0 : 1) > paths.length) range = rangeArg;
-      else range = undefined;
-    } else if (pathArgs.length) {
-      throw new Error('extra arguments: put paths after -- (why-diff [range] -- <paths>)');
-    }
+    // Positionals that came before `--` (commander also lists the pathspecs after it).
+    const positionals = [...(rangeArg === undefined ? [] : [rangeArg]), ...pathArgs];
+    const beforeDd = dd >= 0 ? positionals.slice(0, Math.max(0, positionals.length - paths.length)) : positionals;
+    if (beforeDd.length > 1) throw new Error(`too many arguments: ${beforeDd.map((a) => `"${a}"`).join(' ')} (one optional range, then -- <paths>)`);
+    if (dd < 0 && beforeDd.length === 1 && pathArgs.length) throw new Error('too many arguments: put paths after -- (why-diff [range] -- <paths>)');
+    let range: string | undefined = beforeDd[0];
 
     let classify: ClassifierKind;
     if (o.classify === false || o.classify === undefined) classify = 'none';
@@ -147,6 +147,7 @@ program
   .command('pr')
   .description('put the report into the current branch\'s pull request body (gh pr edit); never pushes or creates a PR')
   .option('--base <ref>', 'branch or ref the PR targets (default: auto-detected)')
+  .option('-w, --working-tree', 'also include uncommitted changes (default: committed work only, <base>...HEAD)')
   .option('-c, --classify [backend]', 'LLM intent check: auto | claude-cli | anthropic | openai', false)
   .option('-m, --model <model>', 'model for the intent check (default: haiku)')
   .option('--harness <list>', 'comma list of harnesses: claude-code,codex,opencode')
@@ -170,8 +171,13 @@ program
     const body = await readPrBody(gh);
     const budget = Math.min(60_000, sectionBudget(body));
     if (budget < 1000) throw new Error(`the pull request description is too long to add the why-diff section (GitHub allows ${PR_BODY_LIMIT} characters); shorten it and run again`);
+    const withWorkingTree = Boolean(o.workingTree);
+    if (!withWorkingTree && (await isDirty(process.cwd()))) {
+      process.stderr.write(pc.yellow('why-diff: uncommitted changes are not included in the PR report (committed work only); use --working-tree to include them\n'));
+    }
     const built = await buildReport({
       base: o.base as string | undefined,
+      committedOnly: !withWorkingTree,
       harnesses,
       sessionFiles: o.session as string[] | undefined,
       since,
@@ -214,6 +220,14 @@ program
     process.stderr.write(result.message ?? '');
     process.exitCode = 2;
   });
+
+async function isDirty(cwd: string): Promise<boolean> {
+  try {
+    return (await git(cwd, ['status', '--porcelain'])).length > 0;
+  } catch {
+    return false;
+  }
+}
 
 function parseHarnesses(value: unknown): Harness[] | undefined {
   if (!value) return undefined;
