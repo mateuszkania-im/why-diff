@@ -172,8 +172,22 @@ export function attribute(hunks: Hunk[], sessions: Session[], repoRoot: string, 
 interface ShellCommand {
   atMs: number;
   command: string;
-  /** Repo-relative paths bash-mutations detected for it (may be empty). */
+  /** Repo-relative paths bash-mutations detected for it that may have changed content (may be empty). */
   rels: string[];
+  /** False when every detected operation of the command only changes metadata (chmod, chown, touch). */
+  contentOps: boolean;
+}
+
+/** Shell operations that change metadata, never content: they explain no changed line. */
+const NON_CONTENT_OPS: ReadonlySet<string> = new Set(['chmod', 'touch']);
+/** Operations on the repo root itself (`.`) that can rewrite any file below it. */
+const REPO_WIDE_OPS: ReadonlySet<string> = new Set(['restore', 'format']);
+
+/** Does a shell edit of `rel` with this op count as touching content there? */
+function shellRelCounts(op: string | undefined, rel: string): boolean {
+  if (op !== undefined && NON_CONTENT_OPS.has(op)) return false;
+  if (rel === '' || rel === '.') return op === undefined || REPO_WIDE_OPS.has(op);
+  return true;
 }
 
 interface EditIndex {
@@ -223,10 +237,11 @@ function indexEdits(sessions: Session[], repoRoot: string, diffFiles: Set<string
         const key = `${edit.sessionId}:${edit.toolUseId}`;
         let cmd = shell.get(key);
         if (!cmd) {
-          cmd = { atMs: Date.parse(edit.at) || 0, command: edit.command, rels: [] };
+          cmd = { atMs: Date.parse(edit.at) || 0, command: edit.command, rels: [], contentOps: false };
           shell.set(key, cmd);
         }
-        if (rel !== null) cmd.rels.push(rel);
+        if (rel !== null && shellRelCounts(edit.bashOp, rel)) cmd.rels.push(rel);
+        if (edit.bashOp === undefined || !NON_CONTENT_OPS.has(edit.bashOp)) cmd.contentOps = true;
       }
       if (rel === null) continue;
       const indexed = indexEdit(edit, seq++, rel);
@@ -251,7 +266,7 @@ function indexEdits(sessions: Session[], repoRoot: string, diffFiles: Set<string
  */
 function touchedByShell(file: string, index: EditIndex): boolean {
   const shell = (index.shellIndex ??= buildShellIndex(index));
-  if (shell.tokens.has(file) || shell.rels.has(file) || shell.rels.has('')) return true;
+  if (shell.tokens.has(file) || shell.rels.has(file) || shell.rels.has('') || shell.rels.has('.')) return true;
   for (let slash = file.lastIndexOf('/'); slash > 0; slash = file.lastIndexOf('/', slash - 1)) {
     if (shell.rels.has(file.slice(0, slash))) return true;
   }
@@ -273,6 +288,7 @@ function buildShellIndex(index: EditIndex): ShellIndex {
       if (/[*?[]/.test(rel)) globs.push(rel);
       else rels.add(rel);
     }
+    if (!s.contentOps) continue; // chmod/chown/touch only: naming a file does not change it
     for (const raw of s.command.split(PATH_TOKEN_SEPARATOR)) {
       if (!raw) continue;
       let token = raw;
@@ -763,9 +779,14 @@ function candidatesFor(hunk: Hunk, index: EditIndex): IndexedEdit[] {
   for (const f of files) for (const e of index.byFile.get(f) ?? []) set.add(e);
   for (const e of index.bash) {
     if (e.rel === null || set.has(e)) continue;
+    if (!shellRelCounts(e.edit.bashOp, e.rel) && !NON_CONTENT_OPS.has(e.edit.bashOp ?? '')) continue;
     if (files.some((f) => bashPathMatches(e.rel ?? '', f))) set.add(e);
   }
-  return [...set].sort((a, b) => a.atMs - b.atMs || a.seq - b.seq);
+  // chmod/chown/touch explain a mode change or an empty new file, never changed lines.
+  const changesLines = hunk.lines.some((l) => l.type !== 'ctx');
+  return [...set]
+    .filter((e) => !(changesLines && e.edit.kind === 'bash' && NON_CONTENT_OPS.has(e.edit.bashOp ?? '')))
+    .sort((a, b) => a.atMs - b.atMs || a.seq - b.seq);
 }
 
 /** A bash edit path matches a file when it is that file, a parent directory, or a glob covering it. */

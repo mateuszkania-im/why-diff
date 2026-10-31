@@ -3117,6 +3117,10 @@ function attribute(hunks, sessions, repoRoot2, opts = {}) {
   let index = indexEdits(sessions, repoRoot2, diffFiles, opts.extraRoots);
   return index.sinceMs = opts.since?.getTime(), hunks.flatMap((hunk) => attributeHunk(hunk, index, prompts));
 }
+var NON_CONTENT_OPS = /* @__PURE__ */ new Set(["chmod", "touch"]), REPO_WIDE_OPS = /* @__PURE__ */ new Set(["restore", "format"]);
+function shellRelCounts(op, rel) {
+  return op !== void 0 && NON_CONTENT_OPS.has(op) ? !1 : rel === "" || rel === "." ? op === void 0 || REPO_WIDE_OPS.has(op) : !0;
+}
 function indexEdits(sessions, repoRoot2, diffFiles = /* @__PURE__ */ new Set(), extraRoots = []) {
   let roots = [repoRoot2, ...extraRoots].flatMap(rootVariants).sort((a, b) => b.length - a.length), byFile = /* @__PURE__ */ new Map(), bash = [], shell = /* @__PURE__ */ new Map(), seq = 0, resolved = sessions.map((session) => {
     let cwdVariants = rootVariants(session.cwd);
@@ -3128,7 +3132,7 @@ function indexEdits(sessions, repoRoot2, diffFiles = /* @__PURE__ */ new Set(), 
       let rel = resolved[si]?.[ei] ?? null;
       if (worktrees.length && (rel = remapWorktree(edit, rel, session.cwd, worktrees) ?? rel), edit.kind === "bash" && edit.command) {
         let key = `${edit.sessionId}:${edit.toolUseId}`, cmd = shell.get(key);
-        cmd || (cmd = { atMs: Date.parse(edit.at) || 0, command: edit.command, rels: [] }, shell.set(key, cmd)), rel !== null && cmd.rels.push(rel);
+        cmd || (cmd = { atMs: Date.parse(edit.at) || 0, command: edit.command, rels: [], contentOps: !1 }, shell.set(key, cmd)), rel !== null && shellRelCounts(edit.bashOp, rel) && cmd.rels.push(rel), (edit.bashOp === void 0 || !NON_CONTENT_OPS.has(edit.bashOp)) && (cmd.contentOps = !0);
       }
       if (rel === null) continue;
       let indexed = indexEdit(edit, seq++, rel);
@@ -3142,7 +3146,7 @@ function indexEdits(sessions, repoRoot2, diffFiles = /* @__PURE__ */ new Set(), 
 }
 function touchedByShell(file, index) {
   let shell = index.shellIndex ??= buildShellIndex(index);
-  if (shell.tokens.has(file) || shell.rels.has(file) || shell.rels.has("")) return !0;
+  if (shell.tokens.has(file) || shell.rels.has(file) || shell.rels.has("") || shell.rels.has(".")) return !0;
   for (let slash = file.lastIndexOf("/"); slash > 0; slash = file.lastIndexOf("/", slash - 1))
     if (shell.rels.has(file.slice(0, slash))) return !0;
   return shell.globs.some((g) => globToRegExp(g).test(file));
@@ -3154,16 +3158,17 @@ function buildShellIndex(index) {
     if (!(since !== void 0 && s.atMs !== 0 && s.atMs < since)) {
       for (let rel of s.rels)
         /[*?[]/.test(rel) ? globs.push(rel) : rels.add(rel);
-      for (let raw of s.command.split(PATH_TOKEN_SEPARATOR)) {
-        if (!raw) continue;
-        let token = raw;
-        for (let prefix of prefixes)
-          if (token.startsWith(prefix)) {
-            token = token.slice(prefix.length);
-            break;
-          }
-        token.startsWith("./") && (token = token.slice(2)), token && tokens.add(token);
-      }
+      if (s.contentOps)
+        for (let raw of s.command.split(PATH_TOKEN_SEPARATOR)) {
+          if (!raw) continue;
+          let token = raw;
+          for (let prefix of prefixes)
+            if (token.startsWith(prefix)) {
+              token = token.slice(prefix.length);
+              break;
+            }
+          token.startsWith("./") && (token = token.slice(2)), token && tokens.add(token);
+        }
     }
   return { tokens, rels, globs: [...new Set(globs)] };
 }
@@ -3412,8 +3417,9 @@ function candidatesFor(hunk, index) {
   let files = hunk.oldFile ? [hunk.file, hunk.oldFile] : [hunk.file], set = /* @__PURE__ */ new Set();
   for (let f of files) for (let e of index.byFile.get(f) ?? []) set.add(e);
   for (let e of index.bash)
-    e.rel === null || set.has(e) || files.some((f) => bashPathMatches(e.rel ?? "", f)) && set.add(e);
-  return [...set].sort((a, b) => a.atMs - b.atMs || a.seq - b.seq);
+    e.rel === null || set.has(e) || !shellRelCounts(e.edit.bashOp, e.rel) && !NON_CONTENT_OPS.has(e.edit.bashOp ?? "") || files.some((f) => bashPathMatches(e.rel ?? "", f)) && set.add(e);
+  let changesLines = hunk.lines.some((l) => l.type !== "ctx");
+  return [...set].filter((e) => !(changesLines && e.edit.kind === "bash" && NON_CONTENT_OPS.has(e.edit.bashOp ?? ""))).sort((a, b) => a.atMs - b.atMs || a.seq - b.seq);
 }
 function bashPathMatches(editRel, file) {
   return editRel === file || editRel === "" || file.startsWith(`${editRel}/`) ? !0 : /[*?[]/.test(editRel) ? globToRegExp(editRel).test(file) : !1;

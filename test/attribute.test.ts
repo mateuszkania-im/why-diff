@@ -1091,3 +1091,38 @@ describe('regression: Edit ending mid-line produces a composite line', () => {
     }
   });
 });
+
+describe('attribute: shell commands that do not change content', () => {
+  const sh = (command: string, file: string, bashOp: string): FileEdit => edit(S, P0.id, file, null, null, { kind: 'bash', tool: 'Bash', command, bashOp });
+
+  for (const [command, file, op] of [
+    ['chmod -R 755 .', '', 'chmod'],
+    ['touch .', '', 'touch'],
+    ['chown -R me .', '', 'chmod'],
+    ['chmod +x src/a.js', 'src/a.js', 'chmod'],
+    ['touch src/a.js', 'src/a.js', 'touch'],
+    ['chmod -R 755 src', 'src', 'chmod'],
+  ] as const) {
+    it(`\`${command}\` does not claim a later human edit`, () => {
+      const s = session(S, [P0], [sh(command, file, op)]);
+      for (const f of ['src/a.js', 'test/t.test.js']) {
+        const [h] = attribute([hunk(f, ['-a', '+human line'])], [s], ROOT);
+        expect(h?.match).toBe('none');
+        expect(h?.labels).toEqual([{ kind: 'unattributed', severity: 'warn', detail: 'No agent edit in the analysed sessions explains this hunk.' }]);
+      }
+    });
+  }
+
+  it('a chmod still explains a mode-only change of the file it named', () => {
+    const s = session(S, [P0], [sh('chmod +x run.sh', 'run.sh', 'chmod')]);
+    const [h] = attribute([hunk('run.sh', [])], [s], ROOT);
+    expect(h?.match).toBe('file-only');
+  });
+
+  it('a repo-wide restore or formatter still claims the files under it; a repo-wide delete does not', () => {
+    for (const [command, op, match] of [['git checkout -- .', 'restore', 'file-only'], ['npx prettier --write .', 'format', 'file-only'], ['rm -rf ./*', 'delete', 'none']] as const) {
+      const s = session(S, [P0], [sh(command, '', op)]);
+      expect(attribute([hunk('src/a.js', ['-a', '+b'])], [s], ROOT)[0]?.match, command).toBe(match);
+    }
+  });
+});
