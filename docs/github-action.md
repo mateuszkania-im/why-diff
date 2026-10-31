@@ -38,8 +38,8 @@ jobs:
 
 Both settings are required:
 
-- `permissions: pull-requests: write`, or the comment step fails with
-  "Resource not accessible by integration".
+- `permissions: pull-requests: write`, or the comment step logs a warning
+  ("Resource not accessible by integration") and the report stays in the job summary.
 - `actions/checkout` with `fetch-depth: 0`. A shallow clone has no merge base
   with the target branch, and why-diff stops with a hint instead of diffing the
   wrong range.
@@ -55,6 +55,8 @@ no `npm install` step.
 | `fail-on` | `''` | Fail the job if: `risk`, `tests`, `unattributed` (comma list). Empty never fails. `unattributed` is ignored in risk-scan mode, with a note in the log. |
 | `comment` | `'true'` | Post or update the sticky comment. Set `'false'` to only write the job summary. |
 | `base` | `${{ github.base_ref }}` | Branch the PR targets. why-diff compares `origin/<base>...HEAD`. |
+| `token` | `${{ github.token }}` | Token used to post the comment (becomes `GH_TOKEN`). Pass a personal access token or a GitHub App token to post as another identity. |
+| `comment-author` | `''` | Login that owns the sticky comment, for example `my-app[bot]`. Empty: the token's own login when `gh api user` works, else `github-actions[bot]`. |
 
 ## Outputs
 
@@ -72,6 +74,11 @@ The comment starts with the marker `<!-- why-diff:comment -->`. The action only
 updates a marker comment written by its own identity (`github-actions[bot]`, or
 the token's user when you pass a personal access token), so a marker comment
 planted by someone else is ignored and the action posts its own.
+
+A GitHub App token posts as `<app>[bot]`, and `gh api user` does not work for
+App tokens. Without `comment-author` the action then looks for a comment by
+`github-actions[bot]`, finds none, and posts a new comment on every run. Set
+`comment-author: <app>[bot]` to keep updating a single comment.
 
 ## Pull requests from forks
 
@@ -103,6 +110,9 @@ that section; the rest of the description is left as it is.
   branch (`gh pr edit --body-file -`). It never pushes and never creates a PR.
 - `--dry-run` prints the new description without changing anything.
 - `--base <ref>` sets the target branch (default: auto-detected).
+- By default the report covers committed work only (`<base>...HEAD`), matching
+  what reviewers see in the PR. Add `--working-tree` to include uncommitted
+  changes; why-diff warns on stderr when the tree is dirty and the flag is absent.
 - `--session <files...>`, `--harness <list>`, `--since <date>` and `--scan-all`
   pick the transcripts, as in the main command.
 - If the description is too long for the section, it is shrunk to fit GitHub's

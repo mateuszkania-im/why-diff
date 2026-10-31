@@ -127,6 +127,17 @@ describe.skipIf(!hasJq)('action comment script', () => {
     expect(writes[0]?.args).toContain('repos/acme/app/issues/comments/6');
   });
 
+  it('uses COMMENT_AUTHOR as the identity filter (GitHub App token that cannot call /user)', () => {
+    comments([
+      { id: 8, login: 'github-actions[bot]', body: `${MARKER}\nother` },
+      { id: 9, login: 'my-app[bot]', body: `${MARKER}\nours` },
+    ]);
+    const r = run({ COMMENT_AUTHOR: 'my-app[bot]' });
+    const writes = r.calls.filter((c) => c.args.includes('PATCH') || c.args.includes('POST'));
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.args).toContain('repos/acme/app/issues/comments/9');
+  });
+
   it('a failing write is a warning, not a failed step', () => {
     const r = run({ GH_STUB_WRITE_FAIL: '1' });
     expect(r.status).toBe(0);
@@ -147,7 +158,9 @@ describe('action.yml', () => {
   it('runs the comment script, passes the head repo, and always writes the job summary', () => {
     expect(yml).toContain('bash "$GITHUB_ACTION_PATH/scripts/action-comment.sh"');
     expect(yml).toContain('HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}');
-    expect(yml).toContain('GH_TOKEN: ${{ github.token }}');
+    expect(yml).toContain('GH_TOKEN: ${{ inputs.token }}');
+    expect(yml).toMatch(/token:\n\s+description:[\s\S]*?default: \$\{\{ github\.token \}\}/);
+    expect(yml).toContain('COMMENT_AUTHOR: ${{ inputs.comment-author }}');
     expect(yml).toContain('>> "$GITHUB_STEP_SUMMARY"');
   });
 });

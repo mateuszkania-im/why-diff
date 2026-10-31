@@ -95,7 +95,7 @@ why-diff v0.2.0 · generated 31 Oct 2026, 21:47 UTC
 
 - **Per-line provenance.** Each added line is owned by the edit that *introduced* it (not the one that merely had it as context). Hunks that mix several prompts, or your own manual edits, are split into segments.
 - **Deterministic risk labels** (no LLM): test files changed, `.skip/.only/xit/@pytest.mark.skip/t.Skip` added, tests disabled (config excludes, `|| true` on a test command, `continue-on-error` on a test step, test files renamed away or deleted), assertions removed or weakened (`toBe` → `toBeDefined`, `.not` dropped, expected number changed), snapshots, new dependencies, lockfiles, CI and build config, `eslint-disable` / `@ts-ignore` / `noqa`, new `any`, secret-looking strings (masked), files no prompt mentioned.
-- **Optional intent check** (`--classify`): a small model reads your prompts and each hunk (by reference id, it never rewrites code) and answers *requested / implied / unrequested / unclear* with a one-line reason. It uses your local `claude` CLI by default, so no API key is needed. Anthropic and any OpenAI-compatible endpoint (including Ollama) also work. Results are cached in `.why-diff/`.
+- **Optional intent check** (`--classify`): a small model reads your prompts and each hunk (by reference id, it never rewrites code) and answers *requested / implied / unrequested / unclear* with a one-line reason. It uses your local `claude` CLI by default, so no API key is needed. Anthropic and any OpenAI-compatible endpoint (including Ollama) also work. Prompts and agent rationales are secret-masked before they are sent. Results are cached in `.why-diff/`.
 - **Four outputs:** terminal, Markdown for the PR description, JSON, and a single-file HTML review page (prompt timeline, filters, `j`/`k` navigation, `x` to mark reviewed, light/dark).
 
 ## Use it
@@ -122,7 +122,7 @@ why-diff pr              # writes the report into the current branch's PR descri
 why-diff pr --dry-run    # print the new description, change nothing
 ```
 
-It needs a logged-in `gh`, edits only the description of the PR that already exists for the branch (between `<!-- why-diff:start -->` and `<!-- why-diff:end -->`), and never pushes or creates a PR. Running it again replaces that section. Add `--redact-prompts` to leave your prompt text out.
+It needs a logged-in `gh`, edits only the description of the PR that already exists for the branch (between `<!-- why-diff:start -->` and `<!-- why-diff:end -->`), and never pushes or creates a PR. Running it again replaces that section. It reports committed work (`<base>...HEAD`) like the PR itself; add `--working-tree` to include uncommitted changes. Add `--redact-prompts` to leave your prompt text out.
 
 ### As a reviewer or in CI: the GitHub Action
 
@@ -160,7 +160,7 @@ Put team rules in `.why-diff.json` at the repo root (or a `"whyDiff"` key in `pa
 - `ignore`: paths dropped from the report, counted as "N hunks ignored by config". Never a protected path, the rules file itself, a rename whose old path is not ignored, or, in the guard, anything the agent edited.
 - `blockOn`: label kinds added to the guard's blocking list.
 
-Rules are read from the base revision (the merge base of a PR, the start of the session for the guard), so a change cannot loosen the rules it is judged by, and any change to the rules file is labelled. Globs support `*`, `**` and `?`; a name without `/` matches a file or directory of that name anywhere; `{`, `[` and `!` are rejected. Matching is case-insensitive on macOS and Windows.
+Rules are read from the base revision (the merge base of a PR, the start of the session for the guard), so a change cannot loosen the rules it is judged by, and any change to the rules file is labelled. Globs support `*`, `**` and `?`; a name without `/` matches a file or directory of that name anywhere; `{`, `[` and `!` are rejected. Matching is case-insensitive on macOS and Windows. Because rules come from the base revision, an `ignore` you add in your branch does nothing until it is committed to the base branch; why-diff prints a note when it drops one. `protected` and `blockOn` from the working tree still apply.
 
 With the [Claude Code plugin](#claude-code-plugin) installed, the Stop hook guard applies these rules in every session: if the agent skipped, weakened, disabled or deleted a test, touched CI or a protected path, or added something that looks like a secret, it is not allowed to finish silently.
 
@@ -227,7 +227,7 @@ why-diff [range] [options] [-- <paths>]
   -V, --version          print the version
 
 why-diff pr [options]    put the report into the current branch's PR description (gh pr edit)
-                         --dry-run, --base, --classify, --redact-prompts, transcript options as above
+                         --dry-run, --base, --working-tree, --classify, --redact-prompts, transcript options as above
 why-diff guard [--on k]  Claude Code Stop hook (reads the hook payload from stdin)
 ```
 

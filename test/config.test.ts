@@ -132,6 +132,17 @@ describe('loadConfig', () => {
     put(repo, '.why-diff.json', JSON.stringify({ ignore: ['**'], protected: ['infra/**'], blockOn: ['lockfile'] }));
     expect(await loadConfig(repo, 'HEAD')).toEqual({ protected: ['infra/**'], blockOn: ['lockfile'] });
   });
+  it('says so when a working-tree ignore is dropped, and stays silent otherwise', async () => {
+    const repo = makeRepo();
+    put(repo, '.why-diff.json', JSON.stringify({ ignore: ['**'], protected: ['infra/**'] }));
+    const notes: string[] = [];
+    await loadConfig(repo, 'HEAD', (m) => notes.push(m));
+    expect(notes).toEqual(['ignore in .why-diff.json takes effect once it is committed to the base branch']);
+    const quiet: string[] = [];
+    put(repo, '.why-diff.json', JSON.stringify({ protected: ['infra/**'] }));
+    await loadConfig(repo, 'HEAD', (m) => quiet.push(m));
+    expect(quiet).toEqual([]);
+  });
   it('an unresolvable base revision is treated as no base config', async () => {
     const repo = makeRepo();
     put(repo, '.why-diff.json', JSON.stringify({ ignore: ['**'], protected: ['infra/**'] }));

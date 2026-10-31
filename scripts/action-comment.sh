@@ -2,7 +2,7 @@
 # Sticky PR comment for the why-diff GitHub Action (action.yml).
 #
 # Env: REPORT (markdown file), REPO (owner/name), HEAD_REPO (PR head owner/name),
-# PR_NUMBER, RUNNER_TEMP, GH_TOKEN. Never fails the job: a comment that cannot be
+# PR_NUMBER, RUNNER_TEMP, GH_TOKEN, optional COMMENT_AUTHOR (login owning the sticky comment). Never fails the job: a comment that cannot be
 # posted is a warning, the report is already in the job summary.
 set -euo pipefail
 
@@ -19,7 +19,9 @@ body="$RUNNER_TEMP/why-diff-comment.md"
 # Only a comment written by this token's identity counts, so a marker planted by
 # someone else is never edited. GITHUB_TOKEN cannot call /user; a PAT can.
 login='github-actions[bot]'
-if me=$(gh api user --jq .login 2>/dev/null) && [[ "$me" =~ ^[A-Za-z0-9-]+(\[bot\])?$ ]]; then
+if [ -n "${COMMENT_AUTHOR:-}" ] && [[ "$COMMENT_AUTHOR" =~ ^[A-Za-z0-9-]+(\[bot\])?$ ]]; then
+  login="$COMMENT_AUTHOR"
+elif me=$(gh api user --jq .login 2>/dev/null) && [[ "$me" =~ ^[A-Za-z0-9-]+(\[bot\])?$ ]]; then
   login="$me"
 fi
 

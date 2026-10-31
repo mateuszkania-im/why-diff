@@ -25,6 +25,19 @@ inputs:
     required: false
     default: ${{ github.base_ref }}
 
+  token:
+    description: >-
+      Token used to post the comment. The default GITHUB_TOKEN posts as github-actions[bot];
+      pass a personal access token or GitHub App token to post as another identity.
+    required: false
+    default: ${{ github.token }}
+  comment-author:
+    description: >-
+      Login of the identity that owns the sticky comment (for example `my-app[bot]`), used to find
+      the comment to update. Empty: the token's own login when `gh api user` works, else github-actions[bot].
+    required: false
+    default: ''
+
 outputs:
   report:
     description: Path of the Markdown report written by the action.
@@ -61,7 +74,8 @@ runs:
       if: inputs.comment == 'true' && github.event.pull_request.number
       shell: bash
       env:
-        GH_TOKEN: ${{ github.token }}
+        GH_TOKEN: ${{ inputs.token }}
+        COMMENT_AUTHOR: ${{ inputs.comment-author }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
         HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}

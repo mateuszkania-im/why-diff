@@ -101,7 +101,7 @@ async function readRaw(root: string, rev?: string): Promise<{ file: string; raw:
  * change itself); it falls back to the working tree only when `rev` has no
  * config at all. Throws an Error naming the file when it is unreadable or invalid.
  */
-export async function loadConfig(repoRoot: string, rev?: string): Promise<WhyDiffConfig> {
+export async function loadConfig(repoRoot: string, rev?: string, onNote?: (msg: string) => void): Promise<WhyDiffConfig> {
   const base = rev !== undefined ? await readRaw(repoRoot, rev) : undefined;
   if (base) return validate(base.file, base.raw);
   const wt = await readRaw(repoRoot);
@@ -109,7 +109,10 @@ export async function loadConfig(repoRoot: string, rev?: string): Promise<WhyDif
   const config = validate(wt.file, wt.raw);
   // No usable base config (none, or the revision does not resolve): the working-tree
   // file may only add strictness, so a change that introduces `ignore` hides nothing.
-  if (rev !== undefined) delete config.ignore;
+  if (rev !== undefined && config.ignore !== undefined) {
+    delete config.ignore;
+    onNote?.(`ignore in ${wt.file === CONFIG_FILE ? CONFIG_FILE : 'package.json'} takes effect once it is committed to the base branch`);
+  }
   return config;
 }
 

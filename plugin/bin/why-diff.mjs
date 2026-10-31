@@ -2744,7 +2744,7 @@ async function isShallow(cwd) {
     return !1;
   }
 }
-var SHALLOW_HINT = "this is a shallow clone; fetch full history (actions/checkout: fetch-depth: 0) or pass --base";
+var SHALLOW_HINT = "this is a shallow clone; fetch full history (actions/checkout: fetch-depth: 0)";
 async function syntheticAddedFileDiff(root, rel) {
   let abs = path2.join(root, rel), buf;
   try {
@@ -4552,6 +4552,7 @@ function buildScopeIndex(hunks, ctx) {
   return {
     promptDirs,
     promptFiles,
+    anchoredFiles: /* @__PURE__ */ new Map(),
     promptTexts: new Map(ctx.prompts.map((p) => [p.id, p.text.toLowerCase()])),
     promptText: ctx.prompts.map((p) => p.text).join(`
 `).toLowerCase(),
@@ -4592,11 +4593,15 @@ function anchoredBy(path13, id, scope) {
   for (let d of scope.promptDirs.get(id) ?? []) if (d !== "." && sameArea(d, dir)) return !0;
   return !1;
 }
+function anchoredFilesOf(id, scope) {
+  let set = scope.anchoredFiles.get(id);
+  return set || (set = new Set((scope.promptFiles.get(id) ?? []).filter((f) => anchoredBy(f, id, scope))), scope.anchoredFiles.set(id, set)), set;
+}
 function outOfScopeReason(path13, scope, ids) {
   if (!scope.promptText || isLockfile(path13) || isSnapshotFile(path13)) return null;
   let dir = posix.dirname(path13);
   if (pathTokens(path13).some((t) => mentioned(t, scope.promptText)) || ids.some((id) => anchoredBy(path13, id, scope)) || scope.agentFiles.every((f) => f === path13)) return null;
-  let others = uniq(ids.flatMap((id) => scope.promptFiles.get(id) ?? [])).filter((f) => f !== path13), anchored = others.filter((f) => ids.some((id) => (scope.promptFiles.get(id) ?? []).includes(f) && anchoredBy(f, id, scope))), pool = anchored.length > 0 ? anchored : others;
+  let others = uniq(ids.flatMap((id) => scope.promptFiles.get(id) ?? [])).filter((f) => f !== path13), anchored = others.filter((f) => ids.some((id) => anchoredFilesOf(id, scope).has(f))), pool = anchored.length > 0 ? anchored : others;
   return pool.length > 0 && pool.filter((f) => related(posix.dirname(f), dir)).length / pool.length > 0.5 ? null : `Not mentioned in any prompt and away from the agent's other edits (${dir === "." ? "repo root" : `${dir}/`})`;
 }
 
@@ -5457,7 +5462,7 @@ var ClaudeCodeAdapter = class {
         let command = str(input.command);
         if (!command) return;
         detectBashMutations(command, call.cwd).forEach((m, n) => {
-          this.edits.push(make(n, "bash", m.path, null, m.content ?? null, { command }));
+          this.edits.push(make(n, "bash", m.path, null, m.content ?? null, { command, bashOp: m.op }));
         });
         return;
       }
@@ -6786,13 +6791,13 @@ async function readRaw(root, rev) {
   let section = pkg && typeof pkg == "object" ? pkg.whyDiff : void 0;
   return section === void 0 ? void 0 : { file: 'package.json "whyDiff"', raw: section };
 }
-async function loadConfig(repoRoot2, rev) {
+async function loadConfig(repoRoot2, rev, onNote) {
   let base = rev !== void 0 ? await readRaw(repoRoot2, rev) : void 0;
   if (base) return validate(base.file, base.raw);
   let wt = await readRaw(repoRoot2);
   if (!wt) return {};
   let config = validate(wt.file, wt.raw);
-  return rev !== void 0 && delete config.ignore, config;
+  return rev !== void 0 && config.ignore !== void 0 && (delete config.ignore, onNote?.(`ignore in ${wt.file === CONFIG_FILE ? CONFIG_FILE : "package.json"} takes effect once it is committed to the base branch`)), config;
 }
 async function configChanged(repoRoot2, baseRev, headRev) {
   let side = async (rev) => {
@@ -7396,11 +7401,13 @@ async function buildReport(opts = {}) {
     target = opts.range, rangeLabel = opts.range;
   else {
     let resolved = await resolveDefaultTarget(root, process.env, opts.base);
-    if (opts.base && !resolved.base) throw new Error(`cannot compare against --base ${opts.base}: ref not found or no commits beyond it`);
-    if (!resolved.base && !resolved.onBase && await isShallow(root)) throw new Error(SHALLOW_HINT);
-    target = resolved.target, rangeLabel = resolved.label;
+    if (!resolved.base && !resolved.onBase) {
+      if (await isShallow(root)) throw new Error(SHALLOW_HINT);
+      if (opts.base) throw new Error(`cannot compare against --base ${opts.base}: ref not found or no commits beyond it`);
+    }
+    opts.committedOnly && resolved.base ? (target = `${resolved.base}...HEAD`, rangeLabel = target) : (target = resolved.target, rangeLabel = resolved.label);
   }
-  let baseRev = await policyRev(root, target), config = opts.config ?? await loadConfig(root, baseRev), protectedGlob = compileGlobs(config.protected), ignoredGlob = compileGlobs(config.ignore);
+  let baseRev = await policyRev(root, target), config = opts.config ?? await loadConfig(root, baseRev, log), protectedGlob = compileGlobs(config.protected), ignoredGlob = compileGlobs(config.ignore);
   log(`diffing ${rangeLabel}`);
   let allHunks = parseUnifiedDiff(await getDiff(root, target, { paths: opts.paths })), rulesFiles = /* @__PURE__ */ new Set();
   for (let h of allHunks)
@@ -8852,11 +8859,20 @@ async function guard(payload, opts) {
     home: opts.home,
     config,
     keepAgentIgnored: !0
-  }), hits = [], keys = [];
-  for (let h of report.hunks)
-    if (!(h.match !== "exact" && h.match !== "partial") && !(!h.editIds.length || !h.editIds.every((id) => id.startsWith(`${session.id}:`))))
+  }), removedByShell = new Set(session.edits.filter((e) => !e.failed && e.kind === "bash" && (e.bashOp === "delete" || e.bashOp === "move")).map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants)).filter((p) => !!p).map((p) => p.split(path11.sep).join("/").replace(/^(\.\/)+/, "").replace(/\/+$/, ""))), shellRemoved = (file) => {
+    let f = file.replace(/^(\.\/)+/, "");
+    for (let r of removedByShell) if (r && (f === r || f.startsWith(`${r}/`))) return !0;
+    return !1;
+  }, hits = [], keys = [];
+  for (let h of report.hunks) {
+    if (h.match !== "exact" && h.match !== "partial") {
+      let gone = h.hunk.status === "deleted" || h.hunk.status === "renamed", source = h.hunk.oldFile ?? h.hunk.file;
+      if (!(h.match === "file-only" && gone && !h.hunk.lines.some((l) => l.type === "add") && shellRemoved(source))) continue;
+    }
+    if (!(!h.editIds.length || !h.editIds.every((id) => id.startsWith(`${session.id}:`))))
       for (let l of h.labels)
         blocking.has(l.kind) && (hits.push(`- ${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`), keys.push(`${h.hunk.file}	${l.kind}	${l.detail}`));
+  }
   let stateDir = opts.stateDir ?? path11.join(root, ".why-diff"), stateFile = path11.join(stateDir, "guard-state.json"), sessionKey = payload.session_id ?? session.id, hash = createHash2("sha256").update(keys.sort().join(`
 `)).digest("hex");
   try {
@@ -8963,12 +8979,10 @@ program2.name("why-diff").enablePositionalOptions().version(VERSION, "-V, --vers
 `));
   }, format = o.html ? "html" : o.format ?? (o.out && String(o.out).endsWith(".html") ? "html" : "terminal");
   if (!isReportFormat(format)) throw new Error(`unknown format ${format}`);
-  let harnesses = parseHarnesses(o.harness), dd = process.argv.indexOf("--"), paths = dd >= 0 ? process.argv.slice(dd + 1) : [], range = rangeArg;
-  if (paths.length)
-    pathArgs.length + (rangeArg === void 0 ? 0 : 1) > paths.length ? range = rangeArg : range = void 0;
-  else if (pathArgs.length)
-    throw new Error("extra arguments: put paths after -- (why-diff [range] -- <paths>)");
-  let classify;
+  let harnesses = parseHarnesses(o.harness), dd = process.argv.indexOf("--"), paths = dd >= 0 ? process.argv.slice(dd + 1) : [], positionals = [...rangeArg === void 0 ? [] : [rangeArg], ...pathArgs], beforeDd = dd >= 0 ? positionals.slice(0, Math.max(0, positionals.length - paths.length)) : positionals;
+  if (beforeDd.length > 1) throw new Error(`too many arguments: ${beforeDd.map((a) => `"${a}"`).join(" ")} (one optional range, then -- <paths>)`);
+  if (dd < 0 && beforeDd.length === 1 && pathArgs.length) throw new Error("too many arguments: put paths after -- (why-diff [range] -- <paths>)");
+  let range = beforeDd[0], classify;
   if (o.classify === !1 || o.classify === void 0) classify = "none";
   else if (o.classify === !0) classify = "auto";
   else if (CLASSIFIERS.includes(o.classify)) classify = o.classify;
@@ -9014,7 +9028,7 @@ program2.name("why-diff").enablePositionalOptions().version(VERSION, "-V, --vers
 `)), process.exitCode = 1);
   }
 });
-program2.command("pr").description("put the report into the current branch's pull request body (gh pr edit); never pushes or creates a PR").option("--base <ref>", "branch or ref the PR targets (default: auto-detected)").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo that edited files in it; slower").option("--redact-prompts", "omit prompt text and agent rationales (secrets are always masked)").option("--dry-run", "print the new PR body instead of editing the PR").option("-q, --quiet", "no progress output").action(async (o) => {
+program2.command("pr").description("put the report into the current branch's pull request body (gh pr edit); never pushes or creates a PR").option("--base <ref>", "branch or ref the PR targets (default: auto-detected)").option("-w, --working-tree", "also include uncommitted changes (default: committed work only, <base>...HEAD)").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo that edited files in it; slower").option("--redact-prompts", "omit prompt text and agent rationales (secrets are always masked)").option("--dry-run", "print the new PR body instead of editing the PR").option("-q, --quiet", "no progress output").action(async (o) => {
   let progress = (msg) => {
     o.quiet || process.stderr.write(import_picocolors2.default.dim(`\xB7 ${msg}
 `));
@@ -9026,8 +9040,12 @@ program2.command("pr").description("put the report into the current branch's pul
   }
   let harnesses = parseHarnesses(o.harness), since = parseSince(o.since), gh = ghRunner(), body = await readPrBody(gh), budget = Math.min(6e4, sectionBudget(body));
   if (budget < 1e3) throw new Error(`the pull request description is too long to add the why-diff section (GitHub allows ${PR_BODY_LIMIT} characters); shorten it and run again`);
+  let withWorkingTree = !!o.workingTree;
+  !withWorkingTree && await isDirty(process.cwd()) && process.stderr.write(import_picocolors2.default.yellow(`why-diff: uncommitted changes are not included in the PR report (committed work only); use --working-tree to include them
+`));
   let built = await buildReport({
     base: o.base,
+    committedOnly: !withWorkingTree,
     harnesses,
     sessionFiles: o.session,
     since,
@@ -9056,6 +9074,13 @@ program2.command("guard").description("Claude Code Stop hook: block the agent fr
   let blocking = o.on === void 0 ? void 0 : new Set(o.on.split(",").map((s) => s.trim()).filter(Boolean)), result = await runGuard(payload, { blocking });
   result.block && (process.stderr.write(result.message ?? ""), process.exitCode = 2);
 });
+async function isDirty(cwd) {
+  try {
+    return (await git(cwd, ["status", "--porcelain"])).length > 0;
+  } catch {
+    return !1;
+  }
+}
 function parseHarnesses(value) {
   if (!value) return;
   let list = String(value).split(",").map((s) => s.trim()).filter(Boolean), unknown = list.find((h) => !HARNESSES.includes(h));

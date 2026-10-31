@@ -111,7 +111,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   }
 
   const baseRev = await policyRev(root, target);
-  const config = opts.config ?? (await loadConfig(root, baseRev));
+  const config = opts.config ?? (await loadConfig(root, baseRev, log));
   const protectedGlob = compileGlobs(config.protected);
   const ignoredGlob = compileGlobs(config.ignore);
 
