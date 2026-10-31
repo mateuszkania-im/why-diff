@@ -2,17 +2,15 @@
 
 **`git diff` tells you what your coding agent changed. `why-diff` tells you why.**
 
-Every hunk of an agent's diff, traced back to the prompt you typed and the tool call that wrote it. Hunks nobody asked for, tests that were skipped or weakened, new dependencies and CI edits are flagged before you commit.
+Every hunk of an agent's diff, traced back to the prompt you typed and the tool call that wrote it. Hunks nobody asked for, tests that were skipped, weakened or turned off, new dependencies and CI edits are flagged before you commit.
 
 ```bash
-npx github:mateuszkania-im/why-diff            # branch + working tree, in your terminal
-npx github:mateuszkania-im/why-diff --html     # interactive review page
-npx github:mateuszkania-im/why-diff --classify # + "did I actually ask for this?" check per hunk
+npx -y github:mateuszkania-im/why-diff            # branch + working tree, in your terminal
+npx -y github:mateuszkania-im/why-diff --html     # interactive review page
+npx -y github:mateuszkania-im/why-diff --classify # + "did I actually ask for this?" check per hunk
 ```
 
-Installs and builds straight from this repo (Node 20+). Tip: `alias why-diff="npx -y github:mateuszkania-im/why-diff"`. The examples below use `why-diff` for short.
-
-Works with **Claude Code**, **Codex** and **OpenCode** transcripts. Runs locally. No account, no server, no telemetry.
+Node 20+. Works with **Claude Code**, **Codex** and **OpenCode** transcripts. Runs locally. No account, no server, no telemetry. The examples below use `why-diff` for short (see [Install](#install)).
 
 <!-- STUDY:START -->
 > **What we measured** ([full study](docs/STUDY.md), 78 headless Claude Code sessions, raw data in `bench/`):
@@ -28,15 +26,33 @@ Works with **Claude Code**, **Codex** and **OpenCode** transcripts. Runs locally
 
 ---
 
-## Why
+## Why this exists
 
-Reviewing agent-written code is now the bottleneck. A 400-line diff from a 20-minute session mixes three things you can't tell apart in `git diff`:
+**The problem.** Reviewing agent-written code is now the bottleneck. A 400-line diff from a 20-minute session mixes three things you can't tell apart in `git diff`:
 
 1. what you asked for,
 2. what the agent decided was "implied" (imports, wiring, a drive-by refactor),
-3. what it did to make the build green: `it.skip`, a loosened `toBe` → `toBeTruthy`, `"strict": false`.
+3. what it did to make the build green: `it.skip`, a loosened `toBe` to `toBeTruthy`, `"strict": false`, `|| true` after the test command.
 
-The transcript knows which is which. Claude Code, Codex and OpenCode already record every `Edit`, `Write` and `apply_patch` with the exact old and new text. `why-diff` joins that record with your git diff, line by line.
+`git blame` says the agent wrote all of it. The commit message is the agent's own summary. Neither tells you which prompt a line came from, or whether any prompt asked for it.
+
+**Transcripts are the missing link.** Claude Code, Codex and OpenCode already record every `Edit`, `Write` and `apply_patch` with the exact old and new text, next to the prompt that led to it. The record exists on your machine; nothing reads it at review time. `why-diff` joins that record with your git diff, line by line.
+
+**Instruction files are not enough.** `AGENTS.md` and `CLAUDE.md` tell the agent what to do. They don't check what it did. In [our study](docs/STUDY.md) Claude Code never edited a test in 72 runs, with or without a CLAUDE.md rule against it. One sentence of pressure in the prompt ("just get `npm test` fully green") was enough for it to edit the tests in 5 of 6 tasks it could not solve honestly. An instruction can be outweighed by the next prompt, and nothing tells you when that happened. why-diff flagged all 5 of those test edits, because it looks at the result instead of the request.
+
+**What it is not.**
+
+- Not a code reviewer. It doesn't judge whether the code is correct, fast or well designed.
+- Not a linter. The risk labels point at things a human should look at (a removed assertion, a new dependency, a CI change); they don't enforce style.
+- Not telemetry. Transcripts are read locally and nothing is sent anywhere. The only network call is the optional `--classify` intent check, to the model backend you pick.
+
+## How is this different from code review?
+
+Claude Code's Code Review tab and AI pull request reviewers answer "is this code good?". why-diff answers "where did each change come from, and was it asked for?".
+
+- **Provenance, not opinion.** Attribution and risk labels are deterministic: the same diff and transcripts give the same report. Only the optional intent check uses a model.
+- **Across sessions, PRs and CI.** One report covers every agent session that touched the branch, can go into the PR description, and runs as a risk scan in CI.
+- **They combine.** The report is context for a reviewer, human or AI: it tells them which hunks nobody asked for and which tests changed, so they know where to look first.
 
 ## What you get
 
@@ -82,6 +98,86 @@ why-diff v0.1.0 · generated 31 Oct 2026, 17:44 UTC
 - **Optional intent check** (`--classify`): a small model reads your prompts and each hunk (by reference id, it never rewrites code) and answers *requested / implied / unrequested / unclear* with a one-line reason. It uses your local `claude` CLI by default, so no API key is needed. Anthropic and any OpenAI-compatible endpoint (including Ollama) also work. Results are cached in `.why-diff/`.
 - **Four outputs:** terminal, Markdown for the PR description, JSON, and a single-file HTML review page (prompt timeline, filters, `j`/`k` navigation, `x` to mark reviewed, light/dark).
 
+## Use it
+
+### After a session
+
+Run it in the repo when the agent stops, before you commit:
+
+```bash
+why-diff                 # branch vs its base + uncommitted work, in the terminal
+why-diff --html          # .why-diff/report.html: prompt timeline, filters, j/k, x to mark reviewed
+why-diff -w              # only uncommitted changes
+why-diff -- src          # only these paths
+```
+
+The base branch is auto-detected (`origin/HEAD`, then `main`, `master`, `develop`, `trunk`); pass `--base <ref>` to choose. Sessions run in other `git worktree`s of the same repo are found too. The `.why-diff/` folder (HTML report, intent cache) is never part of the diff.
+
+### As a PR author: `why-diff pr`
+
+The transcripts live on your machine, so the author is the one who can attach provenance to a PR:
+
+```bash
+why-diff pr              # writes the report into the current branch's PR description
+why-diff pr --dry-run    # print the new description, change nothing
+```
+
+It needs a logged-in `gh`, edits only the description of the PR that already exists for the branch (between `<!-- why-diff:start -->` and `<!-- why-diff:end -->`), and never pushes or creates a PR. Running it again replaces that section. Add `--redact-prompts` to leave your prompt text out.
+
+### As a reviewer or in CI: the GitHub Action
+
+CI has no transcripts, so there why-diff runs in **risk-scan mode**: no prompt attribution and no `unattributed` label, but every risk label (skipped or weakened tests, tests turned off in config, new dependencies, CI changes, suppressions, secret-like strings) on the PR diff. The action posts it as one sticky PR comment and the job summary.
+
+```yaml
+# .github/workflows/why-diff.yml
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  why-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # required: a shallow clone has no merge base
+      - uses: mateuszkania-im/why-diff@main
+        with:
+          fail-on: risk    # optional
+```
+
+Fork PRs get the job summary only. Inputs, outputs and the security notes are in [docs/github-action.md](docs/github-action.md). Outside GitHub Actions, the CLI reads the target branch from GitLab (`CI_MERGE_REQUEST_TARGET_BRANCH_NAME`) and Bitbucket (`BITBUCKET_PR_DESTINATION_BRANCH`) variables. A reviewer can also run `why-diff` on a checked-out PR branch locally and get the same risk scan.
+
+### As a team: `.why-diff.json` and the Stop hook
+
+Put team rules in `.why-diff.json` at the repo root (or a `"whyDiff"` key in `package.json`):
+
+```json
+{ "protected": ["migrations/**"], "ignore": ["generated/**"], "blockOn": ["lockfile"] }
+```
+
+- `protected`: agent edits under these paths get a `protected-path` risk label (in a risk scan, every hunk there does).
+- `ignore`: paths dropped from the report, counted as "N hunks ignored by config". Never a protected path, the rules file itself, a rename whose old path is not ignored, or, in the guard, anything the agent edited.
+- `blockOn`: label kinds added to the guard's blocking list.
+
+Rules are read from the base revision (the merge base of a PR, the start of the session for the guard), so a change cannot loosen the rules it is judged by, and any change to the rules file is labelled. Globs support `*`, `**` and `?`; a name without `/` matches a file or directory of that name anywhere; `{`, `[` and `!` are rejected. Matching is case-insensitive on macOS and Windows.
+
+With the [Claude Code plugin](#claude-code-plugin) installed, the Stop hook guard applies these rules in every session: if the agent skipped, weakened, disabled or deleted a test, touched CI or a protected path, or added something that looks like a secret, it is not allowed to finish silently.
+
+## Install
+
+```bash
+npx -y github:mateuszkania-im/why-diff --version
+```
+
+That runs the committed standalone file `plugin/bin/why-diff.mjs` (one file, zero dependencies, nothing to build). From v0.2.0 each release also has a tarball, which skips the git clone and is faster:
+
+```bash
+npx -y https://github.com/mateuszkania-im/why-diff/releases/download/v0.2.0/why-diff.tgz --version
+```
+
+Tip: `alias why-diff="npx -y github:mateuszkania-im/why-diff"`.
+
 ## Claude Code plugin
 
 ```text
@@ -93,7 +189,7 @@ You get:
 
 - **`/why-diff`**: a review of the current diff, summarised by Claude with every risk quoted as `file:line`.
 - **A skill** Claude uses before committing or opening a PR, so it reports its own scope creep.
-- **A Stop hook guard** (`why-diff guard`): if the agent skipped, deleted or weakened a test, touched CI, or added something that looks like a secret *in this session*, it is not allowed to finish silently. The hook blocks once and tells it to revert or tell you plainly. It never blocks twice in a row and never breaks your session if something goes wrong. Team rules live in `.why-diff.json` at the repo root (or a `"whyDiff"` key in `package.json`): `{ "protected": ["migrations/**"], "ignore": ["generated/**"], "blockOn": ["lockfile"] }`. They are read from the base revision (the guard's session start, the merge-base of a PR), so a change cannot loosen the rules it is judged by. Agent edits under `protected` paths get a `protected-path` risk label (every hunk in a risk scan), and any change to the rules file itself is labelled too. `ignore` drops paths from the report (counted as "N hunks ignored by config"), but never a protected path, the rules file, a rename whose old path is not ignored, or, in the guard, anything the agent edited. `blockOn` adds label kinds to the guard's built-in list; only an explicit `--on` replaces it. Globs support `*`, `**` and `?`; a name without `/` matches a file or directory of that name anywhere; `{`, `[` and `!` are rejected. Matching is case-insensitive on macOS and Windows.
+- **A Stop hook guard** (`why-diff guard`): it looks only at the edits this session made (including commits made during the session) and blocks on `test-skip-added`, `tests-disabled`, `assertion-removed`, `secret-like`, `ci-changed` and `protected-path`, plus `blockOn` from `.why-diff.json` (`--on` replaces the list). The hook blocks once and tells the agent to revert or tell you plainly. It never blocks twice for the same finding and never breaks your session: any internal error means "let it stop", and a corrupt state file cannot switch it off. It runs the CLI bundled in the plugin, locally, with no network and no install.
 
 ## Intent check accuracy
 
@@ -108,26 +204,38 @@ Full confusion matrix in [evals/RESULTS.md](evals/RESULTS.md). Rerun with `npm r
 ## CLI
 
 ```text
-why-diff [range] [options]
+why-diff [range] [options] [-- <paths>]
 
-  range                  git range or commit (default: branch vs main + working tree)
+  range                  git range or commit (default: branch vs its base + working tree)
+  -- <paths>             only these paths, e.g. why-diff -- src
+  --base <ref>           branch or ref to compare against (default: auto-detected, incl. CI PR targets)
   -w, --working-tree     only uncommitted changes
   -f, --format <f>       terminal | md | html | json
   --html                 write .why-diff/report.html and open it
   -o, --out <file>       write to a file
+  --no-open              do not open the HTML report
   -c, --classify [b]     intent check: auto | claude-cli | anthropic | openai
   -m, --model <m>        model for the intent check (default: haiku)
   --harness <list>       claude-code,codex,opencode
   -s, --session <files>  explicit transcript files
-  --since <date>         only sessions after this date (default: first commit of the range minus 6 h)
+  --since <date>         only sessions after this date (default: the commit the range starts from, minus 6 h)
   --scan-all             also scan transcripts started outside the repo that edited files in it (slower)
-  --fail-on <what>       risk | unrequested | tests | unattributed  (exit 1, for CI/hooks)
+  --fail-on <what>       risk | unrequested | tests | unattributed  (comma list; exit 1, for CI/hooks)
+  --redact-prompts       omit prompt text and agent rationales (secrets are always masked)
   -v, --verbose          show the agent's rationale, commands and label details
+  -q, --quiet            no progress output
+  -V, --version          print the version
 
-why-diff guard           Claude Code Stop hook (reads the hook payload from stdin)
+why-diff pr [options]    put the report into the current branch's PR description (gh pr edit)
+                         --dry-run, --base, --classify, --redact-prompts, transcript options as above
+why-diff guard [--on k]  Claude Code Stop hook (reads the hook payload from stdin)
 ```
 
-Put the Markdown in your PR:
+Invalid values for `--fail-on`, `--since`, `--classify` and `--format` are rejected with an error instead of being ignored. Binary files are listed but not diffed. Home directory paths in reports are shortened to `~`. JSON output carries `schemaVersion: 1` and `mode` (`provenance` or `risk-scan`).
+
+Secrets are masked everywhere they could leak: prompts, agent rationales, edit bodies, intent-check reasons, and key-shaped secrets in diff lines. `--redact-prompts` goes further and leaves prompt text and rationales out entirely, for reports you share.
+
+Put the Markdown in a new PR by hand (or use `why-diff pr` on an existing one):
 
 ```bash
 why-diff main...HEAD --format md --classify > provenance.md
@@ -159,6 +267,8 @@ Reports stay small on big diffs: every edit a hunk references is stored once in 
 
 ## Limitations
 
+- Provenance needs the transcripts, and they live only on the machine of whoever ran the agent. A reviewer or CI without them gets a risk scan: the same risk labels, but no prompt attribution and no `unattributed` label. That is why `why-diff pr` exists: the author attaches provenance to the PR.
+- In a risk scan, `protected-path` applies to every hunk under a protected path, because there is no way to tell agent edits from human ones.
 - The intent check judges whole hunks: a requested 17-line function next to an accidental one-line change can be marked `unrequested` as a whole. Its verdicts also vary between runs on borderline cases. Use it to point your attention, not as a score.
 - Transcript formats are not public contracts. Adapters are tested against current Claude Code (2.1.x) and Codex (0.16x) files and will need updates.
 - Lines written by scripts the agent ran (`node fix.js`, codegen, formatters) can't be traced line by line, and show as `file-only` matches.
@@ -166,6 +276,8 @@ Reports stay small on big diffs: every edit a hunk references is stored once in 
 - Sessions run in a `git worktree` are found while that worktree still exists (`git worktree list`), or when it was nested under the repo. Once a worktree outside the repo is removed, its transcripts are generally not found (`--scan-all` only matches edits by absolute path under the repo root), so review before pruning worktrees.
 - If an agent edited a file earlier and those edits were later reverted, a line you then type by hand in that file can show as a `file-only` match to that old prompt. It still carries the `unattributed` label, so it doesn't pass as agent work.
 - Claude Code deletes transcripts after 30 days by default (`cleanupPeriodDays`). Review before that, or raise it.
+- The guard is a Claude Code Stop hook only. Codex and OpenCode sessions are covered by the CLI and the Action, not blocked live.
+- Secret masking is pattern-based. It catches common key formats and `name = value` assignments, not every possible secret. Don't treat a report as safe to publish just because nothing was masked.
 - The intent check is a model judgement (see accuracy above), not a gate. The deterministic labels are the gate.
 - OpenCode support is implemented from its source code and fixtures, not yet battle-tested.
 
