@@ -3712,7 +3712,7 @@ function computeLabels(h, path13, scope, ctx) {
   let secrets = detectSecrets(path13, lines);
   if (secrets.length > 0 && push("secret-like", "risk", secrets.join("; ")), ctx.rulesFiles?.has(path13))
     push("protected-path", "risk", `Team rules changed (${path13})`);
-  else if (ctx.protectedGlob && (agent || ctx.riskScan)) {
+  else if (ctx.protectedGlob && (h.match !== "none" || ctx.riskScan)) {
     let oldPath = h.hunk.oldFile ? toRepoPath(h.hunk.oldFile, ctx.repoRoot) : void 0, glob = ctx.protectedGlob(path13) ?? (oldPath ? ctx.protectedGlob(oldPath) : void 0);
     glob && push("protected-path", "risk", `Protected path (${glob}): ${oldPath && oldPath !== path13 ? `${oldPath} -> ${path13}` : path13}`);
   }
@@ -6787,8 +6787,12 @@ async function readRaw(root, rev) {
   return section === void 0 ? void 0 : { file: 'package.json "whyDiff"', raw: section };
 }
 async function loadConfig(repoRoot2, rev) {
-  let found = rev !== void 0 ? await readRaw(repoRoot2, rev) : void 0;
-  return found || (found = await readRaw(repoRoot2)), found ? validate(found.file, found.raw) : {};
+  let base = rev !== void 0 ? await readRaw(repoRoot2, rev) : void 0;
+  if (base) return validate(base.file, base.raw);
+  let wt = await readRaw(repoRoot2);
+  if (!wt) return {};
+  let config = validate(wt.file, wt.raw);
+  return rev !== void 0 && delete config.ignore, config;
 }
 async function configChanged(repoRoot2, baseRev, headRev) {
   let side = async (rev) => {
@@ -6801,13 +6805,16 @@ async function configChanged(repoRoot2, baseRev, headRev) {
   return await side(baseRev) !== await side(headRev);
 }
 var CASE_INSENSITIVE = process.platform === "darwin" || process.platform === "win32";
+function samePath(a, b) {
+  return CASE_INSENSITIVE ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
 function segmentMatch(pat, text2) {
   let p = 0, t = 0, star = -1, mark = 0;
   for (; t < text2.length; )
-    if (p < pat.length && (pat[p] === "?" || pat[p] === text2[t]))
-      p++, t++;
-    else if (p < pat.length && pat[p] === "*")
+    if (p < pat.length && pat[p] === "*")
       star = p++, mark = t;
+    else if (p < pat.length && (pat[p] === "?" || pat[p] === text2[t]))
+      p++, t++;
     else if (star >= 0)
       p = star + 1, t = ++mark;
     else return !1;
@@ -6831,7 +6838,10 @@ function compileOne(glob) {
   let g = glob.trim().replace(/\\/g, "/");
   if (!g) return;
   if (CASE_INSENSITIVE && (g = g.toLowerCase()), g.length > MAX_GLOB_LENGTH) throw new Error(`glob "${glob.slice(0, 40)}..." is too long (max ${MAX_GLOB_LENGTH})`);
-  if (g.startsWith("./") && (g = g.slice(2)), !g.replace(/\//g, "")) return;
+  let anchored = g.startsWith("./");
+  if (anchored && (g = g.slice(2)), !g.replace(/\//g, "")) return;
+  if (!g.includes("/") && anchored)
+    return { glob, test: (segs) => segmentsMatch([g, "**"], segs) };
   if (!g.includes("/"))
     return { glob, test: (segs) => segs.some((s) => segmentMatch(g, s)) };
   g.startsWith("/") && (g = g.slice(1)), g.endsWith("/") && (g += "**");
@@ -7394,8 +7404,9 @@ async function buildReport(opts = {}) {
   log(`diffing ${rangeLabel}`);
   let allHunks = parseUnifiedDiff(await getDiff(root, target, { paths: opts.paths })), rulesFiles = /* @__PURE__ */ new Set();
   for (let h of allHunks)
-    (h.file === CONFIG_FILE || h.oldFile === CONFIG_FILE) && rulesFiles.add(h.file);
-  allHunks.some((h) => h.file === "package.json") && await configChanged(root, baseRev, headRevOf(target)) && rulesFiles.add("package.json");
+    (samePath(h.file, CONFIG_FILE) || h.oldFile !== void 0 && samePath(h.oldFile, CONFIG_FILE)) && rulesFiles.add(h.file);
+  let pkgHunks = allHunks.filter((h) => samePath(h.file, "package.json"));
+  if (pkgHunks.length && await configChanged(root, baseRev, headRevOf(target))) for (let h of pkgHunks) rulesFiles.add(h.file);
   let isIgnored = (h) => !!ignoredGlob(h.file) && (!h.oldFile || !!ignoredGlob(h.oldFile)) && !protectedGlob(h.file) && !(h.oldFile && protectedGlob(h.oldFile)) && !rulesFiles.has(h.file), hunks = opts.keepAgentIgnored ? allHunks : allHunks.filter((h) => !isIgnored(h)), ignoredHunks = allHunks.length - hunks.length, window = await commitTimes(root, target).catch(() => {
   }), since = opts.since ?? (window ? new Date(new Date(window.since).getTime() - 6 * 36e5) : void 0), sessions = [], extraRoots = await worktreeRoots(root);
   if (opts.sessionFiles?.length)

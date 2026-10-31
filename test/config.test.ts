@@ -3,7 +3,7 @@ import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
-import { compileGlobs, loadConfig, matchGlobs } from '../src/config.js';
+import { compileGlobs, loadConfig, matchGlobs, samePath } from '../src/config.js';
 import { renderMarkdown } from '../src/report/index.js';
 import { runGuard } from '../src/guard.js';
 import { buildReport } from '../src/pipeline.js';
@@ -47,6 +47,11 @@ describe('glob matching', () => {
     ['migrations', 'migrations/001.sql', true],
     ['migrations', 'db/migrations/001.sql', true],
     ['migrations', 'src/migrationsX/a.sql', false],
+    ['./migrations', 'migrations/001.sql', true],
+    ['./migrations', 'db/migrations/001.sql', false],
+    ['*a', '*ba', true],
+    ['*a', '*bc', false],
+    ['a*b', 'a*xb', true],
     ['**', 'a/b/c', true],
     ['a/**/b', 'a/b', true],
     ['a/**/b', 'a/x/y/b', true],
@@ -67,6 +72,11 @@ describe('glob matching', () => {
   it('is case-insensitive on darwin and win32 only', () => {
     const insensitive = process.platform === 'darwin' || process.platform === 'win32';
     expect(matchGlobs(['Migrations/**'], 'migrations/a.sql') !== undefined).toBe(insensitive);
+  });
+  it('samePath follows the platform case rules', () => {
+    const insensitive = process.platform === 'darwin' || process.platform === 'win32';
+    expect(samePath('Package.json', 'package.json')).toBe(insensitive);
+    expect(samePath('package.json', 'package.json')).toBe(true);
   });
   it('matchGlobs returns the matching pattern', () => {
     expect(matchGlobs(['x/**', 'migrations/**'], 'migrations/1.sql')).toBe('migrations/**');
@@ -116,6 +126,16 @@ describe('loadConfig', () => {
     const repo = makeRepo();
     put(repo, '.why-diff.json', JSON.stringify({ protected: ['x/**'] }));
     expect(await loadConfig(repo, 'HEAD')).toEqual({ protected: ['x/**'] });
+  });
+  it('a working-tree config over a base without one never contributes ignore', async () => {
+    const repo = makeRepo();
+    put(repo, '.why-diff.json', JSON.stringify({ ignore: ['**'], protected: ['infra/**'], blockOn: ['lockfile'] }));
+    expect(await loadConfig(repo, 'HEAD')).toEqual({ protected: ['infra/**'], blockOn: ['lockfile'] });
+  });
+  it('an unresolvable base revision is treated as no base config', async () => {
+    const repo = makeRepo();
+    put(repo, '.why-diff.json', JSON.stringify({ ignore: ['**'], protected: ['infra/**'] }));
+    expect(await loadConfig(repo, 'no-such-rev')).toEqual({ protected: ['infra/**'] });
   });
   it('wrong types are rejected', async () => {
     await expect(loadConfig(makeRepo({ protected: 'migrations/**' }))).rejects.toThrow(/"protected" must be an array/);
@@ -204,6 +224,29 @@ describe('protected and ignore in buildReport', () => {
     const files = r.hunks.map((h) => h.hunk.file);
     expect(files).toContain('migrations/001.sql');
     expect(files).toContain('src/api.ts');
+  });
+
+  it('a PR introducing the first config cannot ignore anything but its protected path is labelled', async () => {
+    const repo = makeRepo();
+    put(repo, '.why-diff.json', JSON.stringify({ ignore: ['**'], protected: ['infra/**'] }));
+    put(repo, 'src/a.ts', 'export const a = 2;\n');
+    put(repo, 'infra/main.tf', 'resource "x" "y" {}\n');
+    const r = await buildReport({ cwd: repo, workingTree: true, home: temp('why-diff-config-home-') });
+    const files = r.hunks.map((h) => h.hunk.file);
+    expect(files).toEqual(expect.arrayContaining(['src/a.ts', 'infra/main.tf', '.why-diff.json']));
+    expect(r.summary.ignoredHunks).toBeUndefined();
+    expect(r.hunks.find((h) => h.hunk.file === 'infra/main.tf')!.labels.map((l) => l.kind)).toContain('protected-path');
+  });
+
+  it('a file-only agent match in a protected dir is labelled', async () => {
+    const repo = makeRepo({ protected: ['infra/**'] });
+    const home = temp('why-diff-config-home-');
+    const t = writeSyntheticTranscript(home, repo, 'sf', [{ prompt: 'add infra', at: SESSION_AT, calls: [{ tool: 'Write', at: CALL_AT, input: { file_path: path.join(repo, 'infra/a.json'), content: '{}\n' } }] }]);
+    put(repo, 'infra/a.json', '{}\n');
+    const r = await buildReport({ cwd: repo, workingTree: true, home, sessionFiles: [t], harnesses: ['claude-code'] });
+    const h = r.hunks.find((x) => x.hunk.file === 'infra/a.json')!;
+    expect(h.match).toBe('file-only');
+    expect(h.labels.map((l) => l.kind)).toContain('protected-path');
   });
 
   it('rename from a protected dir to an unprotected one is labelled', async () => {
@@ -306,7 +349,7 @@ describe('CLI', () => {
     const root = path.resolve(__dirname, '..');
     const tsx = pathToFileURL(path.join(root, 'node_modules', 'tsx', 'dist', 'esm', 'index.mjs')).href;
     const r = spawnSync(process.execPath, ['--import', tsx, path.join(root, 'src', 'cli.ts'), '-f', 'json', '-q'], {
-      cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: temp('why-diff-config-home-'), ...ENV, WHY_DIFF_CLAUDE_BIN: '/nonexistent' },
+      cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, ...ENV, HOME: temp('why-diff-config-home-'), WHY_DIFF_CLAUDE_BIN: '/nonexistent' },
     });
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('.why-diff.json');

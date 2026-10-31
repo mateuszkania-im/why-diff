@@ -135,7 +135,7 @@ function computeLabels(h: AttributedHunk, path: string, scope: ScopeIndex, ctx: 
 
   if (ctx.rulesFiles?.has(path)) {
     push('protected-path', 'risk', `Team rules changed (${path})`);
-  } else if (ctx.protectedGlob && (agent || ctx.riskScan)) {
+  } else if (ctx.protectedGlob && (h.match !== 'none' || ctx.riskScan)) {
     const oldPath = h.hunk.oldFile ? toRepoPath(h.hunk.oldFile, ctx.repoRoot) : undefined;
     const glob = ctx.protectedGlob(path) ?? (oldPath ? ctx.protectedGlob(oldPath) : undefined);
     if (glob) push('protected-path', 'risk', `Protected path (${glob}): ${oldPath && oldPath !== path ? `${oldPath} -> ${path}` : path}`);

@@ -15,7 +15,7 @@ import { claudeCodeAdapter } from './adapters/claude.js';
 import { codexAdapter } from './adapters/codex.js';
 import { opencodeAdapter } from './adapters/opencode.js';
 import { redactReport } from './redact.js';
-import { compileGlobs, configChanged, loadConfig, CONFIG_FILE, type WhyDiffConfig } from './config.js';
+import { compileGlobs, configChanged, loadConfig, samePath, CONFIG_FILE, type WhyDiffConfig } from './config.js';
 import { createClassifier, classifyHunks, summarizeIntent, type ClassifierKind } from './classify/index.js';
 
 export const ADAPTERS: Record<Harness, SessionAdapter> = {
@@ -111,9 +111,10 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   // The team-rules files themselves: any change is a finding, and `ignore` can never hide it.
   const rulesFiles = new Set<string>();
   for (const h of allHunks) {
-    if (h.file === CONFIG_FILE || h.oldFile === CONFIG_FILE) rulesFiles.add(h.file);
+    if (samePath(h.file, CONFIG_FILE) || (h.oldFile !== undefined && samePath(h.oldFile, CONFIG_FILE))) rulesFiles.add(h.file);
   }
-  if (allHunks.some((h) => h.file === 'package.json') && (await configChanged(root, baseRev, headRevOf(target)))) rulesFiles.add('package.json');
+  const pkgHunks = allHunks.filter((h) => samePath(h.file, 'package.json'));
+  if (pkgHunks.length && (await configChanged(root, baseRev, headRevOf(target)))) for (const h of pkgHunks) rulesFiles.add(h.file);
 
   const isIgnored = (h: Hunk): boolean =>
     Boolean(ignoredGlob(h.file)) && (!h.oldFile || Boolean(ignoredGlob(h.oldFile))) &&

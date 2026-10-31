@@ -102,9 +102,15 @@ async function readRaw(root: string, rev?: string): Promise<{ file: string; raw:
  * config at all. Throws an Error naming the file when it is unreadable or invalid.
  */
 export async function loadConfig(repoRoot: string, rev?: string): Promise<WhyDiffConfig> {
-  let found = rev !== undefined ? await readRaw(repoRoot, rev) : undefined;
-  if (!found) found = await readRaw(repoRoot);
-  return found ? validate(found.file, found.raw) : {};
+  const base = rev !== undefined ? await readRaw(repoRoot, rev) : undefined;
+  if (base) return validate(base.file, base.raw);
+  const wt = await readRaw(repoRoot);
+  if (!wt) return {};
+  const config = validate(wt.file, wt.raw);
+  // No usable base config (none, or the revision does not resolve): the working-tree
+  // file may only add strictness, so a change that introduces `ignore` hides nothing.
+  if (rev !== undefined) delete config.ignore;
+  return config;
 }
 
 /** True when the team rules differ between two revisions (undefined = working tree). Never throws. */
@@ -117,12 +123,17 @@ export async function configChanged(repoRoot: string, baseRev: string | undefine
 
 const CASE_INSENSITIVE = process.platform === 'darwin' || process.platform === 'win32';
 
+/** Path equality under the platform's case rules (macOS and Windows file systems ignore case). */
+export function samePath(a: string, b: string): boolean {
+  return CASE_INSENSITIVE ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
 /** Linear-time wildcard match of one path segment: `*` any run, `?` one character. */
 function segmentMatch(pat: string, text: string): boolean {
   let p = 0, t = 0, star = -1, mark = 0;
   while (t < text.length) {
-    if (p < pat.length && (pat[p] === '?' || pat[p] === text[t])) { p++; t++; }
-    else if (p < pat.length && pat[p] === '*') { star = p++; mark = t; }
+    if (p < pat.length && pat[p] === '*') { star = p++; mark = t; }
+    else if (p < pat.length && (pat[p] === '?' || pat[p] === text[t])) { p++; t++; }
     else if (star >= 0) { p = star + 1; t = ++mark; }
     else return false;
   }
@@ -150,8 +161,13 @@ function compileOne(glob: string): Compiled | undefined {
   if (!g) return undefined;
   if (CASE_INSENSITIVE) g = g.toLowerCase();
   if (g.length > MAX_GLOB_LENGTH) throw new Error(`glob "${glob.slice(0, 40)}..." is too long (max ${MAX_GLOB_LENGTH})`);
-  if (g.startsWith('./')) g = g.slice(2);
+  const anchored = g.startsWith('./');
+  if (anchored) g = g.slice(2);
   if (!g.replace(/\//g, '')) return undefined;
+  if (!g.includes('/') && anchored) {
+    // `./name`: that file or directory at the repo root only.
+    return { glob, test: (segs) => segmentsMatch([g, '**'], segs) };
+  }
   if (!g.includes('/')) {
     // A bare name matches a file or a directory of that name anywhere.
     return { glob, test: (segs) => segs.some((s) => segmentMatch(g, s)) };
