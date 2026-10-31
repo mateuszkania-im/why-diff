@@ -4,8 +4,8 @@
 import os from 'node:os';
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
-import type { Harness, Report, Session, SessionAdapter } from './types.js';
-import { getDiff, git, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
+import type { Harness, Hunk, Report, Session, SessionAdapter } from './types.js';
+import { getDiff, git, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
 import { attribute } from './attribute.js';
 import { labelHunks, needsFileText } from './labels.js';
@@ -15,7 +15,7 @@ import { claudeCodeAdapter } from './adapters/claude.js';
 import { codexAdapter } from './adapters/codex.js';
 import { opencodeAdapter } from './adapters/opencode.js';
 import { redactReport } from './redact.js';
-import { loadConfig, matchGlobs, type WhyDiffConfig } from './config.js';
+import { compileGlobs, configChanged, loadConfig, CONFIG_FILE, type WhyDiffConfig } from './config.js';
 import { createClassifier, classifyHunks, summarizeIntent, type ClassifierKind } from './classify/index.js';
 
 export const ADAPTERS: Record<Harness, SessionAdapter> = {
@@ -51,8 +51,10 @@ export interface BuildOptions {
    * transcript modified in the window, so it is opt-in.
    */
   scanAll?: boolean;
-  /** Team rules; default: read from the repo root (`.why-diff.json`) */
+  /** Team rules; default: read from the repo root at the base revision (`.why-diff.json`) */
   config?: WhyDiffConfig;
+  /** Never drop hunks the agent edited because of `ignore` (the guard sets this) */
+  keepAgentIgnored?: boolean;
   /** LLM intent check backend; 'none' to skip */
   classify?: ClassifierKind;
   model?: string;
@@ -98,10 +100,26 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
     rangeLabel = resolved.label;
   }
 
-  const config = opts.config ?? (await loadConfig(root));
+  const baseRev = await policyRev(root, target);
+  const config = opts.config ?? (await loadConfig(root, baseRev));
+  const protectedGlob = compileGlobs(config.protected);
+  const ignoredGlob = compileGlobs(config.ignore);
+
   log(`diffing ${rangeLabel}`);
-  const hunks = parseUnifiedDiff(await getDiff(root, target, { paths: opts.paths }))
-    .filter((h) => !matchGlobs(config.ignore, h.file));
+  const allHunks = parseUnifiedDiff(await getDiff(root, target, { paths: opts.paths }));
+
+  // The team-rules files themselves: any change is a finding, and `ignore` can never hide it.
+  const rulesFiles = new Set<string>();
+  for (const h of allHunks) {
+    if (h.file === CONFIG_FILE || h.oldFile === CONFIG_FILE) rulesFiles.add(h.file);
+  }
+  if (allHunks.some((h) => h.file === 'package.json') && (await configChanged(root, baseRev, headRevOf(target)))) rulesFiles.add('package.json');
+
+  const isIgnored = (h: Hunk): boolean =>
+    Boolean(ignoredGlob(h.file)) && (!h.oldFile || Boolean(ignoredGlob(h.oldFile))) &&
+    !protectedGlob(h.file) && !(h.oldFile && protectedGlob(h.oldFile)) && !rulesFiles.has(h.file);
+  const hunks = opts.keepAgentIgnored ? allHunks : allHunks.filter((h) => !isIgnored(h));
+  let ignoredHunks = allHunks.length - hunks.length;
 
   const window = await commitTimes(root, target).catch(() => undefined);
   const since = opts.since ?? (window ? new Date(new Date(window.since).getTime() - 6 * 3600_000) : undefined);
@@ -138,20 +156,17 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
 
   const prompts = sessions.flatMap((s) => s.prompts);
   let attributed = attribute(hunks, sessions, root, { since, extraRoots });
-  const texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== 'deleted').map((h) => h.file))]);
-  attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p) });
+  if (opts.keepAgentIgnored) {
+    // Guard: ignore may drop only hunks no session edit explains.
+    const kept = attributed.filter((h) => !(isIgnored(h.hunk) && h.match === 'none'));
+    ignoredHunks = attributed.length - kept.length;
+    attributed = kept;
+  }
   // Without any transcript every hunk would be "unattributed": noise, not a finding.
   const mode: Report['mode'] = sessions.length === 0 ? 'risk-scan' : 'provenance';
+  const texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== 'deleted').map((h) => h.file))]);
+  attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p), protectedGlob, riskScan: mode === 'risk-scan', rulesFiles });
   if (mode === 'risk-scan') attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== 'unattributed') }));
-  if (config.protected?.length) {
-    // A human editing a protected path is not a risk; only the agent's hunks (or any hunk when there are no transcripts) are.
-    attributed = attributed.map((h) => {
-      if (mode === 'provenance' && h.match === 'none') return h;
-      const glob = matchGlobs(config.protected, h.hunk.file) ?? (h.hunk.oldFile ? matchGlobs(config.protected, h.hunk.oldFile) : undefined);
-      if (!glob) return h;
-      return { ...h, labels: [...h.labels, { kind: 'protected-path' as const, severity: 'risk' as const, detail: `Protected path (${glob}): ${h.hunk.file}` }] };
-    });
-  }
 
   const kind = opts.classify ?? 'none';
   if (kind !== 'none' && attributed.length && mode === 'risk-scan') {
@@ -167,6 +182,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   }
 
   const summary = summarize(attributed, sessions);
+  if (ignoredHunks > 0) summary.ignoredHunks = ignoredHunks;
   if (attributed.some((h) => h.intent)) summary.intent = summarizeIntent(attributed);
 
   const usedPromptIds = new Set(attributed.map((h) => h.prompt?.id).filter(Boolean));
@@ -187,6 +203,30 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
     hunks: compactHunks(attributed),
     summary,
   }, 'secrets');
+}
+
+/**
+ * Revision the team rules are read from: the left side of the diff, so a change
+ * cannot rewrite the policy it is judged by. Undefined: read the working tree.
+ */
+async function policyRev(root: string, target: DiffTarget): Promise<string | undefined> {
+  if (typeof target === 'string') {
+    if (target.startsWith('-')) return undefined;
+    const m = /^(.*?)(\.\.\.?)(.*)$/.exec(target);
+    if (!m) return target;
+    const left = m[1] || 'HEAD';
+    return m[2] === '...' ? await mergeBase(root, left, m[3] || 'HEAD').catch(() => left) : left;
+  }
+  if (!(await hasHead(root))) return undefined;
+  if (target.baseRev) return target.baseRev;
+  return target.base ? await mergeBase(root, target.base, 'HEAD').catch(() => 'HEAD') : 'HEAD';
+}
+
+/** Revision holding the right side of the diff; undefined = the working tree. */
+function headRevOf(target: DiffTarget): string | undefined {
+  if (typeof target !== 'string') return undefined;
+  const m = /^(?:.*?)\.\.\.?(.*)$/.exec(target);
+  return m ? m[1] || 'HEAD' : undefined;
 }
 
 /** Replace a leading home directory with `~` so reports do not leak the user name. */

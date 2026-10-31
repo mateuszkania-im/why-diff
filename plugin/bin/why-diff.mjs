@@ -3675,7 +3675,7 @@ function needsFileText(path13) {
 function labelHunks(hunks, ctx) {
   let scope = buildScopeIndex(hunks, ctx);
   return hunks.map((h) => {
-    let path13 = toRepoPath(h.hunk.file, ctx.repoRoot), fresh = computeLabels(h, path13, scope);
+    let path13 = toRepoPath(h.hunk.file, ctx.repoRoot), fresh = computeLabels(h, path13, scope, ctx);
     return { ...h, labels: mergeLabels(h.labels, fresh) };
   });
 }
@@ -3686,7 +3686,7 @@ function isTestFile(path13) {
 function isLockfile(path13) {
   return LOCKFILES.has(posix.basename(normalisePath(path13)));
 }
-function computeLabels(h, path13, scope) {
+function computeLabels(h, path13, scope, ctx) {
   let out = [], agent = isAgentAttributed(h), lines = h.hunk.lines, push = (kind, severity, detail) => {
     out.push({ kind, severity, detail: clip(detail) });
   };
@@ -3710,7 +3710,13 @@ function computeLabels(h, path13, scope) {
   let anys = detectTypeAny(path13, lines);
   anys.length > 0 && push("type-any-added", "warn", `Adds ${listOf(anys)}`);
   let secrets = detectSecrets(path13, lines);
-  if (secrets.length > 0 && push("secret-like", "risk", secrets.join("; ")), agent) {
+  if (secrets.length > 0 && push("secret-like", "risk", secrets.join("; ")), ctx.rulesFiles?.has(path13))
+    push("protected-path", "risk", `Team rules changed (${path13})`);
+  else if (ctx.protectedGlob && (agent || ctx.riskScan)) {
+    let oldPath = h.hunk.oldFile ? toRepoPath(h.hunk.oldFile, ctx.repoRoot) : void 0, glob = ctx.protectedGlob(path13) ?? (oldPath ? ctx.protectedGlob(oldPath) : void 0);
+    glob && push("protected-path", "risk", `Protected path (${glob}): ${oldPath && oldPath !== path13 ? `${oldPath} -> ${path13}` : path13}`);
+  }
+  if (agent) {
     let why = outOfScopeReason(path13, scope, hunkPromptIds(h));
     why && push("out-of-scope", "warn", why);
   }
@@ -6719,13 +6725,21 @@ var CONFIG_FILE = ".why-diff.json", LABEL_KINDS = [
   "out-of-scope",
   "bash-edit",
   "protected-path"
-];
-async function readOptional(file) {
+], MAX_GLOB_LENGTH = 512;
+async function readOptional(root, rel, rev) {
+  if (rev !== void 0) {
+    if (rev.startsWith("-")) return;
+    try {
+      return await git(root, ["show", `${rev}:${rel}`], { trim: !1 });
+    } catch {
+      return;
+    }
+  }
   try {
-    return await readFile4(file, "utf8");
+    return await readFile4(path9.join(root, rel), "utf8");
   } catch (err) {
     if (err.code === "ENOENT") return;
-    throw new Error(`${file}: cannot read (${err.message})`);
+    throw new Error(`${rel}: cannot read (${err.message})`);
   }
 }
 function parseJson(file, text2) {
@@ -6739,44 +6753,100 @@ function stringList(file, key, value) {
   if (!Array.isArray(value) || value.some((v) => typeof v != "string")) throw new Error(`${file}: "${key}" must be an array of strings`);
   return value;
 }
+function globList(file, key, value) {
+  let list = stringList(file, key, value);
+  for (let g of list) {
+    if (g.length > MAX_GLOB_LENGTH) throw new Error(`${file}: pattern in "${key}" is too long (${g.length} > ${MAX_GLOB_LENGTH} characters)`);
+    let bad = /[{[!]/.exec(g);
+    if (bad) throw new Error(`${file}: unsupported glob syntax "${bad[0]}" in "${key}" pattern "${g}" (only *, ** and ? are supported)`);
+  }
+  return list;
+}
 function validate(file, raw) {
   if (!raw || typeof raw != "object" || Array.isArray(raw)) throw new Error(`${file}: expected a JSON object`);
   let r = raw, out = {};
-  if (r.protected !== void 0 && (out.protected = stringList(file, "protected", r.protected)), r.ignore !== void 0 && (out.ignore = stringList(file, "ignore", r.ignore)), r.blockOn !== void 0) {
+  if (r.protected !== void 0 && (out.protected = globList(file, "protected", r.protected)), r.ignore !== void 0 && (out.ignore = globList(file, "ignore", r.ignore)), r.blockOn !== void 0) {
     let kinds = stringList(file, "blockOn", r.blockOn), bad = kinds.find((k) => !LABEL_KINDS.includes(k));
     if (bad !== void 0) throw new Error(`${file}: unknown label kind "${bad}" in "blockOn" (known: ${LABEL_KINDS.join(", ")})`);
     out.blockOn = kinds;
   }
   return out;
 }
-async function loadConfig(repoRoot2) {
-  let file = path9.join(repoRoot2, CONFIG_FILE), text2 = await readOptional(file);
-  if (text2 !== void 0) return validate(CONFIG_FILE, parseJson(CONFIG_FILE, text2));
-  let pkgText = await readOptional(path9.join(repoRoot2, "package.json"));
-  if (pkgText === void 0) return {};
+async function readRaw(root, rev) {
+  let text2 = await readOptional(root, CONFIG_FILE, rev);
+  if (text2 !== void 0) return { file: CONFIG_FILE, raw: parseJson(CONFIG_FILE, text2) };
+  let pkgText = await readOptional(root, "package.json", rev);
+  if (pkgText === void 0) return;
   let pkg;
   try {
     pkg = JSON.parse(pkgText);
   } catch {
-    return {};
+    return;
   }
   let section = pkg && typeof pkg == "object" ? pkg.whyDiff : void 0;
-  return section === void 0 ? {} : validate('package.json "whyDiff"', section);
+  return section === void 0 ? void 0 : { file: 'package.json "whyDiff"', raw: section };
 }
-function globToRegExp2(glob) {
-  let g = glob.trim().replace(/\\/g, "/"), anywhere = !g.includes("/");
-  g.startsWith("./") && (g = g.slice(2)), g.startsWith("/") && (g = g.slice(1)), g.endsWith("/") && (g += "**");
-  let re = "";
-  for (let i = 0; i < g.length; i++) {
-    let c = g[i];
-    c === "*" ? g[i + 1] === "*" ? (i++, g[i + 1] === "/" ? (i++, re += "(?:.*/)?") : re += ".*") : re += "[^/]*" : c === "?" ? re += "[^/]" : re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-  }
-  return new RegExp(`^${anywhere ? "(?:.*/)?" : ""}${re}$`);
+async function loadConfig(repoRoot2, rev) {
+  let found = rev !== void 0 ? await readRaw(repoRoot2, rev) : void 0;
+  return found || (found = await readRaw(repoRoot2)), found ? validate(found.file, found.raw) : {};
 }
-function matchGlobs(globs, file) {
-  if (!globs?.length) return;
-  let p = file.replace(/\\/g, "/").replace(/^\.\//, "");
-  return globs.find((g) => g.trim() && globToRegExp2(g).test(p));
+async function configChanged(repoRoot2, baseRev, headRev) {
+  let side = async (rev) => {
+    try {
+      return JSON.stringify((await readRaw(repoRoot2, rev))?.raw ?? null);
+    } catch {
+      return "invalid";
+    }
+  };
+  return await side(baseRev) !== await side(headRev);
+}
+var CASE_INSENSITIVE = process.platform === "darwin" || process.platform === "win32";
+function segmentMatch(pat, text2) {
+  let p = 0, t = 0, star = -1, mark = 0;
+  for (; t < text2.length; )
+    if (p < pat.length && (pat[p] === "?" || pat[p] === text2[t]))
+      p++, t++;
+    else if (p < pat.length && pat[p] === "*")
+      star = p++, mark = t;
+    else if (star >= 0)
+      p = star + 1, t = ++mark;
+    else return !1;
+  for (; p < pat.length && pat[p] === "*"; ) p++;
+  return p === pat.length;
+}
+function segmentsMatch(pat, segs) {
+  let p = 0, t = 0, star = -1, mark = 0;
+  for (; t < segs.length; )
+    if (p < pat.length && pat[p] !== "**" && segmentMatch(pat[p], segs[t]))
+      p++, t++;
+    else if (p < pat.length && pat[p] === "**")
+      star = p++, mark = t;
+    else if (star >= 0)
+      p = star + 1, t = ++mark;
+    else return !1;
+  for (; p < pat.length && pat[p] === "**"; ) p++;
+  return p === pat.length;
+}
+function compileOne(glob) {
+  let g = glob.trim().replace(/\\/g, "/");
+  if (!g) return;
+  if (CASE_INSENSITIVE && (g = g.toLowerCase()), g.length > MAX_GLOB_LENGTH) throw new Error(`glob "${glob.slice(0, 40)}..." is too long (max ${MAX_GLOB_LENGTH})`);
+  if (g.startsWith("./") && (g = g.slice(2)), !g.replace(/\//g, "")) return;
+  if (!g.includes("/"))
+    return { glob, test: (segs) => segs.some((s) => segmentMatch(g, s)) };
+  g.startsWith("/") && (g = g.slice(1)), g.endsWith("/") && (g += "**");
+  let pat = g.split("/").filter((x, i, a) => x !== "" || i === a.length);
+  return { glob, test: (segs) => segmentsMatch(pat, segs) };
+}
+function compileGlobs(globs) {
+  let compiled = (globs ?? []).map(compileOne).filter((c) => c !== void 0);
+  return compiled.length ? (file) => {
+    let p = file.replace(/\\/g, "/").replace(/^\.\//, "");
+    CASE_INSENSITIVE && (p = p.toLowerCase());
+    let segs = p.split("/").filter(Boolean);
+    return compiled.find((c) => c.test(segs))?.glob;
+  } : () => {
+  };
 }
 
 // src/classify/prompt.ts
@@ -7320,9 +7390,13 @@ async function buildReport(opts = {}) {
     if (!resolved.base && !resolved.onBase && await isShallow(root)) throw new Error(SHALLOW_HINT);
     target = resolved.target, rangeLabel = resolved.label;
   }
-  let config = opts.config ?? await loadConfig(root);
+  let baseRev = await policyRev(root, target), config = opts.config ?? await loadConfig(root, baseRev), protectedGlob = compileGlobs(config.protected), ignoredGlob = compileGlobs(config.ignore);
   log(`diffing ${rangeLabel}`);
-  let hunks = parseUnifiedDiff(await getDiff(root, target, { paths: opts.paths })).filter((h) => !matchGlobs(config.ignore, h.file)), window = await commitTimes(root, target).catch(() => {
+  let allHunks = parseUnifiedDiff(await getDiff(root, target, { paths: opts.paths })), rulesFiles = /* @__PURE__ */ new Set();
+  for (let h of allHunks)
+    (h.file === CONFIG_FILE || h.oldFile === CONFIG_FILE) && rulesFiles.add(h.file);
+  allHunks.some((h) => h.file === "package.json") && await configChanged(root, baseRev, headRevOf(target)) && rulesFiles.add("package.json");
+  let isIgnored = (h) => !!ignoredGlob(h.file) && (!h.oldFile || !!ignoredGlob(h.oldFile)) && !protectedGlob(h.file) && !(h.oldFile && protectedGlob(h.oldFile)) && !rulesFiles.has(h.file), hunks = opts.keepAgentIgnored ? allHunks : allHunks.filter((h) => !isIgnored(h)), ignoredHunks = allHunks.length - hunks.length, window = await commitTimes(root, target).catch(() => {
   }), since = opts.since ?? (window ? new Date(new Date(window.since).getTime() - 6 * 36e5) : void 0), sessions = [], extraRoots = await worktreeRoots(root);
   if (opts.sessionFiles?.length)
     for (let file of opts.sessionFiles) {
@@ -7348,14 +7422,13 @@ async function buildReport(opts = {}) {
     sessions.length === 0 && hunks.length > 0 && !opts.scanAll && log("no agent sessions found for this repo in the time window; if the agent ran from another folder, try --scan-all (or --since / --session)");
   }
   log(`found ${sessions.length} agent session(s), ${hunks.length} hunk(s)`);
-  let prompts = sessions.flatMap((s) => s.prompts), attributed = attribute(hunks, sessions, root, { since, extraRoots }), texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== "deleted").map((h) => h.file))]);
-  attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p) });
-  let mode = sessions.length === 0 ? "risk-scan" : "provenance";
-  mode === "risk-scan" && (attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== "unattributed") }))), config.protected?.length && (attributed = attributed.map((h) => {
-    if (mode === "provenance" && h.match === "none") return h;
-    let glob = matchGlobs(config.protected, h.hunk.file) ?? (h.hunk.oldFile ? matchGlobs(config.protected, h.hunk.oldFile) : void 0);
-    return glob ? { ...h, labels: [...h.labels, { kind: "protected-path", severity: "risk", detail: `Protected path (${glob}): ${h.hunk.file}` }] } : h;
-  }));
+  let prompts = sessions.flatMap((s) => s.prompts), attributed = attribute(hunks, sessions, root, { since, extraRoots });
+  if (opts.keepAgentIgnored) {
+    let kept = attributed.filter((h) => !(isIgnored(h.hunk) && h.match === "none"));
+    ignoredHunks = attributed.length - kept.length, attributed = kept;
+  }
+  let mode = sessions.length === 0 ? "risk-scan" : "provenance", texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== "deleted").map((h) => h.file))]);
+  attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p), protectedGlob, riskScan: mode === "risk-scan", rulesFiles }), mode === "risk-scan" && (attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== "unattributed") })));
   let kind = opts.classify ?? "none";
   if (kind !== "none" && attributed.length && mode === "risk-scan")
     log("no agent transcripts, so there are no prompts to check intent against; skipping intent check");
@@ -7364,7 +7437,7 @@ async function buildReport(opts = {}) {
     classifier ? (log(`checking intent with ${classifier.name}`), attributed = await classifyHunks(attributed, prompts, classifier, { repoRoot: root })) : log("no LLM backend available (install Claude Code, or set ANTHROPIC_API_KEY / OPENAI_API_KEY); skipping intent check");
   }
   let summary = summarize(attributed, sessions);
-  attributed.some((h) => h.intent) && (summary.intent = summarizeIntent(attributed));
+  ignoredHunks > 0 && (summary.ignoredHunks = ignoredHunks), attributed.some((h) => h.intent) && (summary.intent = summarizeIntent(attributed));
   let usedPromptIds = new Set(attributed.map((h) => h.prompt?.id).filter(Boolean)), contributing = contributingSessionIds(attributed), home = opts.home ?? os5.homedir();
   return redactReport({
     schemaVersion: 1,
@@ -7379,6 +7452,22 @@ async function buildReport(opts = {}) {
     hunks: compactHunks(attributed),
     summary
   }, "secrets");
+}
+async function policyRev(root, target) {
+  if (typeof target == "string") {
+    if (target.startsWith("-")) return;
+    let m = /^(.*?)(\.\.\.?)(.*)$/.exec(target);
+    if (!m) return target;
+    let left = m[1] || "HEAD";
+    return m[2] === "..." ? await mergeBase(root, left, m[3] || "HEAD").catch(() => left) : left;
+  }
+  if (await hasHead(root))
+    return target.baseRev ? target.baseRev : target.base ? await mergeBase(root, target.base, "HEAD").catch(() => "HEAD") : "HEAD";
+}
+function headRevOf(target) {
+  if (typeof target != "string") return;
+  let m = /^(?:.*?)\.\.\.?(.*)$/.exec(target);
+  return m ? m[1] || "HEAD" : void 0;
 }
 function tildify(p, home) {
   if (!home) return p;
@@ -8393,7 +8482,7 @@ function build(report, o) {
     let i = s.intent;
     out.push(`| Intent | ${i.requested} requested \xB7 ${i.implied} implied \xB7 ${i.unrequested} unrequested \xB7 ${i.unclear} unclear${h.classifierModel ? ` (${code(h.classifierModel)})` : ""} |`);
   }
-  out.push(`| Tests | ${s.touchedTests ? "touched" : "untouched"} |`), out.push("");
+  out.push(`| Tests | ${s.touchedTests ? "touched" : "untouched"} |`), s.ignoredHunks && out.push(`| Ignored | ${plural(s.ignoredHunks, "hunk")} ignored by config |`), out.push("");
   let { groups, unattributed } = groupByPrompt(report), budget = o.maxHunks, hidden = 0;
   if (scan) {
     out.push(`${sub} Changes (${report.hunks.length})`), out.push("");
@@ -8517,7 +8606,8 @@ function renderTerminal(report, opts = {}) {
     let meta = [
       `${plural(s.hunks, "hunk")} in ${plural(s.files, "file")}`,
       `+${s.addedLines} \u2212${s.removedLines}`,
-      h.touchedTests ? `tests touched ${GLYPH.tests}` : "tests untouched"
+      h.touchedTests ? `tests touched ${GLYPH.tests}` : "tests untouched",
+      ...s.ignoredHunks ? [`${plural(s.ignoredHunks, "hunk")} ignored by config`] : []
     ];
     for (let row of wrapParts(meta.map((m) => [[m, dim]]), width - 2)) line(["  ", id], ...row);
   } else {
@@ -8535,7 +8625,7 @@ function renderTerminal(report, opts = {}) {
       `+${s.addedLines} \u2212${s.removedLines}`,
       describeSessions(report)
     ];
-    s.sessions > 0 && meta.push(plural(s.prompts, "prompt")), h.classifierModel && meta.push(`intent by ${h.classifierModel}`);
+    s.sessions > 0 && meta.push(plural(s.prompts, "prompt")), s.ignoredHunks && meta.push(`${plural(s.ignoredHunks, "hunk")} ignored by config`), h.classifierModel && meta.push(`intent by ${h.classifierModel}`);
     for (let row of wrapParts(meta.map((m) => [[m, dim]]), width - 2)) line(["  ", id], ...row);
     s.sessions === 0 && s.hunks > 0 && line(["  ", id], [NO_SESSIONS_HINT, c.yellow]);
   }
@@ -8736,12 +8826,12 @@ async function guard(payload, opts) {
   if (payload.stop_hook_active || !payload.transcript_path) return NO_BLOCK;
   let root = await repoRoot(payload.cwd ?? process.cwd()), session = await claudeCodeAdapter.parse(payload.transcript_path), roots = [root, ...await worktreeRoots(root)].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdVariants = rootVariants(session.cwd), paths = [...new Set(session.edits.filter((e) => !e.failed).map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants)).filter((p) => !!p))].map((p) => `:(literal)${p.split(path11.sep).join("/")}`);
   if (!paths.length) return NO_BLOCK;
-  let config = await loadConfig(root).catch(() => ({})), blocking = opts.blocking ?? new Set(config.blockOn ?? DEFAULT_BLOCK_ON), baseRev = "HEAD";
+  let baseRev = "HEAD";
   if (await hasHead(root)) {
     let before = await git(root, ["rev-list", "-1", `--before=${session.startedAt}`, "HEAD"]).catch(() => "");
     before && (baseRev = before);
   }
-  let report = await buildReport({
+  let config = await loadConfig(root, baseRev).catch(() => ({})), blocking = opts.blocking ?? /* @__PURE__ */ new Set([...DEFAULT_BLOCK_ON, ...config.blockOn ?? []]), report = await buildReport({
     cwd: root,
     workingTree: !0,
     baseRev,
@@ -8749,7 +8839,8 @@ async function guard(payload, opts) {
     sessionFiles: [payload.transcript_path],
     harnesses: ["claude-code"],
     home: opts.home,
-    config
+    config,
+    keepAgentIgnored: !0
   }), hits = [], keys = [];
   for (let h of report.hunks)
     if (!(h.match !== "exact" && h.match !== "partial") && !(!h.editIds.length || !h.editIds.every((id) => id.startsWith(`${session.id}:`))))
@@ -8945,7 +9036,7 @@ program2.command("pr").description("put the report into the current branch's pul
   }
   await writePrBody(gh, next), progress("updated the pull request body");
 });
-program2.command("guard").description("Claude Code Stop hook: block the agent from finishing if it skipped, weakened or deleted tests").option("--on <kinds>", "labels that block (comma list; default: blockOn from .why-diff.json, else test-skip-added,tests-disabled,assertion-removed,secret-like,ci-changed,protected-path)").action(async (o) => {
+program2.command("guard").description("Claude Code Stop hook: block the agent from finishing if it skipped, weakened or deleted tests").option("--on <kinds>", "labels that block (comma list; default: test-skip-added,tests-disabled,assertion-removed,secret-like,ci-changed,protected-path, plus blockOn from .why-diff.json)").action(async (o) => {
   let raw = await readStdin(), payload = {};
   try {
     payload = raw.trim() ? JSON.parse(raw) : {};

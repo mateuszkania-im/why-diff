@@ -194,6 +194,8 @@ export interface Summary {
   sessionsFound: number;
   /** Prompts that own at least one hunk */
   prompts: number;
+  /** Hunks dropped by the `ignore` rule of the team config (absent when none) */
+  ignoredHunks?: number;
 }
 
 /**

@@ -27,7 +27,7 @@ export interface GuardPayload {
 }
 
 export interface GuardOptions {
-  /** Explicit blocking list (`--on`); default: config `blockOn`, then {@link DEFAULT_BLOCK_ON} */
+  /** Explicit blocking list (`--on`) replaces everything; default: {@link DEFAULT_BLOCK_ON} plus config `blockOn` */
   blocking?: Set<LabelKind>;
   /** Home dir for transcript discovery (tests) */
   home?: string;
@@ -66,15 +66,16 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
     .map((p) => `:(literal)${p.split(path.sep).join('/')}`);
   if (!paths.length) return NO_BLOCK;
 
-  // An invalid config must not break the session: fall back to defaults.
-  const config: WhyDiffConfig = await loadConfig(root).catch(() => ({}));
-  const blocking = opts.blocking ?? new Set<LabelKind>(config.blockOn ?? DEFAULT_BLOCK_ON);
-
   let baseRev = 'HEAD';
   if (await hasHead(root)) {
     const before = await git(root, ['rev-list', '-1', `--before=${session.startedAt}`, 'HEAD']).catch(() => '');
     if (before) baseRev = before;
   }
+
+  // The policy comes from the session-start commit, so the agent cannot loosen it mid-session.
+  // An invalid config must not break the session: fall back to defaults.
+  const config: WhyDiffConfig = await loadConfig(root, baseRev).catch(() => ({}));
+  const blocking = opts.blocking ?? new Set<LabelKind>([...DEFAULT_BLOCK_ON, ...(config.blockOn ?? [])]);
 
   const report = await buildReport({
     cwd: root,
@@ -85,6 +86,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
     harnesses: ['claude-code'],
     home: opts.home,
     config,
+    keepAgentIgnored: true,
   });
 
   const hits: string[] = [];

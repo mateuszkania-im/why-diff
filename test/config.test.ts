@@ -1,8 +1,10 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
-import { globToRegExp, loadConfig, matchGlobs } from '../src/config.js';
+import { compileGlobs, loadConfig, matchGlobs } from '../src/config.js';
+import { renderMarkdown } from '../src/report/index.js';
 import { runGuard } from '../src/guard.js';
 import { buildReport } from '../src/pipeline.js';
 import { tempDir, writeSyntheticTranscript, type SyntheticCall } from './helpers/claude-fixture.js';
@@ -42,8 +44,29 @@ describe('glob matching', () => {
     ['.github/**', '.github/workflows/ci.yml', true],
     ['a?.ts', 'ab.ts', true],
     ['a?.ts', 'a/.ts', false],
+    ['migrations', 'migrations/001.sql', true],
+    ['migrations', 'db/migrations/001.sql', true],
+    ['migrations', 'src/migrationsX/a.sql', false],
+    ['**', 'a/b/c', true],
+    ['a/**/b', 'a/b', true],
+    ['a/**/b', 'a/x/y/b', true],
   ])('%s vs %s', (glob, file, want) => {
-    expect(globToRegExp(glob).test(file)).toBe(want);
+    expect(matchGlobs([glob], file) !== undefined).toBe(want);
+  });
+  it('pathological ** patterns finish fast (no regex backtracking)', () => {
+    for (const n of [8, 12, 40]) {
+      const t0 = performance.now();
+      const hit = matchGlobs(['**/'.repeat(n) + 'x'], 'a/'.repeat(40) + 'y');
+      expect(hit).toBeUndefined();
+      expect(performance.now() - t0).toBeLessThan(50);
+    }
+    const t1 = performance.now();
+    compileGlobs(['*a*a*a*a*a*a*a*a*b'])('a'.repeat(200));
+    expect(performance.now() - t1).toBeLessThan(50);
+  });
+  it('is case-insensitive on darwin and win32 only', () => {
+    const insensitive = process.platform === 'darwin' || process.platform === 'win32';
+    expect(matchGlobs(['Migrations/**'], 'migrations/a.sql') !== undefined).toBe(insensitive);
   });
   it('matchGlobs returns the matching pattern', () => {
     expect(matchGlobs(['x/**', 'migrations/**'], 'migrations/1.sql')).toBe('migrations/**');
@@ -68,6 +91,31 @@ describe('loadConfig', () => {
   });
   it('unknown blockOn kind names the file and value', async () => {
     await expect(loadConfig(makeRepo({ blockOn: ['bogus'] }))).rejects.toThrow(/\.why-diff\.json.*"bogus"/);
+  });
+  it.each(['{a,b}/**', 'src/[ab].ts', '!vendor/**'])('rejects unsupported glob syntax %s', async (g) => {
+    await expect(loadConfig(makeRepo({ protected: [g] }))).rejects.toThrow(/\.why-diff\.json.*unsupported/);
+  });
+  it('rejects patterns over the length cap', async () => {
+    await expect(loadConfig(makeRepo({ ignore: ['a'.repeat(513)] }))).rejects.toThrow(/\.why-diff\.json.*too long/);
+  });
+  it('reads the config from a base revision, not the working tree', async () => {
+    const repo = makeRepo({ protected: ['migrations/**'] });
+    put(repo, '.why-diff.json', JSON.stringify({ ignore: ['**'] }));
+    expect(await loadConfig(repo, 'HEAD')).toEqual({ protected: ['migrations/**'] });
+    expect(await loadConfig(repo)).toEqual({ ignore: ['**'] });
+  });
+  it('reads whyDiff from package.json at the base revision', async () => {
+    const repo = makeRepo();
+    put(repo, 'package.json', JSON.stringify({ whyDiff: { protected: ['p/**'] } }));
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-qm', 'pkg');
+    put(repo, 'package.json', JSON.stringify({ whyDiff: { ignore: ['**'] } }));
+    expect(await loadConfig(repo, 'HEAD')).toEqual({ protected: ['p/**'] });
+  });
+  it('falls back to the working tree when the base has no config at all', async () => {
+    const repo = makeRepo();
+    put(repo, '.why-diff.json', JSON.stringify({ protected: ['x/**'] }));
+    expect(await loadConfig(repo, 'HEAD')).toEqual({ protected: ['x/**'] });
   });
   it('wrong types are rejected', async () => {
     await expect(loadConfig(makeRepo({ protected: 'migrations/**' }))).rejects.toThrow(/"protected" must be an array/);
@@ -117,16 +165,76 @@ describe('protected and ignore in buildReport', () => {
     const repo = makeRepo('{ nope');
     await expect(buildReport({ cwd: repo, workingTree: true, home: temp('why-diff-config-home-') })).rejects.toThrow(/\.why-diff\.json/);
   });
+
+  it('a change to .why-diff.json is protected-path regardless of config and ignore cannot hide it', async () => {
+    const repo = makeRepo({ ignore: ['**'] });
+    put(repo, '.why-diff.json', JSON.stringify({ ignore: ['**'], blockOn: [] }));
+    put(repo, 'src/a.ts', 'export const a = 2;\n');
+    const r = await buildReport({ cwd: repo, workingTree: true, home: temp('why-diff-config-home-') });
+    const cfg = r.hunks.find((h) => h.hunk.file === '.why-diff.json')!;
+    expect(cfg.labels.find((l) => l.kind === 'protected-path')?.severity).toBe('risk');
+  });
+
+  it('a change to the whyDiff key in package.json is protected-path', async () => {
+    const repo = makeRepo();
+    put(repo, 'package.json', JSON.stringify({ name: 'x', whyDiff: { ignore: [] } }, null, 2) + '\n');
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-qm', 'pkg');
+    put(repo, 'package.json', JSON.stringify({ name: 'x', whyDiff: { ignore: ['**'] } }, null, 2) + '\n');
+    put(repo, 'src/a.ts', 'export const a = 2;\n');
+    const r = await buildReport({ cwd: repo, workingTree: true, home: temp('why-diff-config-home-') });
+    expect(r.hunks.find((h) => h.hunk.file === 'package.json')!.labels.map((l) => l.kind)).toContain('protected-path');
+    expect(r.hunks.find((h) => h.hunk.file === 'src/a.ts')!.labels.map((l) => l.kind)).not.toContain('protected-path');
+  });
+
+  it('a PR that adds ignore: ["**"] does not hide its own hunks (config read from the base)', async () => {
+    const repo = makeRepo({ protected: ['migrations/**'] });
+    put(repo, '.why-diff.json', JSON.stringify({ ignore: ['**'] }));
+    put(repo, 'src/a.ts', 'export const a = 2;\n');
+    const r = await buildReport({ cwd: repo, workingTree: true, home: temp('why-diff-config-home-') });
+    expect(r.hunks.map((h) => h.hunk.file)).toContain('src/a.ts');
+    expect(r.summary.ignoredHunks).toBeUndefined();
+  });
+
+  it('ignore never drops a hunk whose old path is not ignored, or one that matches protected', async () => {
+    const repo = makeRepo({ ignore: ['generated/**', 'migrations/**'], protected: ['migrations/**'] });
+    put(repo, 'migrations/001.sql', 'drop table a;\n');
+    sh(repo, 'mv', 'generated/api.ts', 'src/api.ts');
+    const r = await buildReport({ cwd: repo, workingTree: true, home: temp('why-diff-config-home-') });
+    const files = r.hunks.map((h) => h.hunk.file);
+    expect(files).toContain('migrations/001.sql');
+    expect(files).toContain('src/api.ts');
+  });
+
+  it('rename from a protected dir to an unprotected one is labelled', async () => {
+    const repo = makeRepo({ protected: ['migrations/**'] });
+    sh(repo, 'mv', 'migrations/001.sql', 'src/001.sql');
+    const r = await buildReport({ cwd: repo, workingTree: true, home: temp('why-diff-config-home-') });
+    const h = r.hunks.find((x) => x.hunk.file === 'src/001.sql')!;
+    expect(h.labels.map((l) => l.kind)).toContain('protected-path');
+  });
+
+  it('counts ignored hunks in the summary and shows them in markdown', async () => {
+    const repo = makeRepo({ ignore: ['generated/**'] });
+    put(repo, 'generated/api.ts', 'export const v = 2;\n');
+    put(repo, 'src/a.ts', 'export const a = 2;\n');
+    const r = await buildReport({ cwd: repo, workingTree: true, home: temp('why-diff-config-home-') });
+    expect(r.summary.ignoredHunks).toBe(1);
+    expect(renderMarkdown(r)).toMatch(/1 hunk ignored by config/);
+  });
 });
 
+const LOCK = JSON.stringify({ name: 'x', lockfileVersion: 3, packages: { '': { name: 'x' }, 'node_modules/a': { version: '1.0.0' } } }, null, 2) + '\n';
+
 describe('guard with config', () => {
-  async function scenario(config: unknown) {
+  async function scenario(config: unknown, opts: { extra?: (repo: string) => void } = {}) {
     const repo = makeRepo(config);
     const home = temp('why-diff-config-home-');
     const stateDir = temp('why-diff-config-state-');
     const transcript = writeSyntheticTranscript(home, repo, 'sg', [{ prompt: 'change migration', at: SESSION_AT, calls: [{ tool: 'Edit', at: CALL_AT, input: { file_path: path.join(repo, 'migrations/001.sql'), old_string: 'id int', new_string: 'id bigint' } }] }]);
     put(repo, 'migrations/001.sql', 'create table a (id bigint);\n');
-    return { payload: { transcript_path: transcript, cwd: repo, session_id: 'sg' }, home, stateDir };
+    opts.extra?.(repo);
+    return { repo, payload: { transcript_path: transcript, cwd: repo, session_id: 'sg' }, home, stateDir };
   }
 
   it('protected-path blocks by default', async () => {
@@ -136,20 +244,71 @@ describe('guard with config', () => {
     expect(r.message).toContain('protected-path');
   });
 
-  it('config blockOn replaces the default list', async () => {
-    const s = await scenario({ protected: ['migrations/**'], blockOn: ['ci-changed'] });
-    expect((await runGuard(s.payload, { home: s.home, stateDir: s.stateDir })).block).toBe(false);
+  it('config blockOn only adds to the defaults, never removes', async () => {
+    for (const blockOn of [[], ['ci-changed']]) {
+      const s = await scenario({ protected: ['migrations/**'], blockOn });
+      expect((await runGuard(s.payload, { home: s.home, stateDir: s.stateDir })).block).toBe(true);
+    }
   });
 
-  it('explicit blocking wins over config blockOn', async () => {
-    const s = await scenario({ protected: ['migrations/**'], blockOn: ['ci-changed'] });
-    const r = await runGuard(s.payload, { home: s.home, stateDir: s.stateDir, blocking: new Set(['protected-path']) });
+  it('config blockOn adds a kind that is not blocking by default', async () => {
+    const s = await scenario({ blockOn: ['lockfile'] }, {});
+    const home = s.home;
+    const t = writeSyntheticTranscript(home, s.repo, 'sl', [{ prompt: 'lock', at: SESSION_AT, calls: [{ tool: 'Write', at: CALL_AT, input: { file_path: path.join(s.repo, 'package-lock.json'), content: LOCK } }] }]);
+    put(s.repo, 'package-lock.json', LOCK);
+    const r = await runGuard({ transcript_path: t, cwd: s.repo, session_id: 'sl' }, { home, stateDir: s.stateDir });
     expect(r.block).toBe(true);
+    expect(r.message).toContain('lockfile');
   });
 
-  it('an invalid config falls back to defaults without crashing', async () => {
-    const s = await scenario('{ nope');
-    const r = await runGuard(s.payload, { home: s.home, stateDir: s.stateDir });
+  it('explicit blocking replaces the defaults', async () => {
+    const s = await scenario({ protected: ['migrations/**'] });
+    const r = await runGuard(s.payload, { home: s.home, stateDir: s.stateDir, blocking: new Set(['ci-changed']) });
     expect(r.block).toBe(false);
+  });
+
+  it('an invalid config falls back to defaults: an agent it.skip still blocks', async () => {
+    const repo = makeRepo('{ nope');
+    put(repo, 'test/f.test.js', 'it("a",()=>{\n  expect(1).toBe(1);\n});\n');
+    sh(repo, 'add', '-A');
+    execFileSync('git', ['commit', '-qm', 't'], { cwd: repo, stdio: 'pipe', env: { ...ENV, GIT_AUTHOR_DATE: LONG_AGO, GIT_COMMITTER_DATE: LONG_AGO } });
+    const home = temp('why-diff-config-home-');
+    const t = writeSyntheticTranscript(home, repo, 'si', [{ prompt: 'skip', at: SESSION_AT, calls: [{ tool: 'Edit', at: CALL_AT, input: { file_path: path.join(repo, 'test/f.test.js'), old_string: 'it("a"', new_string: 'it.skip("a"' } }] }]);
+    put(repo, 'test/f.test.js', 'it.skip("a",()=>{\n  expect(1).toBe(1);\n});\n');
+    const r = await runGuard({ transcript_path: t, cwd: repo, session_id: 'si' }, { home, stateDir: temp('why-diff-config-state-') });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('test-skip-added');
+  });
+
+  it('an agent adding ignore: ["**"] in the same session does not unblock its own it.skip, and the config edit is labelled', async () => {
+    const repo = makeRepo({ protected: ['migrations/**'] });
+    put(repo, 'test/f.test.js', 'it("a",()=>{\n  expect(1).toBe(1);\n});\n');
+    sh(repo, 'add', '-A');
+    execFileSync('git', ['commit', '-qm', 't'], { cwd: repo, stdio: 'pipe', env: { ...ENV, GIT_AUTHOR_DATE: LONG_AGO, GIT_COMMITTER_DATE: LONG_AGO } });
+    const home = temp('why-diff-config-home-');
+    const t = writeSyntheticTranscript(home, repo, 'sx', [{ prompt: 'skip a test', at: SESSION_AT, calls: [
+      { tool: 'Edit', at: CALL_AT, input: { file_path: path.join(repo, 'test/f.test.js'), old_string: 'it("a"', new_string: 'it.skip("a"' } },
+      { tool: 'Write', at: CALL_AT, input: { file_path: path.join(repo, '.why-diff.json'), content: '{"ignore":["**"]}' } },
+    ] }]);
+    put(repo, 'test/f.test.js', 'it.skip("a",()=>{\n  expect(1).toBe(1);\n});\n');
+    put(repo, '.why-diff.json', '{"ignore":["**"]}');
+    const r = await runGuard({ transcript_path: t, cwd: repo, session_id: 'sx' }, { home, stateDir: temp('why-diff-config-state-') });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('test-skip-added');
+    expect(r.message).toContain('.why-diff.json');
+    expect(r.message).toContain('protected-path');
+  });
+});
+
+describe('CLI', () => {
+  it('exits 2 and names the file for an invalid config', () => {
+    const repo = makeRepo('{ nope');
+    const root = path.resolve(__dirname, '..');
+    const tsx = pathToFileURL(path.join(root, 'node_modules', 'tsx', 'dist', 'esm', 'index.mjs')).href;
+    const r = spawnSync(process.execPath, ['--import', tsx, path.join(root, 'src', 'cli.ts'), '-f', 'json', '-q'], {
+      cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: temp('why-diff-config-home-'), ...ENV, WHY_DIFF_CLAUDE_BIN: '/nonexistent' },
+    });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('.why-diff.json');
   });
 });

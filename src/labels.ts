@@ -26,6 +26,12 @@ export interface LabelContext {
    * Absent in pure/unit use: the rule then works from the hunk alone.
    */
   fileText?: (repoRelPath: string) => string | undefined;
+  /** Team rules (see config.ts): returns the matching `protected` glob for a repo-relative path */
+  protectedGlob?: (repoRelPath: string) => string | undefined;
+  /** No transcripts: every hunk counts for `protected-path`, not only the agent's */
+  riskScan?: boolean;
+  /** Repo-relative team-rules files that changed in this diff (always `protected-path`) */
+  rulesFiles?: ReadonlySet<string>;
 }
 
 /** Hard cap for `Label.detail`. */
@@ -53,7 +59,7 @@ export function labelHunks(hunks: AttributedHunk[], ctx: LabelContext): Attribut
   const scope = buildScopeIndex(hunks, ctx);
   return hunks.map((h) => {
     const path = toRepoPath(h.hunk.file, ctx.repoRoot);
-    const fresh = computeLabels(h, path, scope);
+    const fresh = computeLabels(h, path, scope, ctx);
     return { ...h, labels: mergeLabels(h.labels, fresh) };
   });
 }
@@ -79,7 +85,7 @@ export function isLockfile(path: string): boolean {
 // Orchestration
 // ---------------------------------------------------------------------------
 
-function computeLabels(h: AttributedHunk, path: string, scope: ScopeIndex): Label[] {
+function computeLabels(h: AttributedHunk, path: string, scope: ScopeIndex, ctx: LabelContext): Label[] {
   const out: Label[] = [];
   const agent = isAgentAttributed(h);
   const lines = h.hunk.lines;
@@ -126,6 +132,14 @@ function computeLabels(h: AttributedHunk, path: string, scope: ScopeIndex): Labe
 
   const secrets = detectSecrets(path, lines);
   if (secrets.length > 0) push('secret-like', 'risk', secrets.join('; '));
+
+  if (ctx.rulesFiles?.has(path)) {
+    push('protected-path', 'risk', `Team rules changed (${path})`);
+  } else if (ctx.protectedGlob && (agent || ctx.riskScan)) {
+    const oldPath = h.hunk.oldFile ? toRepoPath(h.hunk.oldFile, ctx.repoRoot) : undefined;
+    const glob = ctx.protectedGlob(path) ?? (oldPath ? ctx.protectedGlob(oldPath) : undefined);
+    if (glob) push('protected-path', 'risk', `Protected path (${glob}): ${oldPath && oldPath !== path ? `${oldPath} -> ${path}` : path}`);
+  }
 
   if (agent) {
     const why = outOfScopeReason(path, scope, hunkPromptIds(h));
