@@ -8722,7 +8722,8 @@ function build(report, o) {
     let risky = g.hunks.filter((a) => a.labels.some((l) => l.severity === "risk") || a.intent?.verdict === "unrequested").length, summaryBits = [
       `<b>${text(p.harness)}</b>`,
       text(shortTime(p.at)),
-      `\u201C${text(truncate2(p.text, 90))}\u201D`,
+      `\u201C${unlink(text(truncate2(p.text.replace(/\r\n?/g, `
+`), 90)))}\u201D`,
       g.hunks.length === 0 ? "no hunks" : plural(g.hunks.length, "hunk")
     ];
     if (risky > 0 && summaryBits.push(`<b>${risky} flagged</b>`), out.push("<details>"), out.push(`<summary>${summaryBits.join(" \xB7 ")}</summary>`), out.push(""), out.push(`> ${quote(p.text)}`), out.push(""), out.push(`<sub>Session \`${code(shortSession(p.sessionId))}\` \xB7 ${escapeHtml(shortDateTime(p.at))}${g.hunks.length > 0 ? ` \xB7 +${added}${removed > 0 ? ` \u2212${removed}` : ""}` : ""}</sub>`), out.push(""), g.hunks.length > 0) {
@@ -8777,11 +8778,14 @@ function text(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 function cell(s) {
-  return text(s).replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+  return text(s).replace(/\|/g, "\\|").replace(/\r\n?|\n/g, " ");
+}
+function unlink(s) {
+  return s.replace(/(^|[^\w.+-])@(?=[A-Za-z0-9])/g, "$1@\u2060").replace(/#(?=\d)/g, "#\u2060");
 }
 function quote(s) {
   let t = s.trim(), cut = /[\uD800-\uDBFF]/.test(t.charAt(MAX_QUOTE - 1)) ? MAX_QUOTE - 1 : MAX_QUOTE, capped = t.length > MAX_QUOTE ? `${t.slice(0, cut).trimEnd()}\u2026` : t;
-  return text(capped).split(/\r?\n/).join(`
+  return unlink(text(capped)).split(/\r\n?|\n/).join(`
 > `);
 }
 

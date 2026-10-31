@@ -433,6 +433,29 @@ describe('control characters from prompts and file names', () => {
   });
 });
 
+describe('markdown prompt quotes', () => {
+  function withPrompt(text: string): Report {
+    const r = clone(sample);
+    for (const p of r.prompts) p.text = text;
+    for (const h of r.hunks) if (h.prompt) h.prompt.text = text;
+    return r;
+  }
+  it('turns lone CR and CRLF into quote line breaks', () => {
+    const md = renderMarkdown(withPrompt('first\rINJECTED | a |\r\nthird\nfourth'));
+    expect(md).not.toContain('\r');
+    expect(md).toContain('> first\n> INJECTED | a |\n> third\n> fourth');
+  });
+  it('neutralises @mentions and #123 references in prompt text but leaves e-mail addresses alone', () => {
+    const md = renderMarkdown(withPrompt('ping @octocat and @acme/team about #12, acme/repo#7 and GH-3; mail ops@acme.com'));
+    expect(md).not.toMatch(/(^|[^\w])@octocat/m);
+    expect(md).not.toMatch(/@acme\/team/);
+    expect(md).not.toMatch(/#12\b/);
+    expect(md).not.toMatch(/#7\b/);
+    expect(md).toContain('ops@acme.com');
+    expect(md).toContain('@⁠octocat');
+  });
+});
+
 describe('renderHtml', () => {
   const html = renderHtml(sample);
 

@@ -192,7 +192,7 @@ function build(report: Report, o: BuildOpts): string {
     const summaryBits = [
       `<b>${text(p.harness)}</b>`,
       text(shortTime(p.at)),
-      `“${text(truncate(p.text, 90))}”`,
+      `“${unlink(text(truncate(p.text.replace(/\r\n?/g, '\n'), 90)))}”`,
       g.hunks.length === 0 ? 'no hunks' : plural(g.hunks.length, 'hunk'),
     ];
     if (risky > 0) summaryBits.push(`<b>${risky} flagged</b>`);
@@ -303,7 +303,15 @@ function text(s: string): string {
 
 /** Table cell text: escape pipes and HTML, collapse newlines. */
 function cell(s: string): string {
-  return text(s).replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+  return text(s).replace(/\|/g, '\\|').replace(/\r\n?|\n/g, ' ');
+}
+
+/**
+ * Quoted prompt text must not ping people or link issues on GitHub: a word joiner (U+2060) after
+ * `@` (not in e-mail addresses) and after `#` before a digit breaks the autolink, invisibly.
+ */
+function unlink(s: string): string {
+  return s.replace(/(^|[^\w.+-])@(?=[A-Za-z0-9])/g, '$1@\u2060').replace(/#(?=\d)/g, '#\u2060');
 }
 
 /** Blockquote body: escape HTML, keep line breaks as quote continuation. */
@@ -311,5 +319,5 @@ function quote(s: string): string {
   const t = s.trim();
   const cut = /[\uD800-\uDBFF]/.test(t.charAt(MAX_QUOTE - 1)) ? MAX_QUOTE - 1 : MAX_QUOTE;
   const capped = t.length > MAX_QUOTE ? `${t.slice(0, cut).trimEnd()}…` : t;
-  return text(capped).split(/\r?\n/).join('\n> ');
+  return unlink(text(capped)).split(/\r\n?|\n/).join('\n> ');
 }
