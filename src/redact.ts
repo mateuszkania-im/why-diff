@@ -39,18 +39,34 @@ const BARE_SCHEME = /\b(Bearer|Basic)(\s+)(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~
  * (lookbehind), so scanning is linear. Whether the name is secret-sounding and
  * whether the value looks like a literal is decided in the callback.
  */
-const NAME_VALUE = /(?<![\w.])((["']?)([A-Za-z_][\w.-]{0,60})\2\s*(:=|=>|===?|!==?|=|:)\s*)(?:"([^"\n]{1,200})"|'([^'\n]{1,200})'|([^\s"'`,;]{8,}))/g;
+const NAME_VALUE = /(?<![\w.])((["']?)([A-Za-z_][\w.-]{0,60})\2\s*(:=|=>|===?|!==?|=|:)[ \t]*)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'`,;]+))/g;
 const EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b/g;
 
 const SECRET_WORDS = new Set(['password', 'passwd', 'pwd', 'passphrase', 'secret', 'token', 'credential', 'credentials', 'apikey']);
+/** Run-together names (DBPASSWORD, MYAPITOKEN): the keyword ends the name. */
+const SECRET_SUFFIXES = ['password', 'passwd', 'passphrase', 'secret', 'token', 'apikey', 'credential', 'credentials'];
 
-/** True when a name contains a secret keyword as a whole segment (split on _ . - and camelCase). */
-function secretName(name: string): boolean {
-  const segs = name.split(/[._-]+/).flatMap((p) => p.split(/(?<=[a-z0-9])(?=[A-Z])/)).map((x) => x.toLowerCase());
-  return segs.some((x, i) => SECRET_WORDS.has(x) || (x === 'api' && segs[i + 1] === 'key'));
+function nameSegments(name: string): string[] {
+  return name.split(/[._-]+/).flatMap((p) => p.split(/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/)).map((x) => x.toLowerCase());
+}
+
+/** True when a name contains a secret keyword as a whole segment (split on _ . - and camelCase / acronyms). */
+function secretName(segs: string[]): boolean {
+  return segs.some((x, i) => SECRET_WORDS.has(x) || (x === 'api' && segs[i + 1] === 'key') || (x === 'private' && segs[i + 1] === 'key'));
+}
+
+/** A keyword ends the last segment of a run-together name, e.g. `dbpassword`. */
+function secretSuffix(segs: string[]): boolean {
+  const last = segs[segs.length - 1] ?? '';
+  return SECRET_SUFFIXES.some((w) => last.endsWith(w));
 }
 
 const ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/;
+const CALL = /^[A-Za-z_$][\w$.]*\(/;
+const MEMBER_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/;
+/** Roots of obvious code references (`process.env.X2`), excluded even when they contain a digit. */
+const CODE_ROOTS = /^(?:process|os|env|config|conf|settings|this|self|ctx|args|params|options|opts|vars|secrets|props|state|req|request)\./i;
+const CODE_WORDS = new Set(['new', 'null', 'undefined', 'nil', 'none', 'true', 'false', 'this', 'self', 'await', 'async', 'function', 'return', 'require', 'string', 'number', 'boolean', 'any', 'unknown', 'str', 'int', 'bool', 'object', 'void', 'never', 'optional', 'required']);
 
 /** Rules precise enough to run on source code: token formats, JWTs, auth headers, URL credentials, private keys. */
 export function redactKeys(text: string): string {
@@ -71,19 +87,30 @@ export function redactKeys(text: string): string {
 export function redactSecrets(text: string): string {
   if (!text) return text;
   let out = redactKeys(text);
-  out = out.replace(NAME_VALUE, (m, head: string, q: string, name: string, op: string, dq?: string, sq?: string, bare?: string) => {
+  out = out.replace(NAME_VALUE, (m: string, head: string, q: string, name: string, op: string, dq?: string, sq?: string, bare?: string, offset?: number, str?: string) => {
     if (op === '==' || op === '===' || op === '!=' || op === '!==') return m;
-    if (!secretName(name)) return m;
+    const segs = nameSegments(name);
+    const strong = secretName(segs);
     const quoted = dq ?? sq;
     if (quoted !== undefined) {
-      if (ENV_REF.test(quoted)) return m;
+      if (quoted === '' || ENV_REF.test(quoted)) return m;
+      if (!strong && !(secretSuffix(segs) && !/^\d+$/.test(quoted))) return m;
       const quote = dq !== undefined ? '"' : "'";
       return `${head}${quote}${DOTS}${quote}`;
     }
     const v = bare ?? '';
-    if (ENV_REF.test(v) || /[().=]/.test(v)) return m;
-    // `name: word` is usually prose; require something non-alphabetic there.
-    if (op === ':' && /^[A-Za-z]+$/.test(v)) return m;
+    if (ENV_REF.test(v) || CALL.test(v) || (MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v))) || CODE_WORDS.has(v.toLowerCase())) return m;
+    if (!strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
+    // `name: word` is usually prose; an all-letter value needs a config-like line.
+    if (op === ':' && /^[A-Za-z]+$/.test(v)) {
+      const text = str ?? '';
+      const at = offset ?? 0;
+      const lineStart = text.lastIndexOf('\n', at - 1) + 1;
+      const configLike = q !== '' || /^[\s{,-]*$/.test(text.slice(lineStart, at));
+      const restEnd = text.indexOf('\n', at + m.length);
+      const rest = text.slice(at + m.length, restEnd === -1 ? undefined : restEnd);
+      if (!configLike || !/^\s*[,;}\]]?\s*$/.test(rest)) return m;
+    }
     return `${head}${DOTS}`;
   });
   return out.replace(EMAIL, '[email redacted]');

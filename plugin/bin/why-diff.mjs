@@ -3558,12 +3558,18 @@ var SECRET_RULES = [
   { re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/, name: "Slack token" },
   { re: /\bAIza[0-9A-Za-z_-]{35}\b/, name: "Google API key" },
   { re: /\bnpm_[A-Za-z0-9]{36}\b/, name: "npm token" }
-], DOTS = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022", PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/'"`@:]{1,100}:[^\s/'"`]{1,200}@/gi, JWT = /\beyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}/g, AUTH_HEADER = /\b(authorization["']?\s*[:=]\s*["']?(?:Bearer|Basic|Token)\s+)[^\s"']{8,}/gi, BARE_SCHEME = /\b(Bearer|Basic)(\s+)(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/-]{8,}={0,2}/g, NAME_VALUE = /(?<![\w.])((["']?)([A-Za-z_][\w.-]{0,60})\2\s*(:=|=>|===?|!==?|=|:)\s*)(?:"([^"\n]{1,200})"|'([^'\n]{1,200})'|([^\s"'`,;]{8,}))/g, EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b/g, SECRET_WORDS = /* @__PURE__ */ new Set(["password", "passwd", "pwd", "passphrase", "secret", "token", "credential", "credentials", "apikey"]);
-function secretName(name) {
-  let segs = name.split(/[._-]+/).flatMap((p) => p.split(/(?<=[a-z0-9])(?=[A-Z])/)).map((x) => x.toLowerCase());
-  return segs.some((x, i) => SECRET_WORDS.has(x) || x === "api" && segs[i + 1] === "key");
+], DOTS = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022", PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/'"`@:]{1,100}:[^\s/'"`]{1,200}@/gi, JWT = /\beyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}/g, AUTH_HEADER = /\b(authorization["']?\s*[:=]\s*["']?(?:Bearer|Basic|Token)\s+)[^\s"']{8,}/gi, BARE_SCHEME = /\b(Bearer|Basic)(\s+)(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/-]{8,}={0,2}/g, NAME_VALUE = /(?<![\w.])((["']?)([A-Za-z_][\w.-]{0,60})\2\s*(:=|=>|===?|!==?|=|:)[ \t]*)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'`,;]+))/g, EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b/g, SECRET_WORDS = /* @__PURE__ */ new Set(["password", "passwd", "pwd", "passphrase", "secret", "token", "credential", "credentials", "apikey"]), SECRET_SUFFIXES = ["password", "passwd", "passphrase", "secret", "token", "apikey", "credential", "credentials"];
+function nameSegments(name) {
+  return name.split(/[._-]+/).flatMap((p) => p.split(/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/)).map((x) => x.toLowerCase());
 }
-var ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/;
+function secretName(segs) {
+  return segs.some((x, i) => SECRET_WORDS.has(x) || x === "api" && segs[i + 1] === "key" || x === "private" && segs[i + 1] === "key");
+}
+function secretSuffix(segs) {
+  let last = segs[segs.length - 1] ?? "";
+  return SECRET_SUFFIXES.some((w) => last.endsWith(w));
+}
+var ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/, CALL = /^[A-Za-z_$][\w$.]*\(/, MEMBER_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/, CODE_ROOTS = /^(?:process|os|env|config|conf|settings|this|self|ctx|args|params|options|opts|vars|secrets|props|state|req|request)\./i, CODE_WORDS = /* @__PURE__ */ new Set(["new", "null", "undefined", "nil", "none", "true", "false", "this", "self", "await", "async", "function", "return", "require", "string", "number", "boolean", "any", "unknown", "str", "int", "bool", "object", "void", "never", "optional", "required"]);
 function redactKeys(text2) {
   if (!text2) return text2;
   let out = text2.replace(PRIVATE_KEY_BLOCK, "-----PRIVATE KEY REDACTED-----");
@@ -3575,16 +3581,23 @@ function redactKeys(text2) {
 function redactSecrets(text2) {
   if (!text2) return text2;
   let out = redactKeys(text2);
-  return out = out.replace(NAME_VALUE, (m, head, q, name, op, dq, sq, bare) => {
-    if (op === "==" || op === "===" || op === "!=" || op === "!==" || !secretName(name)) return m;
-    let quoted = dq ?? sq;
+  return out = out.replace(NAME_VALUE, (m, head, q, name, op, dq, sq, bare, offset, str3) => {
+    if (op === "==" || op === "===" || op === "!=" || op === "!==") return m;
+    let segs = nameSegments(name), strong = secretName(segs), quoted = dq ?? sq;
     if (quoted !== void 0) {
-      if (ENV_REF.test(quoted)) return m;
+      if (quoted === "" || ENV_REF.test(quoted) || !strong && !(secretSuffix(segs) && !/^\d+$/.test(quoted))) return m;
       let quote2 = dq !== void 0 ? '"' : "'";
       return `${head}${quote2}${DOTS}${quote2}`;
     }
     let v = bare ?? "";
-    return ENV_REF.test(v) || /[().=]/.test(v) || op === ":" && /^[A-Za-z]+$/.test(v) ? m : `${head}${DOTS}`;
+    if (ENV_REF.test(v) || CALL.test(v) || MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) || CODE_WORDS.has(v.toLowerCase()) || !strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
+    if (op === ":" && /^[A-Za-z]+$/.test(v)) {
+      let text3 = str3 ?? "", at = offset ?? 0, lineStart = text3.lastIndexOf(`
+`, at - 1) + 1, configLike = q !== "" || /^[\s{,-]*$/.test(text3.slice(lineStart, at)), restEnd = text3.indexOf(`
+`, at + m.length), rest = text3.slice(at + m.length, restEnd === -1 ? void 0 : restEnd);
+      if (!configLike || !/^\s*[,;}\]]?\s*$/.test(rest)) return m;
+    }
+    return `${head}${DOTS}`;
   }), out.replace(EMAIL, "[email redacted]");
 }
 var mapOpt = (v, f) => typeof v == "string" ? f(v) : v;

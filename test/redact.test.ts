@@ -158,3 +158,46 @@ describe('redaction of diff lines and intent reasons', () => {
     expect(JSON.stringify(redactReport(r, 'prompts'))).not.toContain('hunter2xyz');
   });
 });
+
+describe('redactSecrets: round 2', () => {
+  it.each([
+    ['password=hunter2', 'hunter2'],
+    ['pwd=abc123', 'abc123'],
+    ['password: hunter2', 'hunter2'],
+    ['token: abc123', 'abc123'],
+    ['secret := x9', 'x9'],
+    ['password=p.ss.w0rd', 'p.ss.w0rd'],
+    ['token=YWJjZGVmZ2g=', 'YWJjZGVmZ2g'],
+    ['DBPASSWORD="x"', '"x"'],
+    ['AWSSecretKey: "abcdEFGH1234"', 'abcdEFGH1234'],
+    ['MYAPITOKEN=abc12345', 'abc12345'],
+    ['password: hunter', 'hunter'],
+    [`password = "${'a'.repeat(300)}b1"`, 'aaaaaaaaaa'],
+    ['{"password": "x", "n": 1}', '"x"'],
+  ])('masks %s', (t, leak) => {
+    expect(redactSecrets(t)).not.toContain(leak);
+  });
+  it.each([
+    'max_tokens=4096',
+    'max_tokens: "4096"',
+    'const tokenizer = new Tokenizer()',
+    'secretary = hire(p)',
+    'tokenCount = items.length',
+    'password=process.env.DB_PASS',
+    'password = config.db.password',
+    'password = getPassword()',
+    'token = new Token()',
+    'password: string;',
+    'token: null',
+    'the token: it expires daily',
+    'Note the token: expires soon, refresh it',
+  ])('keeps %s', (t) => {
+    expect(redactSecrets(t)).toBe(t);
+  });
+  it.each(['a:"', "a:'a ", 'password="', 'a=" b'])('200 KB of %j is fast', (unit) => {
+    const input = unit.repeat(Math.ceil(200_000 / unit.length));
+    const t0 = performance.now();
+    redactSecrets(input);
+    expect(performance.now() - t0).toBeLessThan(200);
+  });
+});
