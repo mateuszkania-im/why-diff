@@ -84,6 +84,9 @@ function computeLabels(h: AttributedHunk, path: string, scope: ScopeIndex): Labe
   const skips = detectTestSkips(path, lines);
   if (skips.length > 0) push('test-skip-added', 'risk', `Adds ${listOf(skips)}`);
 
+  const disabled = detectTestsDisabled(path, h.hunk, lines);
+  if (disabled.length > 0) push('tests-disabled', 'risk', disabled.join('; '));
+
   const assertions = detectAssertionChanges(path, lines);
   if (assertions.length > 0) push('assertion-removed', 'risk', assertions.join('; '));
 
@@ -430,6 +433,122 @@ function detectTestSkips(path: string, lines: DiffLine[]): string[] {
     hits.push(...matchPatterns(text, SKIP_PATTERNS, path, inTest, true));
   }
   return uniq(hits);
+}
+
+// ---------------------------------------------------------------------------
+// tests-disabled
+// ---------------------------------------------------------------------------
+
+/**
+ * Tests turned off without touching a test line: runner config that excludes
+ * files, a test command that can no longer fail, a CI step that may fail, a
+ * test file renamed away from its test name or deleted. Only net-added lines
+ * count, so removing such a setting is never flagged. Excludes that name only
+ * build output (node_modules, dist, coverage, ...) are ordinary housekeeping.
+ */
+const IGNORE_KEY = /["']?(exclude|testPathIgnorePatterns|modulePathIgnorePatterns|testIgnore|testIgnorePatterns)["']?\s*[:=]/;
+const BENIGN_IGNORE = /(?:^|[/*<>\s])(?:node_modules|dist|build|coverage|out|\.git|\.next|\.nuxt|\.cache|\.turbo|\.venv|venv|__pycache__|target|vendor|tmp|temp)(?:[/*]|$)/;
+const RUNNER_CONFIG = /^(?:(?:vitest|jest|vite)\.config\.\w+|vitest\.workspace\.\w+|package\.json)$/;
+const PYTEST_CONFIG = /^(?:pytest\.ini|pyproject\.toml|setup\.cfg|tox\.ini)$/;
+const TEST_SCRIPT_KEY = /^\s*"test(?::[\w:.-]+)?"\s*:/;
+const SWALLOW = /(?:--passWithNoTests\b|--no-error-on-unmatched-pattern\b|\|\|\s*(?:true|exit\s+0|:)(?![\w-])|;\s*(?:true|exit\s+0)\s*(?:["',]|$))/;
+const TEST_WORDS = /\b(?:tests?|pytest|jest|vitest|mocha|rspec|phpunit|tox|nextest)\b|go\s+test|cargo\s+test|\bspec\b/i;
+const DISABLED_SUFFIX = /\.(?:disabled?|bak|off|old|orig|skip|skipped|tmp|txt|hidden|ignore)$/i;
+
+function quotedStrings(text: string): string[] {
+  return [...text.matchAll(/(["'`])((?:\\.|(?!\1).)*)\1/g)].map((m) => m[2] ?? '');
+}
+
+function isBenignIgnoreList(strings: string[]): boolean {
+  return strings.every((s) => BENIGN_IGNORE.test(s) || /^\.?\/?(?:node_modules|dist|build|coverage)$/.test(s));
+}
+
+function detectTestsDisabled(path: string, hunk: AttributedHunk['hunk'], lines: DiffLine[]): string[] {
+  const hits: string[] = [];
+  const base = posix.basename(path);
+
+  // Renamed away from a test name, or a test file deleted outright.
+  if (hunk.status === 'deleted' && isTestFile(path)) hits.push(`Deletes test file ${base}`);
+  if (hunk.status === 'renamed' && hunk.oldFile && isTestFile(hunk.oldFile)) {
+    const oldBase = posix.basename(hunk.oldFile);
+    const moved = oldBase !== base && (base.startsWith(`${oldBase}.`) || DISABLED_SUFFIX.test(base));
+    if (moved || !isTestFile(path)) hits.push(`Renames test file ${oldBase} to ${base}`);
+  }
+
+  const added = new Set(netAdded(lines));
+
+  // Ignore lists in runner config (key on the line, or an item under an open list).
+  if (RUNNER_CONFIG.test(base)) {
+    let openKey = false;
+    for (const l of lines) {
+      if (l.type === 'del') continue;
+      const keyed = IGNORE_KEY.exec(l.text);
+      if (keyed) {
+        const value = l.text.slice(keyed.index + keyed[0].length);
+        openKey = /\[\s*[^\]]*$/.test(value);
+        if (added.has(l)) {
+          const items = quotedStrings(value);
+          if (items.length > 0 && !isBenignIgnoreList(items)) hits.push(`Adds ${keyed[1]} entry ${items.join(', ')}`);
+        }
+        continue;
+      }
+      if (openKey) {
+        if (/\]/.test(l.text)) openKey = false;
+        if (added.has(l)) {
+          const items = quotedStrings(l.text.replace(/\].*$/, ''));
+          if (items.length > 0 && !isBenignIgnoreList(items)) hits.push(`Adds ignore entry ${items.join(', ')}`);
+        }
+      }
+    }
+  }
+
+  // package.json "test" scripts that can no longer fail.
+  if (base === 'package.json') {
+    for (const l of added) {
+      if (TEST_SCRIPT_KEY.test(l.text) && SWALLOW.test(l.text)) hits.push(`Test script cannot fail: ${l.text.trim()}`);
+    }
+  }
+
+  // pytest options that skip tests.
+  if (PYTEST_CONFIG.test(base)) {
+    for (const l of added) {
+      const m = /(?:^|[\s"'=])(-k\s*["']?\s*not\b|--deselect\b|--ignore(?:-glob)?\b)(?:[=\s]+(\S+))?/.exec(l.text);
+      if (!m) continue;
+      if (m[1]?.startsWith('--ignore') && isBenignIgnoreList([m[2] ?? ''])) continue;
+      hits.push(`Pytest option ${m[1]?.replace(/\s+/g, ' ')} added`);
+    }
+  }
+
+  // CI: failures swallowed on a test step.
+  if (isCiFile(path)) hits.push(...detectCiSwallowedTests(lines, added));
+
+  return uniq(hits);
+}
+
+function detectCiSwallowedTests(lines: DiffLine[], added: Set<DiffLine>): string[] {
+  const hits: string[] = [];
+  const kept = lines.filter((l) => l.type !== 'del');
+  const stepStart = /^\s*-\s+\S/;
+  let block: DiffLine[] = [];
+  const flush = (): void => {
+    const text = block.map((l) => l.text).join('\n');
+    if (TEST_WORDS.test(text)) {
+      for (const l of block) {
+        if (!added.has(l)) continue;
+        if (/^\s*(?:-\s+)?continue-on-error:\s*true\b/.test(l.text)) hits.push('continue-on-error: true on a test step');
+      }
+    }
+    block = [];
+  };
+  for (const l of kept) {
+    if (stepStart.test(l.text) && /^\s*-\s+(?:name|run|uses|id|if|env|with|working-directory):/.test(l.text)) flush();
+    block.push(l);
+  }
+  flush();
+  for (const l of added) {
+    if (TEST_WORDS.test(l.text) && /\|\|\s*(?:true|exit\s+0|:)(?![\w-])/.test(l.text)) hits.push(`Test command cannot fail: ${l.text.trim()}`);
+  }
+  return hits;
 }
 
 // ---------------------------------------------------------------------------

@@ -491,10 +491,11 @@ const APP_JS = `
     }
     var testKinds = [];
     if (S.labels['test-skip-added']) testKinds.push('skip added');
+    if (S.labels['tests-disabled']) testKinds.push('tests disabled');
     if (S.labels['assertion-removed']) testKinds.push('assertion weakened');
     if (S.labels['snapshot-updated']) testKinds.push('snapshot updated');
     if (S.labels['test-modified']) testKinds.push(plural(S.labels['test-modified'], 'test file') + ' changed');
-    stats.appendChild(stat('Tests touched', S.touchedTests ? 'Yes' : 'No', S.touchedTests ? testKinds.join(' \\u00b7 ') : 'no test files in this diff', S.touchedTests ? (S.labels['test-skip-added'] || S.labels['assertion-removed'] ? 'risk' : 'warn') : 'ok'));
+    stats.appendChild(stat('Tests touched', S.touchedTests ? 'Yes' : 'No', S.touchedTests ? testKinds.join(' \\u00b7 ') : 'no test files in this diff', S.touchedTests ? (S.labels['test-skip-added'] || S.labels['tests-disabled'] || S.labels['assertion-removed'] ? 'risk' : 'warn') : 'ok'));
     var unattrFiles = {}; unattributed.forEach(function (a) { unattrFiles[a.hunk.file] = 1; });
     var uf = Object.keys(unattrFiles);
     stats.appendChild(stat('Unattributed', String(S.unattributedLines), S.unattributedLines === 0 ? 'every added line traces to an agent edit' : plural(S.unattributedLines, 'added line') + (uf.length ? ' \\u00b7 ' + uf.join(', ') : ' outside agent edits'), S.unattributedLines > 0 ? 'warn' : 'ok'));

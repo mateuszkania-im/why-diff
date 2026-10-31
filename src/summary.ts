@@ -4,7 +4,7 @@
 
 import { FILE_LEVEL_LABELS, type AttributedHunk, type IntentVerdict, type LabelKind, type Session, type Summary } from './types.js';
 
-const TEST_LABELS: ReadonlySet<LabelKind> = new Set<LabelKind>(['test-modified', 'test-skip-added', 'assertion-removed']);
+const TEST_LABELS: ReadonlySet<LabelKind> = new Set<LabelKind>(['test-modified', 'test-skip-added', 'assertion-removed', 'tests-disabled']);
 
 /** Ids of the sessions that own at least one hunk's prompt or one referenced edit. */
 export function contributingSessionIds(hunks: AttributedHunk[]): Set<string> {

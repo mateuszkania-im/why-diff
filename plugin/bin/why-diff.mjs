@@ -2887,7 +2887,7 @@ function parseUnifiedDiff(diff) {
     binary: !1,
     emittedHunk: !1
   }), finishFile = () => {
-    file && !file.binary && !file.emittedHunk && isModeOnlyChange(file) && hunks.push(modeChangeHunk(file, hunks.length + 1)), file = null, open = null;
+    file && !file.binary && !file.emittedHunk && isModeOnlyChange(file) ? hunks.push(modeChangeHunk(file, hunks.length + 1)) : file && !file.binary && !file.emittedHunk && isContentlessMove(file) && hunks.push(contentlessHunk(file, hunks.length + 1)), file = null, open = null;
   };
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i] ?? "";
@@ -2970,6 +2970,24 @@ function consumeBodyLine(open, line) {
 }
 function isModeOnlyChange(file) {
   return file.oldMode !== void 0 && file.newMode !== void 0 && file.status === "modified";
+}
+function isContentlessMove(file) {
+  return file.status === "renamed" || file.status === "deleted";
+}
+function contentlessHunk(file, n) {
+  let path12 = displayPath(file);
+  return {
+    id: `h${n}`,
+    file: path12,
+    ...file.oldPath && file.oldPath !== path12 ? { oldFile: file.oldPath } : {},
+    status: file.status,
+    oldStart: 0,
+    oldLines: 0,
+    newStart: 0,
+    newLines: 0,
+    header: file.status === "deleted" ? `deleted file ${path12}` : `rename ${file.oldPath ?? "?"} => ${path12}`,
+    lines: []
+  };
 }
 function modeChangeHunk(file, n) {
   return {
@@ -3657,6 +3675,8 @@ function computeLabels(h, path12, scope) {
   );
   let skips = detectTestSkips(path12, lines);
   skips.length > 0 && push("test-skip-added", "risk", `Adds ${listOf(skips)}`);
+  let disabled = detectTestsDisabled(path12, h.hunk, lines);
+  disabled.length > 0 && push("tests-disabled", "risk", disabled.join("; "));
   let assertions = detectAssertionChanges(path12, lines);
   assertions.length > 0 && push("assertion-removed", "risk", assertions.join("; ")), isSnapshotFile(path12) && push("snapshot-updated", "warn", "Snapshot file changed");
   let deps = detectNewDependencies(path12, lines);
@@ -3906,6 +3926,65 @@ function detectTestSkips(path12, lines) {
     hits.push(...matchPatterns(text2, SKIP_PATTERNS, path12, inTest, !0));
   }
   return uniq(hits);
+}
+var IGNORE_KEY = /["']?(exclude|testPathIgnorePatterns|modulePathIgnorePatterns|testIgnore|testIgnorePatterns)["']?\s*[:=]/, BENIGN_IGNORE = /(?:^|[/*<>\s])(?:node_modules|dist|build|coverage|out|\.git|\.next|\.nuxt|\.cache|\.turbo|\.venv|venv|__pycache__|target|vendor|tmp|temp)(?:[/*]|$)/, RUNNER_CONFIG = /^(?:(?:vitest|jest|vite)\.config\.\w+|vitest\.workspace\.\w+|package\.json)$/, PYTEST_CONFIG = /^(?:pytest\.ini|pyproject\.toml|setup\.cfg|tox\.ini)$/, TEST_SCRIPT_KEY = /^\s*"test(?::[\w:.-]+)?"\s*:/, SWALLOW = /(?:--passWithNoTests\b|--no-error-on-unmatched-pattern\b|\|\|\s*(?:true|exit\s+0|:)(?![\w-])|;\s*(?:true|exit\s+0)\s*(?:["',]|$))/, TEST_WORDS = /\b(?:tests?|pytest|jest|vitest|mocha|rspec|phpunit|tox|nextest)\b|go\s+test|cargo\s+test|\bspec\b/i, DISABLED_SUFFIX = /\.(?:disabled?|bak|off|old|orig|skip|skipped|tmp|txt|hidden|ignore)$/i;
+function quotedStrings(text2) {
+  return [...text2.matchAll(/(["'`])((?:\\.|(?!\1).)*)\1/g)].map((m) => m[2] ?? "");
+}
+function isBenignIgnoreList(strings) {
+  return strings.every((s) => BENIGN_IGNORE.test(s) || /^\.?\/?(?:node_modules|dist|build|coverage)$/.test(s));
+}
+function detectTestsDisabled(path12, hunk, lines) {
+  let hits = [], base = posix.basename(path12);
+  if (hunk.status === "deleted" && isTestFile(path12) && hits.push(`Deletes test file ${base}`), hunk.status === "renamed" && hunk.oldFile && isTestFile(hunk.oldFile)) {
+    let oldBase = posix.basename(hunk.oldFile);
+    (oldBase !== base && (base.startsWith(`${oldBase}.`) || DISABLED_SUFFIX.test(base)) || !isTestFile(path12)) && hits.push(`Renames test file ${oldBase} to ${base}`);
+  }
+  let added = new Set(netAdded(lines));
+  if (RUNNER_CONFIG.test(base)) {
+    let openKey = !1;
+    for (let l of lines) {
+      if (l.type === "del") continue;
+      let keyed = IGNORE_KEY.exec(l.text);
+      if (keyed) {
+        let value = l.text.slice(keyed.index + keyed[0].length);
+        if (openKey = /\[\s*[^\]]*$/.test(value), added.has(l)) {
+          let items = quotedStrings(value);
+          items.length > 0 && !isBenignIgnoreList(items) && hits.push(`Adds ${keyed[1]} entry ${items.join(", ")}`);
+        }
+        continue;
+      }
+      if (openKey && (/\]/.test(l.text) && (openKey = !1), added.has(l))) {
+        let items = quotedStrings(l.text.replace(/\].*$/, ""));
+        items.length > 0 && !isBenignIgnoreList(items) && hits.push(`Adds ignore entry ${items.join(", ")}`);
+      }
+    }
+  }
+  if (base === "package.json")
+    for (let l of added)
+      TEST_SCRIPT_KEY.test(l.text) && SWALLOW.test(l.text) && hits.push(`Test script cannot fail: ${l.text.trim()}`);
+  if (PYTEST_CONFIG.test(base))
+    for (let l of added) {
+      let m = /(?:^|[\s"'=])(-k\s*["']?\s*not\b|--deselect\b|--ignore(?:-glob)?\b)(?:[=\s]+(\S+))?/.exec(l.text);
+      m && (m[1]?.startsWith("--ignore") && isBenignIgnoreList([m[2] ?? ""]) || hits.push(`Pytest option ${m[1]?.replace(/\s+/g, " ")} added`));
+    }
+  return isCiFile(path12) && hits.push(...detectCiSwallowedTests(lines, added)), uniq(hits);
+}
+function detectCiSwallowedTests(lines, added) {
+  let hits = [], kept = lines.filter((l) => l.type !== "del"), stepStart = /^\s*-\s+\S/, block = [], flush = () => {
+    let text2 = block.map((l) => l.text).join(`
+`);
+    if (TEST_WORDS.test(text2))
+      for (let l of block)
+        added.has(l) && /^\s*(?:-\s+)?continue-on-error:\s*true\b/.test(l.text) && hits.push("continue-on-error: true on a test step");
+    block = [];
+  };
+  for (let l of kept)
+    stepStart.test(l.text) && /^\s*-\s+(?:name|run|uses|id|if|env|with|working-directory):/.test(l.text) && flush(), block.push(l);
+  flush();
+  for (let l of added)
+    TEST_WORDS.test(l.text) && /\|\|\s*(?:true|exit\s+0|:)(?![\w-])/.test(l.text) && hits.push(`Test command cannot fail: ${l.text.trim()}`);
+  return hits;
 }
 var MATCHER_ALIASES = {
   equals: "equal",
@@ -4368,7 +4447,7 @@ var FILE_LEVEL_LABELS = /* @__PURE__ */ new Set([
 ]);
 
 // src/summary.ts
-var TEST_LABELS = /* @__PURE__ */ new Set(["test-modified", "test-skip-added", "assertion-removed"]);
+var TEST_LABELS = /* @__PURE__ */ new Set(["test-modified", "test-skip-added", "assertion-removed", "tests-disabled"]);
 function contributingSessionIds(hunks) {
   let ids = /* @__PURE__ */ new Set();
   for (let h of hunks) {
@@ -7629,10 +7708,11 @@ kbd{display:inline-block;min-width:18px;padding:0 5px;border-radius:4px;border:1
     }
     var testKinds = [];
     if (S.labels['test-skip-added']) testKinds.push('skip added');
+    if (S.labels['tests-disabled']) testKinds.push('tests disabled');
     if (S.labels['assertion-removed']) testKinds.push('assertion weakened');
     if (S.labels['snapshot-updated']) testKinds.push('snapshot updated');
     if (S.labels['test-modified']) testKinds.push(plural(S.labels['test-modified'], 'test file') + ' changed');
-    stats.appendChild(stat('Tests touched', S.touchedTests ? 'Yes' : 'No', S.touchedTests ? testKinds.join(' \\u00b7 ') : 'no test files in this diff', S.touchedTests ? (S.labels['test-skip-added'] || S.labels['assertion-removed'] ? 'risk' : 'warn') : 'ok'));
+    stats.appendChild(stat('Tests touched', S.touchedTests ? 'Yes' : 'No', S.touchedTests ? testKinds.join(' \\u00b7 ') : 'no test files in this diff', S.touchedTests ? (S.labels['test-skip-added'] || S.labels['tests-disabled'] || S.labels['assertion-removed'] ? 'risk' : 'warn') : 'ok'));
     var unattrFiles = {}; unattributed.forEach(function (a) { unattrFiles[a.hunk.file] = 1; });
     var uf = Object.keys(unattrFiles);
     stats.appendChild(stat('Unattributed', String(S.unattributedLines), S.unattributedLines === 0 ? 'every added line traces to an agent edit' : plural(S.unattributedLines, 'added line') + (uf.length ? ' \\u00b7 ' + uf.join(', ') : ' outside agent edits'), S.unattributedLines > 0 ? 'warn' : 'ok'));
@@ -8461,7 +8541,7 @@ program2.name("why-diff").version(VERSION, "-V, --version").description("Trace e
 `)), process.exitCode = 1);
   }
 });
-program2.command("guard").description("Claude Code Stop hook: block the agent from finishing if it skipped, weakened or deleted tests").option("--on <kinds>", "labels that block (comma list)", "test-skip-added,assertion-removed,secret-like,ci-changed").action(async (o) => {
+program2.command("guard").description("Claude Code Stop hook: block the agent from finishing if it skipped, weakened or deleted tests").option("--on <kinds>", "labels that block (comma list)", "test-skip-added,tests-disabled,assertion-removed,secret-like,ci-changed").action(async (o) => {
   let raw = await readStdin(), payload = {};
   try {
     payload = raw.trim() ? JSON.parse(raw) : {};

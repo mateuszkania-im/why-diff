@@ -90,9 +90,21 @@ index 1111111..2222222 100644
  export const two = 2;
 `;
     const hunks = parseUnifiedDiff(diff);
-    // A pure rename has no hunks (nothing to attribute); the changed rename has one.
+    // A pure rename becomes one zero-line hunk so the move stays visible; the changed rename has one too.
+    expect(hunks).toHaveLength(2);
+    expect(hunks[0]).toMatchObject({ id: 'h1', file: 'src/new-name.ts', oldFile: 'src/old-name.ts', status: 'renamed', lines: [] });
+    expect(hunks[1]).toMatchObject({ id: 'h2', file: 'lib/b.ts', oldFile: 'lib/a.ts', status: 'renamed' });
+    expect(hunks[1]?.lines.length).toBeGreaterThan(0);
+  });
+
+  it('emits a zero-line hunk for deleting an empty file', () => {
+    const diff = `diff --git a/test/empty.test.js b/test/empty.test.js
+deleted file mode 100644
+index e69de29..0000000
+`;
+    const hunks = parseUnifiedDiff(diff);
     expect(hunks).toHaveLength(1);
-    expect(hunks[0]).toMatchObject({ file: 'lib/b.ts', oldFile: 'lib/a.ts', status: 'renamed' });
+    expect(hunks[0]).toMatchObject({ file: 'test/empty.test.js', status: 'deleted', lines: [], newLines: 0 });
   });
 
   it('skips binary files and emits an empty hunk for mode-only changes', () => {

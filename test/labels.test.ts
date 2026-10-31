@@ -739,3 +739,69 @@ describe('combined', () => {
     expect(kinds(hunk('src/cart.ts', ['-  return a + b;', '+  return a + b + shipping;']))).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// tests-disabled
+// ---------------------------------------------------------------------------
+
+describe('tests-disabled', () => {
+  const flagged: Array<[string, string, string[]]> = [
+    ['vitest exclude entry', 'vitest.config.ts', [' export default defineConfig({', '   test: {', "+    exclude: ['src/**/*.test.ts'],", '   },']],
+    ['vitest exclude array item', 'vitest.config.ts', ['   test: {', "     exclude: [", "+      'test/flaky.test.ts',", '     ],']],
+    ['jest testPathIgnorePatterns', 'jest.config.js', ["+  testPathIgnorePatterns: ['/integration/'],"]],
+    ['jest modulePathIgnorePatterns', 'jest.config.js', ["+  modulePathIgnorePatterns: ['<rootDir>/spec/'],"]],
+    ['package.json jest ignore', 'package.json', [' "jest": {', '+  "testPathIgnorePatterns": ["/api/"]', ' }']],
+    ['test script passWithNoTests', 'package.json', [' "scripts": {', '-  "test": "vitest run",', '+  "test": "vitest run --passWithNoTests",', ' }']],
+    ['test script || true', 'package.json', [' "scripts": {', '-  "test": "vitest run",', '+  "test": "vitest run || true",', ' }']],
+    ['test script || exit 0', 'package.json', [' "scripts": {', '-  "test": "jest",', '+  "test": "jest || exit 0",', ' }']],
+    ['pytest -k not', 'pytest.ini', [' [pytest]', '-addopts = -q', '+addopts = -q -k "not slow"']],
+    ['pytest --deselect', 'pyproject.toml', ['[tool.pytest.ini_options]', '-addopts = "-q"', '+addopts = "-q --deselect tests/test_a.py::test_x"']],
+    ['pytest --ignore', 'setup.cfg', ['[tool:pytest]', '-addopts = -q', '+addopts = -q --ignore=tests/integration']],
+    ['CI continue-on-error on test step', '.github/workflows/ci.yml', [' steps:', '   - name: Run tests', '     run: npm test', '+    continue-on-error: true']],
+    ['CI || true after test', '.github/workflows/ci.yml', ['   - name: Run tests', '-    run: npm test', '+    run: npm test || true']],
+  ];
+
+  it.each(flagged)('flags %s', (_name, file, lines) => {
+    expect(find(hunk(file, lines), 'tests-disabled')?.severity).toBe('risk');
+  });
+
+  it.each([
+    ['exclude node_modules', 'vitest.config.ts', ["+    exclude: ['node_modules', 'dist'],"]],
+    ['exclude dist item', 'vitest.config.ts', ['     exclude: [', "+      '**/dist/**',", '     ],']],
+    ['ignore build', 'jest.config.js', ["+  testPathIgnorePatterns: ['/node_modules/', '/build/'],"]],
+    ['pytest ignore build', 'pytest.ini', ['+addopts = --ignore=build']],
+    ['CI continue-on-error on non-test step', '.github/workflows/ci.yml', ['   - name: Upload coverage', '     uses: codecov/codecov-action@v4', '+    continue-on-error: true']],
+    ['unrelated exclude in tsconfig-like file', 'webpack.config.js', ["+  exclude: ['src/legacy'],"]],
+    ['removing an exclude', 'vitest.config.ts', ["-    exclude: ['src/**/*.test.ts'],"]],
+    ['removing --passWithNoTests', 'package.json', [' "scripts": {', '-  "test": "vitest run --passWithNoTests",', '+  "test": "vitest run",', ' }']],
+    ['plain test script edit', 'package.json', [' "scripts": {', '-  "test": "vitest run",', '+  "test": "vitest run --coverage",', ' }']],
+    ['CI continue-on-error: false', '.github/workflows/ci.yml', ['   - name: Run tests', '     run: npm test', '+    continue-on-error: false']],
+  ])('does not flag %s', (_name, file, lines) => {
+    expect(kinds(hunk(file, lines))).not.toContain('tests-disabled');
+  });
+
+  function renameHunk(from: string, to: string, status: 'renamed' | 'deleted', lines: string[] = []): AttributedHunk {
+    const h = hunk(status === 'deleted' ? from : to, lines);
+    h.hunk = { ...h.hunk, status, ...(status === 'renamed' ? { oldFile: from } : {}) };
+    return h;
+  }
+
+  it('flags a pure rename of a test file to .disabled', () => {
+    const h = renameHunk('test/a.test.js', 'test/a.test.js.disabled', 'renamed');
+    expect(find(h, 'tests-disabled')?.severity).toBe('risk');
+  });
+
+  it('does not flag a rename between test names', () => {
+    expect(kinds(renameHunk('test/a.test.js', 'test/b.test.js', 'renamed'))).not.toContain('tests-disabled');
+    expect(kinds(renameHunk('src/a.ts', 'src/b.ts', 'renamed'))).not.toContain('tests-disabled');
+  });
+
+  it('flags deleting a test file next to test-modified', () => {
+    const h = renameHunk('test/a.test.js', '', 'deleted', ['-it("works", () => {})']);
+    expect(kinds(h)).toEqual(expect.arrayContaining(['tests-disabled', 'test-modified']));
+  });
+
+  it('does not flag deleting a non-test file', () => {
+    expect(kinds(renameHunk('src/a.ts', '', 'deleted', ['-x']))).not.toContain('tests-disabled');
+  });
+});

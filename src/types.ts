@@ -121,6 +121,7 @@ export type MatchStrength = 'exact' | 'partial' | 'file-only' | 'none';
 export type LabelKind =
   | 'test-modified'        // a test file changed
   | 'test-skip-added'      // .skip / .only / xit / @pytest.mark.skip / t.Skip added
+  | 'tests-disabled'       // tests turned off: config excludes, swallowed failures, renamed or deleted test files
   | 'assertion-removed'    // expect/assert lines removed or weakened
   | 'snapshot-updated'     // snapshot file changed
   | 'dependency-added'     // new dependency in a manifest
@@ -184,7 +185,7 @@ export interface Summary {
    * `test-modified`; line-level kinds count hunks.
    */
   labels: Partial<Record<LabelKind, number>>;
-  /** True if any test-modified / test-skip-added / assertion-removed */
+  /** True if any test-modified / test-skip-added / assertion-removed / tests-disabled */
   touchedTests: boolean;
   /** Sessions that contributed at least one edit or prompt to this diff */
   sessions: number;

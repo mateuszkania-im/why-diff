@@ -110,7 +110,7 @@ program
 program
   .command('guard')
   .description('Claude Code Stop hook: block the agent from finishing if it skipped, weakened or deleted tests')
-  .option('--on <kinds>', 'labels that block (comma list)', 'test-skip-added,assertion-removed,secret-like,ci-changed')
+  .option('--on <kinds>', 'labels that block (comma list)', 'test-skip-added,tests-disabled,assertion-removed,secret-like,ci-changed')
   .action(async (o: { on: string }) => {
     const raw = await readStdin();
     let payload: GuardPayload = {};

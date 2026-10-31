@@ -448,3 +448,21 @@ describe('renderReport', () => {
     expect(() => renderReport(sample, 'pdf' as never)).toThrow(/Unknown report format/);
   });
 });
+
+describe('zero-line hunks (pure rename of a test file)', () => {
+  it('summarises and renders a tests-disabled hunk with no lines', async () => {
+    const { summarize } = await import('../src/summary.js');
+    const ah: AttributedHunk = {
+      hunk: { id: 'h1', file: 'test/a.test.js.disabled', oldFile: 'test/a.test.js', status: 'renamed', oldStart: 0, oldLines: 0, newStart: 0, newLines: 0, header: 'rename test/a.test.js => test/a.test.js.disabled', lines: [] },
+      match: 'none', coverage: 0, editIds: [], edits: [],
+      labels: [{ kind: 'tests-disabled', severity: 'risk', detail: 'Renames test file a.test.js to a.test.js.disabled' }],
+    };
+    const r = clone(sample);
+    r.hunks = [ah];
+    r.summary = summarize([ah], []);
+    expect(r.summary).toMatchObject({ hunks: 1, files: 1, addedLines: 0, removedLines: 0, touchedTests: true, labels: { 'tests-disabled': 1 } });
+    expect(renderTerminal(r, { color: false, width: 100 })).toContain('a.test.js.disabled');
+    expect(renderMarkdown(r)).toContain('a.test.js.disabled');
+    expect(renderHtml(r)).toContain('tests-disabled');
+  });
+});

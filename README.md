@@ -78,7 +78,7 @@ why-diff v0.1.0 · generated 31 Oct 2026, 17:44 UTC
 ```
 
 - **Per-line provenance.** Each added line is owned by the edit that *introduced* it (not the one that merely had it as context). Hunks that mix several prompts, or your own manual edits, are split into segments.
-- **Deterministic risk labels** (no LLM): test files changed, `.skip/.only/xit/@pytest.mark.skip/t.Skip` added, assertions removed or weakened (`toBe` → `toBeDefined`, `.not` dropped, expected number changed), snapshots, new dependencies, lockfiles, CI and build config, `eslint-disable` / `@ts-ignore` / `noqa`, new `any`, secret-looking strings (masked), files no prompt mentioned.
+- **Deterministic risk labels** (no LLM): test files changed, `.skip/.only/xit/@pytest.mark.skip/t.Skip` added, tests disabled (config excludes, `|| true` on a test command, `continue-on-error` on a test step, test files renamed away or deleted), assertions removed or weakened (`toBe` → `toBeDefined`, `.not` dropped, expected number changed), snapshots, new dependencies, lockfiles, CI and build config, `eslint-disable` / `@ts-ignore` / `noqa`, new `any`, secret-looking strings (masked), files no prompt mentioned.
 - **Optional intent check** (`--classify`): a small model reads your prompts and each hunk (by reference id, it never rewrites code) and answers *requested / implied / unrequested / unclear* with a one-line reason. It uses your local `claude` CLI by default, so no API key is needed. Anthropic and any OpenAI-compatible endpoint (including Ollama) also work. Results are cached in `.why-diff/`.
 - **Four outputs:** terminal, Markdown for the PR description, JSON, and a single-file HTML review page (prompt timeline, filters, `j`/`k` navigation, `x` to mark reviewed, light/dark).
 

@@ -77,6 +77,8 @@ export function parseUnifiedDiff(diff: string): Hunk[] {
   const finishFile = (): void => {
     if (file && !file.binary && !file.emittedHunk && isModeOnlyChange(file)) {
       hunks.push(modeChangeHunk(file, hunks.length + 1));
+    } else if (file && !file.binary && !file.emittedHunk && isContentlessMove(file)) {
+      hunks.push(contentlessHunk(file, hunks.length + 1));
     }
     file = null;
     open = null;
@@ -223,6 +225,30 @@ function consumeBodyLine(open: OpenHunk, line: string): boolean {
 /** True when the diff header changed only the file mode (chmod) and carried no content. */
 function isModeOnlyChange(file: FileHeader): boolean {
   return file.oldMode !== undefined && file.newMode !== undefined && file.status === 'modified';
+}
+
+/**
+ * A pure rename (similarity 100%) or the deletion of an empty file carries no
+ * `@@` hunk, yet a reviewer must see it (moving a test aside disables it).
+ */
+function isContentlessMove(file: FileHeader): boolean {
+  return file.status === 'renamed' || file.status === 'deleted';
+}
+
+function contentlessHunk(file: FileHeader, n: number): Hunk {
+  const path = displayPath(file);
+  return {
+    id: `h${n}`,
+    file: path,
+    ...(file.oldPath && file.oldPath !== path ? { oldFile: file.oldPath } : {}),
+    status: file.status,
+    oldStart: 0,
+    oldLines: 0,
+    newStart: 0,
+    newLines: 0,
+    header: file.status === 'deleted' ? `deleted file ${path}` : `rename ${file.oldPath ?? '?'} => ${path}`,
+    lines: [],
+  };
 }
 
 function modeChangeHunk(file: FileHeader, n: number): Hunk {
