@@ -344,3 +344,47 @@ describe('redactSecrets: audit 2', () => {
     expectScalesSubQuadratically(() => redactSecrets(small, 'code'), () => redactSecrets(large, 'code'));
   });
 });
+
+describe('redactSecrets: audit 2 security review', () => {
+  it('masks a capitalised secret value on a config-shaped line even in code mode', () => {
+    for (const [t, leak] of [['password: Hunter', 'Hunter'], ['db:\n  password: Hunter\n', 'Hunter'], ['- password: Hunter', 'Hunter'], ['token: Summer', 'Summer']] as const) {
+      expect(redactSecrets(t, 'code'), t).not.toContain(leak);
+    }
+    expect(redactSecrets('password: Hunter', 'code')).toBe('password: ••••••••');
+    expect(redactSecrets('  password: Hunter;', 'code', { file: 'config/app.yml' })).not.toContain('Hunter');
+    expect(redactSecrets('password: Password;', 'code', { file: 'secrets.env' })).not.toContain('Password;');
+  });
+
+  it('still keeps type annotations in code', () => {
+    for (const t of ['interface Auth {\n  token: Token;\n  password: Password;\n  secret: Buffer;\n}', 'function f(token: Token, secret: Buffer) {}', 'type T = { token: AccessToken, secret: SecretBox | null }', 'const m = new Map<string, number>(); let x: { password: Password } = y;']) {
+      expect(redactSecrets(t, 'code', { file: 'src/auth.ts' }), t).toBe(t);
+    }
+  });
+
+  it.each(['strict', 'code'] as const)('keeps only known library calls after a secret name, masks other module-looking values (%s)', (mode) => {
+    for (const t of ['password=getpass.getpass', 'password = getpass.getpass()', 'token=keyring.get_password', 'secret = vault.read', 'password=secrets.token_hex', 'password=os.environ']) {
+      expect(redactSecrets(t, mode), t).toBe(t);
+    }
+    for (const [t, leak] of [['password=vault.Xk93jQ2v', 'Xk93jQ2v'], ['secret=keyring.aB3dE5fG7h', 'aB3dE5fG7h'], ['token=getpass.Q9zR2xW8', 'Q9zR2xW8'], ['password=secrets.hunterHunter', 'hunterHunter']] as const) {
+      expect(redactSecrets(t, mode), t).not.toContain(leak);
+    }
+  });
+
+  it('exempts only the scp-style remote shape from e-mail masking', () => {
+    expect(redactSecrets('git clone git@github.com:acme/repo.git')).toBe('git clone git@github.com:acme/repo.git');
+    expect(redactSecrets('git@gitlab.example.com:~/repo')).toBe('git@gitlab.example.com:~/repo');
+    expect(redactSecrets('scp deploy@web1.example.com:/var/www/x .')).toBe('scp deploy@web1.example.com:/var/www/x .');
+    expect(redactSecrets('jan.kowalski@firma.pl:8080')).not.toContain('kowalski');
+    expect(redactSecrets('user@host.com: hello')).not.toContain('user@');
+    expect(redactSecrets('write to user@host.com:x please')).not.toContain('user@');
+  });
+});
+
+describe('redactSecrets: review patterns performance', () => {
+  it.each(['a@b.co:', 'a@b.co.', 'git@h.io:a/b ', 'password: Hunter;', 'password=vault.Xk9 '])('200 KB of %j is fast and scales sub-quadratically in both modes', (unit) => {
+    expectFastAndLinear(unit);
+    const small = unit.repeat(Math.ceil(50_000 / unit.length));
+    const large = unit.repeat(Math.ceil(200_000 / unit.length));
+    expectScalesSubQuadratically(() => redactSecrets(small, 'code', { file: 'a.ts' }), () => redactSecrets(large, 'code', { file: 'a.ts' }));
+  });
+});

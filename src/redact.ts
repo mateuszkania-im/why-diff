@@ -51,8 +51,8 @@ function basicCredential(b64: string): boolean {
  * whether the value looks like a literal is decided in the callback.
  */
 const NAME_VALUE = /(?<![\w.])((["']?)([A-Za-z_][\w.-]{0,60})\2\s*(:=|=>|===?|!==?|=|:)[ \t]*)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'`,;]+))/g;
-/** An e-mail address; `user@host:path` (an scp-style git remote) is not one. */
-const EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b(?![\w.-]*:[\w~/.-])/g;
+/** An e-mail address; an scp-style remote (`git@host:owner/repo`, `user@host:~`, `user@host:/path`) is not one. */
+const EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b(?![\w.-]*:(?:[\w.-]+\/[\w.-]+|~|\/))/g;
 /** `mysql ... -pSECRET`: the password glued to -p (a bare `-p` prompts for it). */
 const MYSQL_PASSWORD = /\b(mysql(?:dump|admin|import|show|check)?|mariadb(?:-dump)?)\b([^\n|;&]{0,200}?\s)-p(?=[^\s-])([^\s'"`]+)/g;
 /** `curl -u user:password` / `--user user:password`. */
@@ -107,7 +107,7 @@ const ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/;
 const CALL = /^[A-Za-z_$][\w$.]*\(/;
 const MEMBER_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/;
 /** Roots of obvious code references (`process.env.X2`), excluded even when they contain a digit. */
-const CODE_ROOTS = /^(?:process|os|env|config|conf|settings|this|self|ctx|args|params|options|opts|vars|secrets|props|state|req|request|getpass|keyring|vault)\./i;
+const CODE_ROOTS = /^(?:process|os|env|config|conf|settings|this|self|ctx|args|params|options|opts|vars|secrets|props|state|req|request)\./i;
 const CODE_WORDS = new Set(['new', 'null', 'undefined', 'nil', 'none', 'true', 'false', 'this', 'self', 'await', 'async', 'function', 'return', 'require', 'string', 'number', 'boolean', 'any', 'unknown', 'str', 'int', 'bool', 'object', 'void', 'never', 'optional', 'required']);
 
 /** Rules precise enough to run on source code: token formats, JWTs, auth headers, URL credentials, private keys. */
@@ -138,14 +138,30 @@ export function redactKeys(text: string): string {
 export type RedactMode = 'strict' | 'code';
 
 /** Code roots that keep a dotted value in strict mode (`password = body.pass` names a field, not a secret). */
-const STRICT_CODE_ROOTS = /^(?:(?:process|config|env|os|self|this|settings|event|req|res|response|body|getpass|keyring|vault|secrets)\.|e\.target\.)/i;
+const STRICT_CODE_ROOTS = /^(?:(?:process|config|env|os|self|this|settings|event|req|res|response|body)\.|e\.target\.)/i;
+
+/**
+ * Library modules whose values are mostly calls that fetch a secret (`getpass.getpass`). Only the
+ * listed members are code; anything else after these roots (`vault.Xk93jQ2v`) is masked.
+ */
+const LIBRARY_ROOTS = /^(?:getpass|keyring|vault|secrets)\./i;
+const LIBRARY_CALLS = new Set([
+  'getpass.getpass', 'getpass.getuser',
+  'keyring.get_password', 'keyring.get_credential', 'keyring.set_password', 'keyring.delete_password',
+  'secrets.token_hex', 'secrets.token_urlsafe', 'secrets.token_bytes', 'secrets.choice', 'secrets.randbelow',
+  'vault.read', 'vault.write',
+]);
+
+/** Extensions whose `name: Value` lines are configuration, never type annotations. */
+const CONFIG_FILE = /(?:\.(?:ya?ml|env|ini|toml|properties|cfg|conf)$|(?:^|\/)\.env(?:\.[\w-]+)?$)/i;
 
 function strictDotted(segs: string[], v: string): boolean {
   return EXACT_SECRET_NAMES.has(segs[segs.length - 1] ?? '') && !/\d/.test(v) && !STRICT_CODE_ROOTS.test(v);
 }
 
 /** Mask secrets in free text (prompts, rationales; `code` mode for edit bodies). Idempotent; ordinary text is returned unchanged. */
-export function redactSecrets(text: string, mode: RedactMode = 'strict'): string {
+export function redactSecrets(text: string, mode: RedactMode = 'strict', opts: { file?: string } = {}): string {
+  const configFile = opts.file !== undefined && CONFIG_FILE.test(opts.file);
   if (!text) return text;
   let out = redactKeys(text);
   out = out.replace(NAME_VALUE, (m: string, head: string, q: string, name: string, op: string, dq?: string, sq?: string, bare?: string, offset?: number, str?: string) => {
@@ -162,13 +178,21 @@ export function redactSecrets(text: string, mode: RedactMode = 'strict'): string
     // Closing brackets after the value belong to the code around it (`f(password=getpass.getpass)`).
     if (ENV_REF.test(bare ?? '')) return m;
     const v = (bare ?? '').replace(/[)\]}]+$/, '');
-    if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase())) return m;
-    // Code: `token: Token;`, `secret: SecretBox | null`: a PascalCase value after `:` is a type.
-    if (mode === 'code' && op === ':' && /^[A-Z][a-z]+(?:[A-Z][a-z0-9]*)*$/.test(v)) return m;
+    const library = LIBRARY_ROOTS.test(v);
+    if (library) {
+      if (LIBRARY_CALLS.has(v.replace(/\($/, '').toLowerCase())) return m;
+    } else if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase())) return m;
+    // Code: `token: Token;`, `f(secret: Buffer)`, `{ password: Password }`: a PascalCase, digit-free
+    // value after `:` followed by code punctuation is a type. Never in a config file, and never at
+    // the end of a line (`password: Hunter` is a YAML value).
+    if (mode === 'code' && op === ':' && !configFile && /^[A-Z][a-z]+(?:[A-Z][a-z]*)*$/.test(v)) {
+      const after = `${(bare ?? '').slice(v.length)}${(str ?? '').slice((offset ?? 0) + m.length, (offset ?? 0) + m.length + 200)}`;
+      if (/^[ \t]*[;,)>|=}\]<[]/.test(after)) return m;
+    }
     const dotted = MEMBER_PATH.test(v) && (mode === 'strict'
       ? strictDotted(segs, v)
       : dottedSecret(segs, v, head, op, str ?? '', offset ?? 0, (offset ?? 0) + m.length));
-    if (MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dotted) return m;
+    if (!library && MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dotted) return m;
     if (!strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
     // `name: word` is usually prose; an all-letter (or dotted all-letter) value needs a config-like line.
     if (op === ':' && /^[A-Za-z]+(?:\.[A-Za-z]+)*$/.test(v) && !(mode === 'strict' && dotted)) {
@@ -201,7 +225,7 @@ const mapOpt = (v: string | null | undefined, f: (s: string) => string) => (type
 export function redactReport(report: Report, mode: 'secrets' | 'prompts'): Report {
   const strip = mode === 'prompts';
   const text = (s: string) => redactSecrets(s);
-  const code = (s: string) => redactSecrets(s, 'code');
+  const code = (s: string, file?: string) => redactSecrets(s, 'code', file !== undefined ? { file } : {});
   const promptText = (p: { index: number; text: string }) => (strip ? `[prompt ${p.index + 1} redacted]` : text(p.text));
   const rationale = <T extends { rationale?: string }>(e: T): T => {
     const { rationale: r, ...rest } = e;
@@ -213,8 +237,8 @@ export function redactReport(report: Report, mode: 'secrets' | 'prompts'): Repor
     const r = rationale(e);
     edits[id] = {
       ...r,
-      oldText: mapOpt(r.oldText, code) as string | null,
-      newText: mapOpt(r.newText, code) as string | null,
+      oldText: mapOpt(r.oldText, (t) => code(t, r.filePath)) as string | null,
+      newText: mapOpt(r.newText, (t) => code(t, r.filePath)) as string | null,
       ...(r.command !== undefined ? { command: code(r.command) } : {}),
     };
   }

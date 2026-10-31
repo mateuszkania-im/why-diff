@@ -3626,7 +3626,7 @@ function basicCredential(b64) {
   let text2 = buf.toString("latin1");
   return /^[\x20-\x7e]+$/.test(text2) && /^[^:]+:./.test(text2);
 }
-var NAME_VALUE = /(?<![\w.])((["']?)([A-Za-z_][\w.-]{0,60})\2\s*(:=|=>|===?|!==?|=|:)[ \t]*)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'`,;]+))/g, EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b(?![\w.-]*:[\w~/.-])/g, MYSQL_PASSWORD = /\b(mysql(?:dump|admin|import|show|check)?|mariadb(?:-dump)?)\b([^\n|;&]{0,200}?\s)-p(?=[^\s-])([^\s'"`]+)/g, CURL_USER = /\b(curl\b[^\n|;&]{0,300}?\s(?:-u|--user)(?:\s+|=)["']?[^\s:"'`]{1,100}:)([^\s"'`@]{1,200})/g, SECRET_WORDS = /* @__PURE__ */ new Set(["password", "passwd", "pwd", "passphrase", "secret", "token", "credential", "credentials", "apikey"]), SECRET_SUFFIXES = ["password", "passwd", "passphrase", "secret", "token", "apikey", "credential", "credentials"];
+var NAME_VALUE = /(?<![\w.])((["']?)([A-Za-z_][\w.-]{0,60})\2\s*(:=|=>|===?|!==?|=|:)[ \t]*)(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'`,;]+))/g, EMAIL = /(?<![\w.%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b(?![\w.-]*:(?:[\w.-]+\/[\w.-]+|~|\/))/g, MYSQL_PASSWORD = /\b(mysql(?:dump|admin|import|show|check)?|mariadb(?:-dump)?)\b([^\n|;&]{0,200}?\s)-p(?=[^\s-])([^\s'"`]+)/g, CURL_USER = /\b(curl\b[^\n|;&]{0,300}?\s(?:-u|--user)(?:\s+|=)["']?[^\s:"'`]{1,100}:)([^\s"'`@]{1,200})/g, SECRET_WORDS = /* @__PURE__ */ new Set(["password", "passwd", "pwd", "passphrase", "secret", "token", "credential", "credentials", "apikey"]), SECRET_SUFFIXES = ["password", "passwd", "passphrase", "secret", "token", "apikey", "credential", "credentials"];
 function nameSegments(name) {
   return name.split(/[._-]+/).flatMap((p) => p.split(/(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/)).map((x) => x.toLowerCase());
 }
@@ -3646,7 +3646,7 @@ function dottedSecret(segs, v, head, op, text2, at, end) {
 `) + 1);
   return /(?:^|[\s;({])(?:const|let|var|val|def)\s+$/.test(prefix) ? !1 : op === "=" ? !/\s/.test(head) : op === ":" ? /^\s*(?:-\s+)?$/.test(prefix) : !1;
 }
-var ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/, CALL = /^[A-Za-z_$][\w$.]*\(/, MEMBER_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/, CODE_ROOTS = /^(?:process|os|env|config|conf|settings|this|self|ctx|args|params|options|opts|vars|secrets|props|state|req|request|getpass|keyring|vault)\./i, CODE_WORDS = /* @__PURE__ */ new Set(["new", "null", "undefined", "nil", "none", "true", "false", "this", "self", "await", "async", "function", "return", "require", "string", "number", "boolean", "any", "unknown", "str", "int", "bool", "object", "void", "never", "optional", "required"]);
+var ENV_REF = /^(?:\$[A-Z_][A-Z0-9_]*|\$\{[^}]*\}|\{\{.*\}\}|•+)$/, CALL = /^[A-Za-z_$][\w$.]*\(/, MEMBER_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/, CODE_ROOTS = /^(?:process|os|env|config|conf|settings|this|self|ctx|args|params|options|opts|vars|secrets|props|state|req|request)\./i, CODE_WORDS = /* @__PURE__ */ new Set(["new", "null", "undefined", "nil", "none", "true", "false", "this", "self", "await", "async", "function", "return", "require", "string", "number", "boolean", "any", "unknown", "str", "int", "bool", "object", "void", "never", "optional", "required"]);
 function redactKeys(text2) {
   if (!text2) return text2;
   let out = text2.replace(PRIVATE_KEY_BLOCK, "-----PRIVATE KEY REDACTED-----");
@@ -3655,11 +3655,26 @@ function redactKeys(text2) {
     re.source.includes("PRIVATE KEY") || (out = out.replace(new RegExp(re.source, "g"), (m) => `${m.slice(0, m.startsWith("sk-ant-") ? 7 : 4)}${DOTS}`));
   return out;
 }
-var STRICT_CODE_ROOTS = /^(?:(?:process|config|env|os|self|this|settings|event|req|res|response|body|getpass|keyring|vault|secrets)\.|e\.target\.)/i;
+var STRICT_CODE_ROOTS = /^(?:(?:process|config|env|os|self|this|settings|event|req|res|response|body)\.|e\.target\.)/i, LIBRARY_ROOTS = /^(?:getpass|keyring|vault|secrets)\./i, LIBRARY_CALLS = /* @__PURE__ */ new Set([
+  "getpass.getpass",
+  "getpass.getuser",
+  "keyring.get_password",
+  "keyring.get_credential",
+  "keyring.set_password",
+  "keyring.delete_password",
+  "secrets.token_hex",
+  "secrets.token_urlsafe",
+  "secrets.token_bytes",
+  "secrets.choice",
+  "secrets.randbelow",
+  "vault.read",
+  "vault.write"
+]), CONFIG_FILE = /(?:\.(?:ya?ml|env|ini|toml|properties|cfg|conf)$|(?:^|\/)\.env(?:\.[\w-]+)?$)/i;
 function strictDotted(segs, v) {
   return EXACT_SECRET_NAMES.has(segs[segs.length - 1] ?? "") && !/\d/.test(v) && !STRICT_CODE_ROOTS.test(v);
 }
-function redactSecrets(text2, mode = "strict") {
+function redactSecrets(text2, mode = "strict", opts = {}) {
+  let configFile = opts.file !== void 0 && CONFIG_FILE.test(opts.file);
   if (!text2) return text2;
   let out = redactKeys(text2);
   return out = out.replace(NAME_VALUE, (m, head, q, name, op, dq, sq, bare, offset, str3) => {
@@ -3671,10 +3686,16 @@ function redactSecrets(text2, mode = "strict") {
       return `${head}${quote2}${DOTS}${quote2}`;
     }
     if (ENV_REF.test(bare ?? "")) return m;
-    let v = (bare ?? "").replace(/[)\]}]+$/, "");
-    if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase()) || mode === "code" && op === ":" && /^[A-Z][a-z]+(?:[A-Z][a-z0-9]*)*$/.test(v)) return m;
+    let v = (bare ?? "").replace(/[)\]}]+$/, ""), library = LIBRARY_ROOTS.test(v);
+    if (library) {
+      if (LIBRARY_CALLS.has(v.replace(/\($/, "").toLowerCase())) return m;
+    } else if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase())) return m;
+    if (mode === "code" && op === ":" && !configFile && /^[A-Z][a-z]+(?:[A-Z][a-z]*)*$/.test(v)) {
+      let after = `${(bare ?? "").slice(v.length)}${(str3 ?? "").slice((offset ?? 0) + m.length, (offset ?? 0) + m.length + 200)}`;
+      if (/^[ \t]*[;,)>|=}\]<[]/.test(after)) return m;
+    }
     let dotted = MEMBER_PATH.test(v) && (mode === "strict" ? strictDotted(segs, v) : dottedSecret(segs, v, head, op, str3 ?? "", offset ?? 0, (offset ?? 0) + m.length));
-    if (MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dotted || !strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
+    if (!library && MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dotted || !strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
     if (op === ":" && /^[A-Za-z]+(?:\.[A-Za-z]+)*$/.test(v) && !(mode === "strict" && dotted)) {
       let text3 = str3 ?? "", at = offset ?? 0, WINDOW = 200, back = text3.slice(Math.max(0, at - WINDOW), at), nl = back.lastIndexOf(`
 `), prefix = nl !== -1 ? back.slice(nl + 1) : at <= WINDOW || /^\s*$/.test(back) ? back : null, configLike = q !== "" || prefix !== null && /^[\s{,-]*$/.test(prefix), after = at + m.length, rest = text3.slice(after, after + WINDOW).split(`
@@ -3686,7 +3707,7 @@ function redactSecrets(text2, mode = "strict") {
 }
 var mapOpt = (v, f) => typeof v == "string" ? f(v) : v;
 function redactReport(report, mode) {
-  let strip = mode === "prompts", text2 = (s) => redactSecrets(s), code2 = (s) => redactSecrets(s, "code"), promptText = (p) => strip ? `[prompt ${p.index + 1} redacted]` : text2(p.text), rationale = (e) => {
+  let strip = mode === "prompts", text2 = (s) => redactSecrets(s), code2 = (s, file) => redactSecrets(s, "code", file !== void 0 ? { file } : {}), promptText = (p) => strip ? `[prompt ${p.index + 1} redacted]` : text2(p.text), rationale = (e) => {
     let { rationale: r, ...rest } = e;
     return strip || r === void 0 ? rest : { ...rest, rationale: text2(r) };
   }, edits = {};
@@ -3694,8 +3715,8 @@ function redactReport(report, mode) {
     let r = rationale(e);
     edits[id] = {
       ...r,
-      oldText: mapOpt(r.oldText, code2),
-      newText: mapOpt(r.newText, code2),
+      oldText: mapOpt(r.oldText, (t) => code2(t, r.filePath)),
+      newText: mapOpt(r.newText, (t) => code2(t, r.filePath)),
       ...r.command !== void 0 ? { command: code2(r.command) } : {}
     };
   }
@@ -6878,7 +6899,7 @@ var opencodeAdapter = {
 // src/config.ts
 import path9 from "node:path";
 import { readFile as readFile4 } from "node:fs/promises";
-var CONFIG_FILE = ".why-diff.json", LABEL_KINDS = [
+var CONFIG_FILE2 = ".why-diff.json", LABEL_KINDS = [
   "test-modified",
   "test-skip-added",
   "tests-disabled",
@@ -6943,8 +6964,8 @@ function validate(file, raw) {
   return out;
 }
 async function readRaw(root, rev) {
-  let text2 = await readOptional(root, CONFIG_FILE, rev);
-  if (text2 !== void 0) return { file: CONFIG_FILE, raw: parseJson(CONFIG_FILE, text2) };
+  let text2 = await readOptional(root, CONFIG_FILE2, rev);
+  if (text2 !== void 0) return { file: CONFIG_FILE2, raw: parseJson(CONFIG_FILE2, text2) };
   let pkgText = await readOptional(root, "package.json", rev);
   if (pkgText === void 0) return;
   let pkg;
@@ -6962,7 +6983,7 @@ async function loadConfig(repoRoot2, rev, onNote) {
   let wt = await readRaw(repoRoot2);
   if (!wt) return {};
   let config = validate(wt.file, wt.raw);
-  return rev !== void 0 && config.ignore !== void 0 && (delete config.ignore, onNote?.(`ignore in ${wt.file === CONFIG_FILE ? CONFIG_FILE : "package.json"} takes effect once it is committed to the base branch`)), config;
+  return rev !== void 0 && config.ignore !== void 0 && (delete config.ignore, onNote?.(`ignore in ${wt.file === CONFIG_FILE2 ? CONFIG_FILE2 : "package.json"} takes effect once it is committed to the base branch`)), config;
 }
 async function configChanged(repoRoot2, baseRev, headRev) {
   let side = async (rev) => {
@@ -7576,7 +7597,7 @@ async function buildReport(opts = {}) {
   log(`diffing ${rangeLabel}`);
   let allHunks = parseUnifiedDiff(await getDiff(root, target, { paths: opts.paths })), rulesFiles = /* @__PURE__ */ new Set();
   for (let h of allHunks)
-    (samePath(h.file, CONFIG_FILE) || h.oldFile !== void 0 && samePath(h.oldFile, CONFIG_FILE)) && rulesFiles.add(h.file);
+    (samePath(h.file, CONFIG_FILE2) || h.oldFile !== void 0 && samePath(h.oldFile, CONFIG_FILE2)) && rulesFiles.add(h.file);
   let pkgHunks = allHunks.filter((h) => samePath(h.file, "package.json"));
   if (pkgHunks.length && await configChanged(root, baseRev, headRevOf(target))) for (let h of pkgHunks) rulesFiles.add(h.file);
   let isIgnored = (h) => !!ignoredGlob(h.file) && (!h.oldFile || !!ignoredGlob(h.oldFile)) && !protectedGlob(h.file) && !(h.oldFile && protectedGlob(h.oldFile)) && !rulesFiles.has(h.file), hunks = opts.keepAgentIgnored ? allHunks : allHunks.filter((h) => !isIgnored(h)), ignoredHunks = allHunks.length - hunks.length, window = await commitTimes(root, target).catch(() => {
