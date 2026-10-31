@@ -2,6 +2,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { detectBashMutations } from '../src/adapters/bash-mutations.js';
+import { bestOf, expectScalesSubQuadratically } from './helpers/perf.js';
 
 const CWD = '/repo';
 const abs = (p: string): string => path.resolve(CWD, p);
@@ -93,5 +94,83 @@ describe('detectBashMutations', () => {
     expect(paths(`curl -s https://example.com/api | jq '.items[]'`)).toEqual([]);
     expect(paths(`node -e "console.log(process.cwd())"`)).toEqual([]);
     expect(paths(`echo "a > b" # redirect-looking text inside quotes`)).toEqual([]);
+  });
+});
+
+describe('detectBashMutations: audit 2 shell forms', () => {
+  const del = (...ps: string[]) => ps.map((p) => `delete:${abs(p)}`);
+
+  it('expands unquoted brace lists, but not quoted ones', () => {
+    expect(paths('rm test/{a,b}.test.js')).toEqual(del('test/a.test.js', 'test/b.test.js'));
+    expect(paths('mv f{,.bak}')).toEqual([`move:${abs('f')}`, `write:${abs('f.bak')}`]);
+    expect(paths('mv test/a.test.js{,.disabled}')).toEqual([`move:${abs('test/a.test.js')}`, `write:${abs('test/a.test.js.disabled')}`]);
+    expect(paths('rm "test/{a,b}.test.js"')).toEqual(del('test/{a,b}.test.js'));
+    expect(paths('rm src/{a..c}.js')).toEqual(del('src/{a..c}.js')); // sequences stay unresolved
+  });
+
+  it('expands variables assigned earlier on the same command line', () => {
+    expect(paths('D=test; rm $D/*.js')).toEqual(del('test/*.js'));
+    expect(paths('export D=test && rm "${D}/a.test.js"')).toEqual(del('test/a.test.js'));
+    expect(paths("D='my dir'; rm \"$D/a.js\"")).toEqual(del('my dir/a.js'));
+    expect(paths("rm '$D/a.js'")).toEqual(del('$D/a.js')); // single quotes: literal
+    expect(paths('rm $UNSET/a.js')).toEqual(del('$UNSET/a.js')); // unknown: unresolved
+    expect(paths('D=$(pwd)/test; rm $D/a.js')).toEqual(del('$D/a.js')); // computed value: unresolved
+  });
+
+  it('follows bash -c, sh -c and eval', () => {
+    expect(paths('bash -c "rm test/a.test.js"')).toEqual(del('test/a.test.js'));
+    expect(paths("sh -c 'cd test && rm a.test.js'")).toEqual(del('test/a.test.js'));
+    expect(paths('eval "rm test/a.test.js"')).toEqual(del('test/a.test.js'));
+    expect(paths('bash -lc "sed -i s/a/b/ test/a.test.js"')).toEqual([`edit:${abs('test/a.test.js')}`]);
+  });
+
+  it('credits find -delete and find -exec rm as recursive globs from -name', () => {
+    expect(paths('find test -name "*.test.js" -delete')).toEqual(del('test/*.test.js', 'test/**/*.test.js'));
+    expect(paths('find test -type f -name "*.spec.ts" -exec rm {} +')).toEqual(del('test/*.spec.ts', 'test/**/*.spec.ts'));
+    expect(paths("find test -name '*.js' -exec rm -f {} \;")).toEqual(del('test/*.js', 'test/**/*.js'));
+    expect(paths('find test -type f -delete')).toEqual(del('test'));
+    expect(paths("find . -name '*.snap' -exec sed -i 's/a/b/' {} +")).toEqual([`edit:${abs('*.snap')}`, `edit:${abs('**/*.snap')}`]);
+    expect(paths('find test -name "*.js"')).toEqual([]); // no action
+    expect(paths('find test -name "*.js" -print')).toEqual([]);
+  });
+
+  it('credits xargs rm only when a literal ls or find produces the list', () => {
+    expect(paths('ls test/*.test.js | xargs rm')).toEqual(del('test/*.test.js'));
+    expect(paths('find test -name "*.snap" | xargs rm -f')).toEqual(del('test/*.snap', 'test/**/*.snap'));
+    expect(paths('find test -name "*.snap" -print0 | xargs -0 rm')).toEqual(del('test/*.snap', 'test/**/*.snap'));
+    expect(paths('git ls-files test | xargs rm')).toEqual([]);
+    expect(paths('cat list.txt | xargs rm')).toEqual([]);
+    expect(paths('xargs rm < list.txt')).toEqual([]);
+  });
+
+  it('detects git clean, sudo -u, rimraf, shred -u, dd of=, install and busybox', () => {
+    expect(paths('git clean -fdx')).toEqual(del('.'));
+    expect(paths('git clean -fd test/tmp')).toEqual(del('test/tmp'));
+    expect(paths('git clean -n')).toEqual([]);
+    expect(paths('sudo -u me rm test/a.test.js')).toEqual(del('test/a.test.js'));
+    expect(paths('npx rimraf test')).toEqual(del('test'));
+    expect(paths('rimraf "dist/**"')).toEqual(del('dist/**'));
+    expect(paths('shred -u test/a.test.js')).toEqual(del('test/a.test.js'));
+    expect(paths('shred test/a.test.js')).toEqual([`write:${abs('test/a.test.js')}`]);
+    expect(paths('dd if=/dev/null of=test/a.test.js')).toEqual([`write:${abs('test/a.test.js')}`]);
+    expect(paths('install -m 644 x test/a.test.js')).toEqual([`copy:${abs('test/a.test.js')}`]);
+    expect(paths('install -d build/out')).toEqual([]);
+    expect(paths('busybox rm test/a.test.js')).toEqual(del('test/a.test.js'));
+  });
+
+  it('follows for loops over literal lists only', () => {
+    expect(paths('for f in test/a.test.js test/b.test.js; do rm "$f"; done')).toEqual(del('test/a.test.js', 'test/b.test.js'));
+    expect(paths('for f in test/*.test.js; do rm "$f"; done')).toEqual(del('test/*.test.js'));
+    expect(paths('for f in $(ls test); do rm "$f"; done')).toEqual(del('$f'));
+  });
+
+  it('stays bounded and linear on huge brace and variable inputs', () => {
+    const many = `rm ${'{a,b}'.repeat(40)}`;
+    expect(detectBashMutations(many, CWD).length).toBeLessThanOrEqual(256);
+    for (const unit of ['{a,', 'D=x; rm $D/{a,b} ', 'a{', '$D$D', 'for f in a b; do rm "$f"; done; ']) {
+      const cmd = (n: number) => () => detectBashMutations(unit.repeat(Math.ceil(n / unit.length)), CWD);
+      expect(bestOf(cmd(200_000), 3)).toBeLessThan(2000);
+      expectScalesSubQuadratically(cmd(50_000), cmd(200_000));
+    }
   });
 });

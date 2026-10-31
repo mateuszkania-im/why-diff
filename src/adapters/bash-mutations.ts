@@ -47,11 +47,15 @@ interface Redirect {
 
 interface SimpleCommand {
   words: string[];
+  /** Per word, per character: `u` unquoted, `d` inside double quotes, `q` literal (single-quoted or escaped), `c` command substitution. */
+  masks: string[];
   redirects: Redirect[];
+  /** The command whose output is piped into this one (`a | b`). */
+  pipeFrom?: SimpleCommand;
 }
 
 type Token =
-  | { kind: 'word'; text: string }
+  | { kind: 'word'; text: string; mask: string }
   | { kind: 'op'; text: string }
   | { kind: 'redirect'; redirect: Redirect };
 
@@ -59,12 +63,31 @@ const PATH_LIKE = /[\\/.]|^[A-Za-z0-9_-]+$/;
 
 /**
  * Detect files mutated by `command`, resolving relative paths against `cwd`.
+ *
+ * Followed: `cd`, brace lists (`rm test/{a,b}.js`, `mv f{,.bak}`), variables assigned a literal
+ * earlier on the same command line (`D=test; rm $D/*.js`, `export D=...`), `for v in <literal
+ * list>` loops, `bash -c`/`sh -c`/`eval` scripts, `find ... -delete`/`-exec`, `ls|find ... |
+ * xargs cmd`. Left unresolved (the path keeps its `$VAR`): variables from outside the command,
+ * computed values (`$(...)`, backticks), and scripts that compute paths.
  */
 export function detectBashMutations(command: string, cwd: string): BashMutation[] {
+  return detect(command, cwd, 0);
+}
+
+const MAX_DEPTH = 4;
+const MAX_EXPANSIONS = 256;
+const ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=/;
+const DECLARE = new Set(['export', 'declare', 'local', 'readonly', 'typeset']);
+/** Reserved words that may start a simple command in a compound one (`do rm "$f"`, `then ...`). */
+const KEYWORDS = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '!', '{', 'done', 'fi', '}', 'esac']);
+
+function detect(command: string, cwd: string, depth: number): BashMutation[] {
   const commands = splitSimpleCommands(tokenize(command));
   const out: BashMutation[] = [];
   let dir = cwd;
   const seen = new Set<string>();
+  const vars = new Map<string, string[]>();
+  const expanded = new Map<SimpleCommand, string[]>();
 
   const push = (p: string, op: MutationOp, content?: string): void => {
     if (!p || p === '-' || p === '/dev/null' || p.startsWith('/dev/')) return;
@@ -75,24 +98,14 @@ export function detectBashMutations(command: string, cwd: string): BashMutation[
     out.push(content === undefined ? { path: abs, op } : { path: abs, op, content });
   };
 
-  for (const cmd of commands) {
-    const words = stripWrappers(cmd.words);
+  const nested = (script: string): void => {
+    if (depth >= MAX_DEPTH) return;
+    for (const m of detect(script, dir, depth + 1)) push(m.path, m.op, m.content);
+  };
+
+  const run = (words: string[], redirects: Redirect[], pipeFrom?: SimpleCommand): void => {
     const prog = path.basename(words[0] ?? '');
     const args = words.slice(1);
-
-    if (prog === 'cd' || prog === 'pushd') {
-      const target = args.find((a) => !a.startsWith('-'));
-      if (target) dir = resolvePath(dir, target);
-      continue;
-    }
-
-    // Output redirections apply to any program.
-    for (const r of cmd.redirects) {
-      if ((r.op === '>' || r.op === '>>') && r.target) {
-        push(r.target, r.op === '>' ? 'write' : 'append', recoverContent(words, cmd.redirects));
-      }
-    }
-
     switch (prog) {
       case 'tee': {
         const append = args.some((a) => a === '-a' || a === '--append');
@@ -163,14 +176,252 @@ export function detectBashMutations(command: string, cwd: string): BashMutation[
       case 'composer':
         for (const f of packageManagerFiles(prog, args)) push(f, 'install');
         break;
+      case 'bash':
+      case 'sh':
+      case 'zsh':
+      case 'dash':
+      case 'ksh': {
+        const flag = args.findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
+        const script = flag === -1 ? undefined : args[flag + 1];
+        if (script !== undefined) nested(script);
+        break;
+      }
+      case 'eval':
+        nested(args.join(' '));
+        break;
+      case 'find': {
+        const f = findCommand(args);
+        if (f.del) for (const t of f.targets) push(t, 'delete');
+        if (f.exec) run(f.exec.flatMap((w) => (w === '{}' ? f.targets : [w])), []);
+        break;
+      }
+      case 'xargs': {
+        const x = xargsCommand(args, redirects);
+        const producer = pipeFrom ? stripWrappers(expanded.get(pipeFrom) ?? pipeFrom.words) : [];
+        const pprog = path.basename(producer[0] ?? '');
+        const listed = pprog === 'ls' ? positional(producer.slice(1), new Set(['-I', '--ignore', '-w', '--width'])) : pprog === 'find' ? findCommand(producer.slice(1)).targets : [];
+        if (!x || !listed.length || !x.cmd.length) break;
+        const cmdWords = x.replace !== undefined && x.cmd.includes(x.replace)
+          ? x.cmd.flatMap((w) => (w === x.replace ? listed : [w]))
+          : [...x.cmd, ...listed];
+        run(cmdWords, []);
+        break;
+      }
+      case 'rimraf':
+        for (const f of positional(args)) push(f, 'delete');
+        break;
+      case 'shred': {
+        const remove = args.some((a) => a === '--remove' || a.startsWith('--remove=') || /^-[A-Za-z]*u[A-Za-z]*$/.test(a));
+        for (const f of positional(args, new Set(['-n', '--iterations', '-s', '--size', '--random-source']))) push(f, remove ? 'delete' : 'write');
+        break;
+      }
+      case 'dd':
+        for (const a of args) if (a.startsWith('of=')) push(a.slice(3), 'write');
+        break;
+      case 'install': {
+        if (args.some((a) => a === '-d' || a === '--directory' || /^-[A-Za-z]*d[A-Za-z]*$/.test(a))) break;
+        const rest: string[] = [];
+        for (let i = 0; i < args.length; i++) {
+          const a = args[i] ?? '';
+          if (['-m', '--mode', '-o', '--owner', '-g', '--group', '-S', '--suffix'].includes(a)) i++;
+          else rest.push(a);
+        }
+        for (const { dest } of moveTargets(rest)) push(dest, 'copy');
+        break;
+      }
       default: {
         for (const f of formatterFiles(prog, args)) push(f, 'format');
-        for (const f of inlineScriptWrites(prog, args, cmd.redirects)) push(f, 'edit');
+        for (const f of inlineScriptWrites(prog, args, redirects)) push(f, 'edit');
+      }
+    }
+  };
+
+  for (const cmd of commands) {
+    let pairs: Array<[string, string]> = cmd.words.map((w, i) => [w, cmd.masks[i] ?? 'u'.repeat(w.length)]);
+    while (pairs[0] && KEYWORDS.has(pairs[0][0]) && !pairs[0][1].includes('q')) pairs = pairs.slice(1);
+    const head = pairs[0]?.[0];
+
+    // `for v in <list>`: a literal list binds v; anything computed leaves it unresolved.
+    if (head === 'for' && pairs[2]?.[0] === 'in' && pairs[1]) {
+      const name = pairs[1][0];
+      const list = pairs.slice(3);
+      if (list.length && !list.some(([w, m]) => computed(w, m))) vars.set(name, list.flatMap(([w, m]) => expandBraces(w, m)).map(([w]) => w));
+      else vars.delete(name);
+      continue;
+    }
+    // `D=test`, `export D=test`: remember literal values for later commands of this line.
+    const declStart = head !== undefined && DECLARE.has(head) ? 1 : 0;
+    const assigns = pairs.slice(declStart);
+    if (assigns.length && assigns.every(([w]) => ASSIGNMENT.test(w)) && !cmd.redirects.length) {
+      for (const [w, m] of assigns) {
+        const name = ASSIGNMENT.exec(w)?.[1] ?? '';
+        const eq = name.length + 1;
+        const value = w.slice(eq);
+        if (computed(value, m.slice(eq))) vars.delete(name);
+        else vars.set(name, [expandVars(value, m.slice(eq), vars)[0] ?? value]);
+      }
+      continue;
+    }
+
+    const words = expandWords(pairs, vars);
+    expanded.set(cmd, words);
+    const stripped = stripWrappers(words);
+    const prog = path.basename(stripped[0] ?? '');
+    const args = stripped.slice(1);
+
+    if (prog === 'cd' || prog === 'pushd') {
+      const target = args.find((a) => !a.startsWith('-'));
+      if (target) dir = resolvePath(dir, target);
+      continue;
+    }
+
+    // Output redirections apply to any program.
+    for (const r of cmd.redirects) {
+      if ((r.op === '>' || r.op === '>>') && r.target) {
+        push(r.target, r.op === '>' ? 'write' : 'append', recoverContent(stripped, cmd.redirects));
+      }
+    }
+    run(stripped, cmd.redirects, cmd.pipeFrom);
+  }
+  return out;
+}
+
+/** True when a word holds a command substitution or an unquoted/double-quoted `$` (its value is computed). */
+function computed(word: string, mask: string): boolean {
+  for (let i = 0; i < word.length; i++) {
+    const k = mask[i];
+    if (k === 'c' || (word[i] === '$' && k !== 'q') || (word[i] === '`' && k !== 'q')) return true;
+  }
+  return false;
+}
+
+/** Brace lists, then known variables, for each word; at most {@link MAX_EXPANSIONS} words in all. */
+function expandWords(pairs: Array<[string, string]>, vars: Map<string, string[]>): string[] {
+  const out: string[] = [];
+  for (const [w, m] of pairs) {
+    for (const [bw, bm] of expandBraces(w, m)) {
+      for (const v of expandVars(bw, bm, vars)) {
+        if (out.length >= MAX_EXPANSIONS) return out;
+        out.push(v);
       }
     }
   }
   return out;
 }
+
+/** `pre{a,b}post` -> `preapost`, `prebpost` (unquoted braces with a top-level comma; nested lists too). */
+function expandBraces(word: string, mask: string, budget = { n: MAX_EXPANSIONS }): Array<[string, string]> {
+  if (word.length > 4096 || !word.includes('{')) return [[word, mask]];
+  for (let open = word.indexOf('{'); open !== -1; open = word.indexOf('{', open + 1)) {
+    if (mask[open] !== 'u') continue;
+    let depth = 0;
+    const commas: number[] = [];
+    let close = -1;
+    for (let i = open + 1; i < word.length; i++) {
+      if (mask[i] !== 'u') continue;
+      const c = word[i];
+      if (c === '{') depth++;
+      else if (c === '}') {
+        if (depth === 0) {
+          close = i;
+          break;
+        }
+        depth--;
+      } else if (c === ',' && depth === 0) commas.push(i);
+    }
+    if (close === -1) return [[word, mask]];
+    if (!commas.length) continue;
+    const out: Array<[string, string]> = [];
+    const cuts = [open, ...commas, close];
+    for (let k = 0; k + 1 < cuts.length; k++) {
+      const a = (cuts[k] ?? 0) + 1;
+      const b = cuts[k + 1] ?? 0;
+      const text = word.slice(0, open) + word.slice(a, b) + word.slice(close + 1);
+      const m = mask.slice(0, open) + mask.slice(a, b) + mask.slice(close + 1);
+      for (const r of expandBraces(text, m, budget)) {
+        if (budget.n-- <= 0) return out.length ? out : [[word, mask]];
+        out.push(r);
+      }
+    }
+    return out;
+  }
+  return [[word, mask]];
+}
+
+/** Substitute `$NAME` / `${NAME}` (unquoted or double-quoted) for variables known on this line. */
+function expandVars(word: string, mask: string, vars: Map<string, string[]>): string[] {
+  if (!vars.size || !word.includes('$')) return [word];
+  let results = [''];
+  let i = 0;
+  while (i < word.length) {
+    const c = word[i];
+    if (c === '$' && mask[i] !== 'q' && mask[i] !== 'c') {
+      const m = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/.exec(word.slice(i, i + 130));
+      const name = m?.[1] ?? m?.[2];
+      const values = name !== undefined ? vars.get(name) : undefined;
+      if (m && values) {
+        const next: string[] = [];
+        for (const r of results) for (const v of values) if (next.length < MAX_EXPANSIONS) next.push(r + v);
+        results = next;
+        i += m[0].length;
+        continue;
+      }
+    }
+    results = results.map((r) => r + c);
+    i++;
+  }
+  return results;
+}
+
+/** `find [roots] expr`: the roots crossed with each `-name`, and the action (`-delete`, `-exec cmd {} ;|+`). */
+function findCommand(args: string[]): { targets: string[]; del: boolean; exec?: string[] } {
+  let i = 0;
+  while (i < args.length && /^-[HLP]$/.test(args[i] ?? '')) i++;
+  const roots: string[] = [];
+  while (i < args.length && !/^[-(!]/.test(args[i] ?? '')) roots.push(args[i++] ?? '');
+  const names: string[] = [];
+  let del = false;
+  let exec: string[] | undefined;
+  for (; i < args.length; i++) {
+    const a = args[i] ?? '';
+    if (a === '-name' || a === '-iname') names.push(args[++i] ?? '');
+    else if (a === '-delete') del = true;
+    else if (a === '-exec' || a === '-execdir') {
+      const cmd: string[] = [];
+      for (i++; i < args.length && args[i] !== ';' && args[i] !== '+'; i++) cmd.push(args[i] ?? '');
+      if (cmd.includes('{}')) exec = cmd;
+    }
+  }
+  const targets = (roots.length ? roots : ['.']).flatMap((r) => {
+    const root = r.replace(/\/+$/, '') || '/';
+    if (!names.length) return [root];
+    return names.filter(Boolean).flatMap((n) => (root === '.' ? [n, `**/${n}`] : [path.posix.join(root, n), path.posix.join(root, '**', n)]));
+  });
+  return { targets, del, ...(exec ? { exec } : {}) };
+}
+
+const XARGS_VALUE_OPTIONS = new Set(['-n', '-I', '-i', '-P', '-d', '-L', '-l', '-s', '-E', '-e', '--max-args', '--replace', '--max-procs', '--delimiter', '--max-lines', '--max-chars', '--eof']);
+
+/** The command xargs runs, and its `-I` placeholder; null when it reads a file (`-a f`, `< f`) instead of the pipe. */
+function xargsCommand(args: string[], redirects: Redirect[]): { cmd: string[]; replace?: string } | null {
+  if (redirects.some((r) => r.op === '<' || r.op === '<<' || r.op === '<<<')) return null;
+  let replace: string | undefined;
+  let i = 0;
+  for (; i < args.length; i++) {
+    const a = args[i] ?? '';
+    if (a === '-a' || a === '--arg-file' || a.startsWith('--arg-file=')) return null;
+    if (a === '--') {
+      i++;
+      break;
+    }
+    if (!a.startsWith('-')) break;
+    if (a === '-I' || a === '--replace') replace = args[i + 1];
+    else if (a.startsWith('-I') && a.length > 2) replace = a.slice(2);
+    if (XARGS_VALUE_OPTIONS.has(a)) i++;
+  }
+  return { cmd: args.slice(i), ...(replace !== undefined ? { replace } : {}) };
+}
+
 
 const SCRIPT_PATH = String.raw`(['"\`])([^'"\`\n$\{}]+?)\1`;
 const SCRIPT_WRITERS: Record<string, { flag: string; writes: RegExp[]; assign: (v: string) => RegExp }> = {
@@ -379,6 +630,14 @@ function gitMutations(args: string[]): Array<{ path: string; op: MutationOp }> {
         ...(recursive && GLOB_CHARS.test(p) ? [{ path: `${p.replace(/\/+$/, '')}/**`, op: 'delete' as const }] : []),
       ]);
     }
+    case 'clean': {
+      const opts = rest.slice(0, rest.includes('--') ? rest.indexOf('--') : rest.length).filter((a) => a.startsWith('-'));
+      const force = opts.some((a) => a === '--force' || /^-[A-Za-z]*f[A-Za-z]*$/.test(a));
+      const dry = opts.some((a) => a === '--dry-run' || /^-[A-Za-z]*n[A-Za-z]*$/.test(a));
+      if (!force || dry) return [];
+      const files = afterDashDash(rest) ?? positional(rest, new Set(['-e', '--exclude']));
+      return (files.length ? files : ['.']).map((p) => ({ path: p, op: 'delete' as const }));
+    }
     case 'mv': {
       const files = positional(rest);
       const dest = files[files.length - 1];
@@ -494,15 +753,29 @@ function recoverContent(words: string[], redirects: Redirect[]): string | undefi
   return undefined;
 }
 
+/** Options of wrapper programs that take a separate value (`sudo -u alice rm x`). */
+const WRAPPER_VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
+  sudo: new Set(['-u', '-g', '-U', '-C', '-h', '-p', '-r', '-t', '-D', '-T', '--user', '--group', '--other-user', '--close-from', '--host', '--prompt', '--role', '--type', '--chdir']),
+  doas: new Set(['-u', '-C']),
+  env: new Set(['-u', '-C', '-S', '--unset', '--chdir', '--split-string']),
+  nice: new Set(['-n', '--adjustment']),
+};
+
 /** Drop `sudo`, `env VAR=x`, `time`, `nohup`, `npx`, `pnpm exec`, `bun x` ... prefixes. */
 function stripWrappers(words: string[]): string[] {
   let w = words;
   for (;;) {
     while (w[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0])) w = w.slice(1);
     const first = path.basename(w[0] ?? '');
-    if (['sudo', 'env', 'time', 'nohup', 'command', 'exec', 'nice'].includes(first)) {
+    if (['sudo', 'env', 'time', 'nohup', 'command', 'exec', 'nice', 'doas'].includes(first)) {
+      const valued = WRAPPER_VALUE_OPTIONS[first];
       w = w.slice(1);
-      while (w[0] && w[0].startsWith('-')) w = w.slice(1);
+      while (w[0] && w[0].startsWith('-') && w[0] !== '--') w = valued?.has(w[0]) ? w.slice(2) : w.slice(1);
+      if (w[0] === '--') w = w.slice(1);
+      continue;
+    }
+    if (first === 'busybox' || first === 'toybox') {
+      w = w.slice(1);
       continue;
     }
     if (['npx', 'bunx'].includes(first)) {
@@ -540,8 +813,13 @@ export function tokenize(input: string): Token[] {
   const tokens: Token[] = [];
   const pendingHeredocs: Redirect[] = [];
   let buf = '';
+  let mask = '';
   let inWord = false;
   let i = 0;
+  const add = (text: string, kind: string): void => {
+    buf += text;
+    mask += kind.repeat(text.length);
+  };
 
   const flush = (): void => {
     if (!inWord) return;
@@ -550,9 +828,10 @@ export function tokenize(input: string): Token[] {
       last.redirect.target = buf;
       if (last.redirect.op === '<<') pendingHeredocs.push(last.redirect);
     } else {
-      tokens.push({ kind: 'word', text: buf });
+      tokens.push({ kind: 'word', text: buf, mask });
     }
     buf = '';
+    mask = '';
     inWord = false;
   };
 
@@ -582,14 +861,14 @@ export function tokenize(input: string): Token[] {
         i += 2;
         continue;
       }
-      buf += next;
+      add(next, 'q');
       inWord = true;
       i += 2;
       continue;
     }
     if (ch === "'") {
       const end = input.indexOf("'", i + 1);
-      buf += input.slice(i + 1, end === -1 ? input.length : end);
+      add(input.slice(i + 1, end === -1 ? input.length : end), 'q');
       inWord = true;
       i = end === -1 ? input.length : end + 1;
       continue;
@@ -598,10 +877,14 @@ export function tokenize(input: string): Token[] {
       i++;
       while (i < input.length && input[i] !== '"') {
         if (input[i] === '\\' && i + 1 < input.length) {
-          buf += input[i + 1];
+          add(input[i + 1] ?? '', 'q');
           i += 2;
+        } else if (input[i] === '$' && input[i + 1] === '(') {
+          const end = matchParen(input, i + 1);
+          add(input.slice(i, end + 1), 'c');
+          i = end + 1;
         } else {
-          buf += input[i];
+          add(input[i] ?? '', 'd');
           i++;
         }
       }
@@ -611,14 +894,14 @@ export function tokenize(input: string): Token[] {
     }
     if (ch === '$' && next === '(') {
       const end = matchParen(input, i + 1);
-      buf += input.slice(i, end + 1);
+      add(input.slice(i, end + 1), 'c');
       inWord = true;
       i = end + 1;
       continue;
     }
     if (ch === '`') {
       const end = input.indexOf('`', i + 1);
-      buf += input.slice(i, end === -1 ? input.length : end + 1);
+      add(input.slice(i, end === -1 ? input.length : end + 1), 'c');
       inWord = true;
       i = end === -1 ? input.length : end + 1;
       continue;
@@ -668,6 +951,7 @@ export function tokenize(input: string): Token[] {
       const fdPrefix = inWord && /^\d+$/.test(buf);
       if (fdPrefix) {
         buf = '';
+        mask = '';
         inWord = false;
       } else {
         flush();
@@ -710,7 +994,7 @@ export function tokenize(input: string): Token[] {
       }
       continue;
     }
-    buf += ch;
+    add(ch, 'u');
     inWord = true;
     i++;
   }
@@ -739,16 +1023,20 @@ function matchParen(s: string, open: number): number {
 /** Group tokens into simple commands at `&&`, `||`, `;`, `|`, `(`, `)`. */
 export function splitSimpleCommands(tokens: Token[]): SimpleCommand[] {
   const commands: SimpleCommand[] = [];
-  let current: SimpleCommand = { words: [], redirects: [] };
-  const close = (): void => {
-    if (current.words.length || current.redirects.length) commands.push(current);
-    current = { words: [], redirects: [] };
+  let current: SimpleCommand = { words: [], masks: [], redirects: [] };
+  const close = (pipe: boolean): void => {
+    const done = current.words.length || current.redirects.length ? current : undefined;
+    if (done) commands.push(done);
+    current = { words: [], masks: [], redirects: [] };
+    if (pipe && done) current.pipeFrom = done;
   };
   for (const t of tokens) {
-    if (t.kind === 'op') close();
-    else if (t.kind === 'word') current.words.push(t.text);
-    else current.redirects.push(t.redirect);
+    if (t.kind === 'op') close(t.text === '|');
+    else if (t.kind === 'word') {
+      current.words.push(t.text);
+      current.masks.push(t.mask);
+    } else current.redirects.push(t.redirect);
   }
-  close();
+  close(false);
   return commands;
 }

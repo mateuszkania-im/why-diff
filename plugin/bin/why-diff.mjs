@@ -4858,20 +4858,19 @@ import os from "node:os";
 import path4 from "node:path";
 var PATH_LIKE = /[\\/.]|^[A-Za-z0-9_-]+$/;
 function detectBashMutations(command, cwd) {
-  let commands = splitSimpleCommands(tokenize(command)), out = [], dir = cwd, seen = /* @__PURE__ */ new Set(), push = (p, op, content) => {
+  return detect(command, cwd, 0);
+}
+var MAX_DEPTH = 4, MAX_EXPANSIONS = 256, ASSIGNMENT2 = /^([A-Za-z_][A-Za-z0-9_]*)=/, DECLARE = /* @__PURE__ */ new Set(["export", "declare", "local", "readonly", "typeset"]), KEYWORDS = /* @__PURE__ */ new Set(["do", "then", "else", "elif", "if", "while", "until", "!", "{", "done", "fi", "}", "esac"]);
+function detect(command, cwd, depth) {
+  let commands = splitSimpleCommands(tokenize(command)), out = [], dir = cwd, seen = /* @__PURE__ */ new Set(), vars = /* @__PURE__ */ new Map(), expanded = /* @__PURE__ */ new Map(), push = (p, op, content) => {
     if (!p || p === "-" || p === "/dev/null" || p.startsWith("/dev/")) return;
     let abs = resolvePath(dir, p), key = `${op}\0${abs}`;
     seen.has(key) || (seen.add(key), out.push(content === void 0 ? { path: abs, op } : { path: abs, op, content }));
-  };
-  for (let cmd of commands) {
-    let words = stripWrappers(cmd.words), prog = path4.basename(words[0] ?? ""), args = words.slice(1);
-    if (prog === "cd" || prog === "pushd") {
-      let target = args.find((a) => !a.startsWith("-"));
-      target && (dir = resolvePath(dir, target));
-      continue;
-    }
-    for (let r of cmd.redirects)
-      (r.op === ">" || r.op === ">>") && r.target && push(r.target, r.op === ">" ? "write" : "append", recoverContent(words, cmd.redirects));
+  }, nested = (script) => {
+    if (!(depth >= MAX_DEPTH))
+      for (let m of detect(script, dir, depth + 1)) push(m.path, m.op, m.content);
+  }, run = (words, redirects, pipeFrom) => {
+    let prog = path4.basename(words[0] ?? ""), args = words.slice(1);
     switch (prog) {
       case "tee": {
         let append = args.some((a) => a === "-a" || a === "--append");
@@ -4935,13 +4934,191 @@ function detectBashMutations(command, cwd) {
       case "composer":
         for (let f of packageManagerFiles(prog, args)) push(f, "install");
         break;
+      case "bash":
+      case "sh":
+      case "zsh":
+      case "dash":
+      case "ksh": {
+        let flag = args.findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a)), script = flag === -1 ? void 0 : args[flag + 1];
+        script !== void 0 && nested(script);
+        break;
+      }
+      case "eval":
+        nested(args.join(" "));
+        break;
+      case "find": {
+        let f = findCommand(args);
+        if (f.del) for (let t of f.targets) push(t, "delete");
+        f.exec && run(f.exec.flatMap((w) => w === "{}" ? f.targets : [w]), []);
+        break;
+      }
+      case "xargs": {
+        let x = xargsCommand(args, redirects), producer = pipeFrom ? stripWrappers(expanded.get(pipeFrom) ?? pipeFrom.words) : [], pprog = path4.basename(producer[0] ?? ""), listed = pprog === "ls" ? positional(producer.slice(1), /* @__PURE__ */ new Set(["-I", "--ignore", "-w", "--width"])) : pprog === "find" ? findCommand(producer.slice(1)).targets : [];
+        if (!x || !listed.length || !x.cmd.length) break;
+        let cmdWords = x.replace !== void 0 && x.cmd.includes(x.replace) ? x.cmd.flatMap((w) => w === x.replace ? listed : [w]) : [...x.cmd, ...listed];
+        run(cmdWords, []);
+        break;
+      }
+      case "rimraf":
+        for (let f of positional(args)) push(f, "delete");
+        break;
+      case "shred": {
+        let remove = args.some((a) => a === "--remove" || a.startsWith("--remove=") || /^-[A-Za-z]*u[A-Za-z]*$/.test(a));
+        for (let f of positional(args, /* @__PURE__ */ new Set(["-n", "--iterations", "-s", "--size", "--random-source"]))) push(f, remove ? "delete" : "write");
+        break;
+      }
+      case "dd":
+        for (let a of args) a.startsWith("of=") && push(a.slice(3), "write");
+        break;
+      case "install": {
+        if (args.some((a) => a === "-d" || a === "--directory" || /^-[A-Za-z]*d[A-Za-z]*$/.test(a))) break;
+        let rest = [];
+        for (let i = 0; i < args.length; i++) {
+          let a = args[i] ?? "";
+          ["-m", "--mode", "-o", "--owner", "-g", "--group", "-S", "--suffix"].includes(a) ? i++ : rest.push(a);
+        }
+        for (let { dest } of moveTargets(rest)) push(dest, "copy");
+        break;
+      }
       default: {
         for (let f of formatterFiles(prog, args)) push(f, "format");
-        for (let f of inlineScriptWrites(prog, args, cmd.redirects)) push(f, "edit");
+        for (let f of inlineScriptWrites(prog, args, redirects)) push(f, "edit");
       }
     }
+  };
+  for (let cmd of commands) {
+    let pairs = cmd.words.map((w, i) => [w, cmd.masks[i] ?? "u".repeat(w.length)]);
+    for (; pairs[0] && KEYWORDS.has(pairs[0][0]) && !pairs[0][1].includes("q"); ) pairs = pairs.slice(1);
+    let head = pairs[0]?.[0];
+    if (head === "for" && pairs[2]?.[0] === "in" && pairs[1]) {
+      let name = pairs[1][0], list = pairs.slice(3);
+      list.length && !list.some(([w, m]) => computed(w, m)) ? vars.set(name, list.flatMap(([w, m]) => expandBraces(w, m)).map(([w]) => w)) : vars.delete(name);
+      continue;
+    }
+    let declStart = head !== void 0 && DECLARE.has(head) ? 1 : 0, assigns = pairs.slice(declStart);
+    if (assigns.length && assigns.every(([w]) => ASSIGNMENT2.test(w)) && !cmd.redirects.length) {
+      for (let [w, m] of assigns) {
+        let name = ASSIGNMENT2.exec(w)?.[1] ?? "", eq = name.length + 1, value = w.slice(eq);
+        computed(value, m.slice(eq)) ? vars.delete(name) : vars.set(name, [expandVars(value, m.slice(eq), vars)[0] ?? value]);
+      }
+      continue;
+    }
+    let words = expandWords(pairs, vars);
+    expanded.set(cmd, words);
+    let stripped = stripWrappers(words), prog = path4.basename(stripped[0] ?? ""), args = stripped.slice(1);
+    if (prog === "cd" || prog === "pushd") {
+      let target = args.find((a) => !a.startsWith("-"));
+      target && (dir = resolvePath(dir, target));
+      continue;
+    }
+    for (let r of cmd.redirects)
+      (r.op === ">" || r.op === ">>") && r.target && push(r.target, r.op === ">" ? "write" : "append", recoverContent(stripped, cmd.redirects));
+    run(stripped, cmd.redirects, cmd.pipeFrom);
   }
   return out;
+}
+function computed(word, mask2) {
+  for (let i = 0; i < word.length; i++) {
+    let k = mask2[i];
+    if (k === "c" || word[i] === "$" && k !== "q" || word[i] === "`" && k !== "q") return !0;
+  }
+  return !1;
+}
+function expandWords(pairs, vars) {
+  let out = [];
+  for (let [w, m] of pairs)
+    for (let [bw, bm] of expandBraces(w, m))
+      for (let v of expandVars(bw, bm, vars)) {
+        if (out.length >= MAX_EXPANSIONS) return out;
+        out.push(v);
+      }
+  return out;
+}
+function expandBraces(word, mask2, budget = { n: MAX_EXPANSIONS }) {
+  if (word.length > 4096 || !word.includes("{")) return [[word, mask2]];
+  for (let open = word.indexOf("{"); open !== -1; open = word.indexOf("{", open + 1)) {
+    if (mask2[open] !== "u") continue;
+    let depth = 0, commas = [], close = -1;
+    for (let i = open + 1; i < word.length; i++) {
+      if (mask2[i] !== "u") continue;
+      let c = word[i];
+      if (c === "{") depth++;
+      else if (c === "}") {
+        if (depth === 0) {
+          close = i;
+          break;
+        }
+        depth--;
+      } else c === "," && depth === 0 && commas.push(i);
+    }
+    if (close === -1) return [[word, mask2]];
+    if (!commas.length) continue;
+    let out = [], cuts = [open, ...commas, close];
+    for (let k = 0; k + 1 < cuts.length; k++) {
+      let a = (cuts[k] ?? 0) + 1, b = cuts[k + 1] ?? 0, text2 = word.slice(0, open) + word.slice(a, b) + word.slice(close + 1), m = mask2.slice(0, open) + mask2.slice(a, b) + mask2.slice(close + 1);
+      for (let r of expandBraces(text2, m, budget)) {
+        if (budget.n-- <= 0) return out.length ? out : [[word, mask2]];
+        out.push(r);
+      }
+    }
+    return out;
+  }
+  return [[word, mask2]];
+}
+function expandVars(word, mask2, vars) {
+  if (!vars.size || !word.includes("$")) return [word];
+  let results = [""], i = 0;
+  for (; i < word.length; ) {
+    let c = word[i];
+    if (c === "$" && mask2[i] !== "q" && mask2[i] !== "c") {
+      let m = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/.exec(word.slice(i, i + 130)), name = m?.[1] ?? m?.[2], values = name !== void 0 ? vars.get(name) : void 0;
+      if (m && values) {
+        let next = [];
+        for (let r of results) for (let v of values) next.length < MAX_EXPANSIONS && next.push(r + v);
+        results = next, i += m[0].length;
+        continue;
+      }
+    }
+    results = results.map((r) => r + c), i++;
+  }
+  return results;
+}
+function findCommand(args) {
+  let i = 0;
+  for (; i < args.length && /^-[HLP]$/.test(args[i] ?? ""); ) i++;
+  let roots = [];
+  for (; i < args.length && !/^[-(!]/.test(args[i] ?? ""); ) roots.push(args[i++] ?? "");
+  let names = [], del = !1, exec;
+  for (; i < args.length; i++) {
+    let a = args[i] ?? "";
+    if (a === "-name" || a === "-iname") names.push(args[++i] ?? "");
+    else if (a === "-delete") del = !0;
+    else if (a === "-exec" || a === "-execdir") {
+      let cmd = [];
+      for (i++; i < args.length && args[i] !== ";" && args[i] !== "+"; i++) cmd.push(args[i] ?? "");
+      cmd.includes("{}") && (exec = cmd);
+    }
+  }
+  return { targets: (roots.length ? roots : ["."]).flatMap((r) => {
+    let root = r.replace(/\/+$/, "") || "/";
+    return names.length ? names.filter(Boolean).flatMap((n) => root === "." ? [n, `**/${n}`] : [path4.posix.join(root, n), path4.posix.join(root, "**", n)]) : [root];
+  }), del, ...exec ? { exec } : {} };
+}
+var XARGS_VALUE_OPTIONS = /* @__PURE__ */ new Set(["-n", "-I", "-i", "-P", "-d", "-L", "-l", "-s", "-E", "-e", "--max-args", "--replace", "--max-procs", "--delimiter", "--max-lines", "--max-chars", "--eof"]);
+function xargsCommand(args, redirects) {
+  if (redirects.some((r) => r.op === "<" || r.op === "<<" || r.op === "<<<")) return null;
+  let replace, i = 0;
+  for (; i < args.length; i++) {
+    let a = args[i] ?? "";
+    if (a === "-a" || a === "--arg-file" || a.startsWith("--arg-file=")) return null;
+    if (a === "--") {
+      i++;
+      break;
+    }
+    if (!a.startsWith("-")) break;
+    a === "-I" || a === "--replace" ? replace = args[i + 1] : a.startsWith("-I") && a.length > 2 && (replace = a.slice(2)), XARGS_VALUE_OPTIONS.has(a) && i++;
+  }
+  return { cmd: args.slice(i), ...replace !== void 0 ? { replace } : {} };
 }
 var SCRIPT_PATH = String.raw`(['"\`])([^'"\`\n$\{}]+?)\1`, SCRIPT_WRITERS = {
   python: {
@@ -5096,6 +5273,12 @@ function gitMutations(args) {
         ...recursive && GLOB_CHARS.test(p) ? [{ path: `${p.replace(/\/+$/, "")}/**`, op: "delete" }] : []
       ]);
     }
+    case "clean": {
+      let opts = rest.slice(0, rest.includes("--") ? rest.indexOf("--") : rest.length).filter((a) => a.startsWith("-")), force = opts.some((a) => a === "--force" || /^-[A-Za-z]*f[A-Za-z]*$/.test(a)), dry = opts.some((a) => a === "--dry-run" || /^-[A-Za-z]*n[A-Za-z]*$/.test(a));
+      if (!force || dry) return [];
+      let files = afterDashDash(rest) ?? positional(rest, /* @__PURE__ */ new Set(["-e", "--exclude"]));
+      return (files.length ? files : ["."]).map((p) => ({ path: p, op: "delete" }));
+    }
     case "mv": {
       let files = positional(rest), dest = files[files.length - 1];
       return files.length < 2 || !dest ? [] : [
@@ -5181,13 +5364,25 @@ function recoverContent(words, redirects) {
 `).replace(/\\t/g, "	");
   }
 }
+var WRAPPER_VALUE_OPTIONS = {
+  sudo: /* @__PURE__ */ new Set(["-u", "-g", "-U", "-C", "-h", "-p", "-r", "-t", "-D", "-T", "--user", "--group", "--other-user", "--close-from", "--host", "--prompt", "--role", "--type", "--chdir"]),
+  doas: /* @__PURE__ */ new Set(["-u", "-C"]),
+  env: /* @__PURE__ */ new Set(["-u", "-C", "-S", "--unset", "--chdir", "--split-string"]),
+  nice: /* @__PURE__ */ new Set(["-n", "--adjustment"])
+};
 function stripWrappers(words) {
   let w = words;
   for (; ; ) {
     for (; w[0] && /^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0]); ) w = w.slice(1);
     let first = path4.basename(w[0] ?? "");
-    if (["sudo", "env", "time", "nohup", "command", "exec", "nice"].includes(first)) {
-      for (w = w.slice(1); w[0] && w[0].startsWith("-"); ) w = w.slice(1);
+    if (["sudo", "env", "time", "nohup", "command", "exec", "nice", "doas"].includes(first)) {
+      let valued = WRAPPER_VALUE_OPTIONS[first];
+      for (w = w.slice(1); w[0] && w[0].startsWith("-") && w[0] !== "--"; ) w = valued?.has(w[0]) ? w.slice(2) : w.slice(1);
+      w[0] === "--" && (w = w.slice(1));
+      continue;
+    }
+    if (first === "busybox" || first === "toybox") {
+      w = w.slice(1);
       continue;
     }
     if (["npx", "bunx"].includes(first)) {
@@ -5207,10 +5402,12 @@ function resolvePath(dir, p) {
   return (expanded === "~" || expanded.startsWith("~/")) && (expanded = os.homedir() + expanded.slice(1)), path4.resolve(dir, expanded);
 }
 function tokenize(input) {
-  let tokens = [], pendingHeredocs = [], buf = "", inWord = !1, i = 0, flush = () => {
+  let tokens = [], pendingHeredocs = [], buf = "", mask2 = "", inWord = !1, i = 0, add = (text2, kind) => {
+    buf += text2, mask2 += kind.repeat(text2.length);
+  }, flush = () => {
     if (!inWord) return;
     let last = tokens[tokens.length - 1];
-    last?.kind === "redirect" && last.redirect.target === void 0 && last.redirect.op !== ">&" && last.redirect.op !== "<&" ? (last.redirect.target = buf, last.redirect.op === "<<" && pendingHeredocs.push(last.redirect)) : tokens.push({ kind: "word", text: buf }), buf = "", inWord = !1;
+    last?.kind === "redirect" && last.redirect.target === void 0 && last.redirect.op !== ">&" && last.redirect.op !== "<&" ? (last.redirect.target = buf, last.redirect.op === "<<" && pendingHeredocs.push(last.redirect)) : tokens.push({ kind: "word", text: buf, mask: mask2 }), buf = "", mask2 = "", inWord = !1;
   }, readHeredocBodies = () => {
     for (let h of pendingHeredocs) {
       let delimiter2 = (h.target ?? "").replace(/^['"]|['"]$/g, ""), lines = [];
@@ -5234,28 +5431,34 @@ function tokenize(input) {
         i += 2;
         continue;
       }
-      buf += next, inWord = !0, i += 2;
+      add(next, "q"), inWord = !0, i += 2;
       continue;
     }
     if (ch === "'") {
       let end = input.indexOf("'", i + 1);
-      buf += input.slice(i + 1, end === -1 ? input.length : end), inWord = !0, i = end === -1 ? input.length : end + 1;
+      add(input.slice(i + 1, end === -1 ? input.length : end), "q"), inWord = !0, i = end === -1 ? input.length : end + 1;
       continue;
     }
     if (ch === '"') {
       for (i++; i < input.length && input[i] !== '"'; )
-        input[i] === "\\" && i + 1 < input.length ? (buf += input[i + 1], i += 2) : (buf += input[i], i++);
+        if (input[i] === "\\" && i + 1 < input.length)
+          add(input[i + 1] ?? "", "q"), i += 2;
+        else if (input[i] === "$" && input[i + 1] === "(") {
+          let end = matchParen(input, i + 1);
+          add(input.slice(i, end + 1), "c"), i = end + 1;
+        } else
+          add(input[i] ?? "", "d"), i++;
       i++, inWord = !0;
       continue;
     }
     if (ch === "$" && next === "(") {
       let end = matchParen(input, i + 1);
-      buf += input.slice(i, end + 1), inWord = !0, i = end + 1;
+      add(input.slice(i, end + 1), "c"), inWord = !0, i = end + 1;
       continue;
     }
     if (ch === "`") {
       let end = input.indexOf("`", i + 1);
-      buf += input.slice(i, end === -1 ? input.length : end + 1), inWord = !0, i = end === -1 ? input.length : end + 1;
+      add(input.slice(i, end === -1 ? input.length : end + 1), "c"), inWord = !0, i = end === -1 ? input.length : end + 1;
       continue;
     }
     if (ch === "#" && !inWord) {
@@ -5290,7 +5493,7 @@ function tokenize(input) {
       continue;
     }
     if (ch === ">" || ch === "<" || ch === "&" && next === ">") {
-      inWord && /^\d+$/.test(buf) ? (buf = "", inWord = !1) : flush();
+      inWord && /^\d+$/.test(buf) ? (buf = "", mask2 = "", inWord = !1) : flush();
       let op;
       ch === "&" ? (op = input[i + 2] === ">" ? ">>" : ">", i += input[i + 2] === ">" ? 3 : 2) : ch === ">" ? next === ">" ? (op = ">>", i += 2) : next === "&" ? (op = ">&", i += 2) : (op = ">", i += next === "|" ? 2 : 1) : next === "<" ? input[i + 2] === "<" ? (op = "<<<", i += 3) : (op = "<<", i += input[i + 2] === "-" ? 3 : 2) : next === "&" ? (op = "<&", i += 2) : (op = "<", i += 1);
       let redirect = { op };
@@ -5298,7 +5501,7 @@ function tokenize(input) {
         for (; i < input.length && /[\d-]/.test(input[i] ?? ""); ) i++;
       continue;
     }
-    buf += ch, inWord = !0, i++;
+    add(ch, "u"), inWord = !0, i++;
   }
   return flush(), pendingHeredocs.length && readHeredocBodies(), tokens;
 }
@@ -5318,12 +5521,13 @@ function matchParen(s, open) {
   return s.length - 1;
 }
 function splitSimpleCommands(tokens) {
-  let commands = [], current = { words: [], redirects: [] }, close = () => {
-    (current.words.length || current.redirects.length) && commands.push(current), current = { words: [], redirects: [] };
+  let commands = [], current = { words: [], masks: [], redirects: [] }, close = (pipe) => {
+    let done = current.words.length || current.redirects.length ? current : void 0;
+    done && commands.push(done), current = { words: [], masks: [], redirects: [] }, pipe && done && (current.pipeFrom = done);
   };
   for (let t of tokens)
-    t.kind === "op" ? close() : t.kind === "word" ? current.words.push(t.text) : current.redirects.push(t.redirect);
-  return close(), commands;
+    t.kind === "op" ? close(t.text === "|") : t.kind === "word" ? (current.words.push(t.text), current.masks.push(t.mask)) : current.redirects.push(t.redirect);
+  return close(!1), commands;
 }
 
 // src/adapters/claude.ts
