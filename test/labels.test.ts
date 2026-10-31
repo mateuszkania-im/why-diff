@@ -710,6 +710,40 @@ describe('out-of-scope', () => {
     expect(out[0]?.labels).toEqual([]);
   });
 
+  it('does not flag files the agent created in the same prompt, or siblings of them', () => {
+    const hs: AttributedHunk[] = [];
+    const prompts: Prompt[] = [];
+    for (let i = 0; i < 20; i++) {
+      const id = `s1:${i}`;
+      prompts.push({ ...prompt(`build module m${i}`), id, index: i });
+      for (const f of ['index', 'util', 'types']) {
+        const h = hunk(`src/m${i}/${f}.ts`, ['+x']);
+        h.hunk.status = 'added';
+        h.edits = h.edits.map((e) => ({ ...e, kind: 'write', tool: 'Write', promptId: id }));
+        h.prompt = prompts[i];
+        hs.push(h);
+      }
+    }
+    const out = labelHunks(hs, { repoRoot: '/repo', prompts });
+    expect(out.flatMap((h) => h.labels).filter((l) => l.kind === 'out-of-scope')).toEqual([]);
+  });
+
+  it('does not flag an edit next to a file the same prompt mentions', () => {
+    const a = hunk('src/cart.js', ['+x']);
+    const b = hunk('src/checkout.js', ['+y']);
+    const far = hunk('lib/other/x.ts', ['+z']);
+    const out = labelHunks([a, b, far, hunk('docs/guide/readme.md', ['+q'])], { repoRoot: '/repo', prompts: [prompt('fix src/cart.js')] });
+    expect(out[1]?.labels.map((l) => l.kind)).not.toContain('out-of-scope');
+  });
+
+  it('still flags an unrelated infra file when the prompt is about src/cart.js', () => {
+    const out = labelHunks([hunk('src/cart.js', ['+x']), hunk('src/totals.js', ['+x']), hunk('infra/terraform/main.tf', ['+y'])], {
+      repoRoot: '/repo',
+      prompts: [prompt('fix the cart in src/cart.js')],
+    });
+    expect(out[2]?.labels.map((l) => l.kind)).toContain('out-of-scope');
+  });
+
   it('treats the repo root as unrelated to subdirectories', () => {
     const l = run(hunk('Makefile', ['+x']), 'Fix the lexer');
     expect(l?.detail).toContain('repo root');

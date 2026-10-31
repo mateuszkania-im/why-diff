@@ -3693,7 +3693,7 @@ function computeLabels(h, path12, scope) {
   anys.length > 0 && push("type-any-added", "warn", `Adds ${listOf(anys)}`);
   let secrets = detectSecrets(path12, lines);
   if (secrets.length > 0 && push("secret-like", "risk", secrets.join("; ")), agent) {
-    let why = outOfScopeReason(path12, scope);
+    let why = outOfScopeReason(path12, scope, hunkPromptIds(h));
     why && push("out-of-scope", "warn", why);
   }
   return out;
@@ -4500,14 +4500,40 @@ function detectSecrets(path12, lines) {
 function mask(secret) {
   return `${secret.slice(0, 4)}\u2026, ${secret.length} chars`;
 }
+function hunkPromptIds(h) {
+  return uniq([...h.prompt ? [h.prompt.id] : [], ...h.edits.filter((e) => e.failed !== !0).map((e) => e.promptId)]);
+}
 function buildScopeIndex(hunks, ctx) {
+  let agent = hunks.filter(isAgentAttributed), createdFiles = /* @__PURE__ */ new Set(), promptDirs = /* @__PURE__ */ new Map(), dirsOf = (id) => {
+    let d = promptDirs.get(id);
+    return d || promptDirs.set(id, d = /* @__PURE__ */ new Set()), d;
+  };
+  for (let h of agent) {
+    let path12 = toRepoPath(h.hunk.file, ctx.repoRoot), created = h.hunk.status === "added" || h.edits.some((e) => e.kind === "write" && e.failed !== !0);
+    created && createdFiles.add(path12);
+    for (let id of hunkPromptIds(h)) {
+      let text2 = ctx.prompts.find((p) => p.id === id)?.text.toLowerCase() ?? "";
+      (created || fileMentioned(path12, text2)) && dirsOf(id).add(posix.dirname(path12));
+    }
+  }
+  for (let p of ctx.prompts)
+    for (let m of p.text.matchAll(/[\w@.-]+(?:\/[\w@.-]+)+/g)) {
+      let dir = posix.dirname(m[0].replace(/^\.\//, ""));
+      dir !== "." && dirsOf(p.id).add(dir);
+    }
   return {
+    promptDirs,
+    createdFiles,
     promptText: ctx.prompts.map((p) => p.text).join(`
 `).toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
     goneSourceStems: goneSourceStems(hunks, ctx.repoRoot),
     ...ctx.fileText ? { fileText: ctx.fileText } : {}
   };
+}
+function fileMentioned(path12, text2) {
+  let base = posix.basename(path12), stem = base.replace(/\.[^.]+$/, "");
+  return mentioned(base, text2) || stem.length >= 4 && mentioned(stem, text2);
 }
 function mentioned(token, text2) {
   let t = token.toLowerCase(), i = text2.indexOf(t);
@@ -4521,10 +4547,12 @@ function mentioned(token, text2) {
 function related(a, b) {
   return a === b ? !0 : a === "." || b === "." ? !1 : a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
-function outOfScopeReason(path12, scope) {
+function outOfScopeReason(path12, scope, ids) {
   if (!scope.promptText || isLockfile(path12) || isSnapshotFile(path12)) return null;
   let base = posix.basename(path12), stem = base.replace(/\.[^.]+$/, ""), segments = posix.dirname(path12).split("/").filter((s) => s.length >= 4 && s !== ".");
-  if ([base, ...stem.length >= 4 ? [stem] : [], ...segments].some((t) => mentioned(t, scope.promptText))) return null;
+  if ([base, ...stem.length >= 4 ? [stem] : [], ...segments].some((t) => mentioned(t, scope.promptText)) || scope.createdFiles.has(path12)) return null;
+  let dirOfFile = posix.dirname(path12);
+  for (let id of ids) if (scope.promptDirs.get(id)?.has(dirOfFile)) return null;
   let others = scope.agentFiles.filter((f) => f !== path12);
   if (others.length === 0) return null;
   let dir = posix.dirname(path12);

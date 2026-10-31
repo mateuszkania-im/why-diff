@@ -128,7 +128,7 @@ function computeLabels(h: AttributedHunk, path: string, scope: ScopeIndex): Labe
   if (secrets.length > 0) push('secret-like', 'risk', secrets.join('; '));
 
   if (agent) {
-    const why = outOfScopeReason(path, scope);
+    const why = outOfScopeReason(path, scope, hunkPromptIds(h));
     if (why) push('out-of-scope', 'warn', why);
   }
 
@@ -1459,16 +1459,57 @@ interface ScopeIndex {
   agentFiles: string[];
   /** Stems of source files deleted or renamed away anywhere in the diff. */
   goneSourceStems: Set<string>;
+  /** Directories the agent worked in or was pointed at, per prompt id (created files, files and paths the prompt mentions). */
+  promptDirs: Map<string, Set<string>>;
+  /** Repo paths of files an agent `write` created or the diff adds, per hunk path. */
+  createdFiles: Set<string>;
   fileText?: LabelContext['fileText'];
 }
 
+function hunkPromptIds(h: AttributedHunk): string[] {
+  return uniq([...(h.prompt ? [h.prompt.id] : []), ...h.edits.filter((e) => e.failed !== true).map((e) => e.promptId)]);
+}
+
 function buildScopeIndex(hunks: AttributedHunk[], ctx: LabelContext): ScopeIndex {
+  const agent = hunks.filter(isAgentAttributed);
+  const createdFiles = new Set<string>();
+  const promptDirs = new Map<string, Set<string>>();
+  const dirsOf = (id: string): Set<string> => {
+    let d = promptDirs.get(id);
+    if (!d) promptDirs.set(id, (d = new Set()));
+    return d;
+  };
+  for (const h of agent) {
+    const path = toRepoPath(h.hunk.file, ctx.repoRoot);
+    const created = h.hunk.status === 'added' || h.edits.some((e) => e.kind === 'write' && e.failed !== true);
+    if (created) createdFiles.add(path);
+    for (const id of hunkPromptIds(h)) {
+      const text = ctx.prompts.find((p) => p.id === id)?.text.toLowerCase() ?? '';
+      if (created || fileMentioned(path, text)) dirsOf(id).add(posix.dirname(path));
+    }
+  }
+  for (const p of ctx.prompts) {
+    // Path-like tokens ("src/cart.js") name their directory directly.
+    for (const m of p.text.matchAll(/[\w@.-]+(?:\/[\w@.-]+)+/g)) {
+      const dir = posix.dirname(m[0].replace(/^\.\//, ''));
+      if (dir !== '.') dirsOf(p.id).add(dir);
+    }
+  }
   return {
+    promptDirs,
+    createdFiles,
     promptText: ctx.prompts.map((p) => p.text).join('\n').toLowerCase(),
     agentFiles: uniq(hunks.filter(isAgentAttributed).map((h) => toRepoPath(h.hunk.file, ctx.repoRoot))),
     goneSourceStems: goneSourceStems(hunks, ctx.repoRoot),
     ...(ctx.fileText ? { fileText: ctx.fileText } : {}),
   };
+}
+
+/** True when the text names the file by basename, or by stem (>= 4 chars). */
+function fileMentioned(path: string, text: string): boolean {
+  const base = posix.basename(path);
+  const stem = base.replace(/\.[^.]+$/, '');
+  return mentioned(base, text) || (stem.length >= 4 && mentioned(stem, text));
 }
 
 function mentioned(token: string, text: string): boolean {
@@ -1502,13 +1543,16 @@ function related(a: string, b: string): boolean {
  * Skipped when there are no prompts or the agent touched a single file, and
  * for lockfiles and snapshots (derived artefacts of an in-scope change).
  */
-function outOfScopeReason(path: string, scope: ScopeIndex): string | null {
+function outOfScopeReason(path: string, scope: ScopeIndex, ids: string[]): string | null {
   if (!scope.promptText || isLockfile(path) || isSnapshotFile(path)) return null;
   const base = posix.basename(path);
   const stem = base.replace(/\.[^.]+$/, '');
   const segments = posix.dirname(path).split('/').filter((s) => s.length >= 4 && s !== '.');
   const tokens = [base, ...(stem.length >= 4 ? [stem] : []), ...segments];
   if (tokens.some((t) => mentioned(t, scope.promptText))) return null;
+  if (scope.createdFiles.has(path)) return null;
+  const dirOfFile = posix.dirname(path);
+  for (const id of ids) if (scope.promptDirs.get(id)?.has(dirOfFile)) return null;
 
   const others = scope.agentFiles.filter((f) => f !== path);
   if (others.length === 0) return null;
