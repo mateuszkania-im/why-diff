@@ -17,7 +17,7 @@ import { renderReport, isReportFormat, type ReportFormat } from './report/index.
 import type { Harness, LabelKind } from './types.js';
 import { runGuard, type GuardPayload } from './guard.js';
 import type { ClassifierKind } from './classify/index.js';
-import { ghRunner, readPrBody, sectionBudget, upsertSection, writePrBody } from './pr.js';
+import { ghRunner, PR_BODY_LIMIT, readPrBody, sectionBudget, upsertSection, writePrBody } from './pr.js';
 
 const HARNESSES: Harness[] = ['claude-code', 'codex', 'opencode'];
 const CLASSIFIERS: ClassifierKind[] = ['auto', 'claude-cli', 'anthropic', 'openai'];
@@ -58,9 +58,7 @@ program
     const format: ReportFormat = o.html ? 'html' : (o.format as ReportFormat | undefined) ?? (o.out && String(o.out).endsWith('.html') ? 'html' : 'terminal');
     if (!isReportFormat(format)) throw new Error(`unknown format ${format}`);
 
-    const harnesses = o.harness ? (String(o.harness).split(',').map((s) => s.trim()).filter(Boolean) as Harness[]) : undefined;
-    const unknownHarness = harnesses?.find((h) => !HARNESSES.includes(h));
-    if (unknownHarness) throw new Error(`unknown harness "${unknownHarness}" (use ${HARNESSES.join(', ')})`);
+    const harnesses = parseHarnesses(o.harness);
 
     // Everything after a literal `--` is a pathspec; the optional range must come before it.
     const dd = process.argv.indexOf('--');
@@ -85,11 +83,7 @@ program
     if (badCheck) throw new Error(`unknown --fail-on value "${badCheck}" (use ${FAIL_ON.join(', ')})`);
     if (failChecks.includes('unrequested') && classify === 'none') throw new Error('--fail-on unrequested needs --classify');
 
-    let since: Date | undefined;
-    if (o.since) {
-      since = new Date(String(o.since));
-      if (Number.isNaN(since.getTime())) throw new Error(`invalid --since date "${String(o.since)}" (use ISO, e.g. 2026-10-31 or 2026-10-31T09:00)`);
-    }
+    const since = parseSince(o.since);
     const built = await buildReport({
       range,
       base: o.base as string | undefined,
@@ -155,6 +149,9 @@ program
   .option('--base <ref>', 'branch or ref the PR targets (default: auto-detected)')
   .option('-c, --classify [backend]', 'LLM intent check: auto | claude-cli | anthropic | openai', false)
   .option('-m, --model <model>', 'model for the intent check (default: haiku)')
+  .option('--harness <list>', 'comma list of harnesses: claude-code,codex,opencode')
+  .option('-s, --session <files...>', 'explicit transcript file(s) instead of auto-discovery')
+  .option('--since <date>', 'only consider sessions after this date (ISO)')
   .option('--scan-all', 'also scan transcripts started outside the repo that edited files in it; slower')
   .option('--redact-prompts', 'omit prompt text and agent rationales (secrets are always masked)')
   .option('--dry-run', 'print the new PR body instead of editing the PR')
@@ -167,18 +164,25 @@ program
       if (!CLASSIFIERS.includes(o.classify as ClassifierKind)) throw new Error(`unknown --classify backend "${String(o.classify)}" (use ${CLASSIFIERS.join(', ')})`);
       classify = o.classify as ClassifierKind;
     }
+    const harnesses = parseHarnesses(o.harness);
+    const since = parseSince(o.since);
     const gh = ghRunner();
     const body = await readPrBody(gh);
+    const budget = Math.min(60_000, sectionBudget(body));
+    if (budget < 1000) throw new Error(`the pull request description is too long to add the why-diff section (GitHub allows ${PR_BODY_LIMIT} characters); shorten it and run again`);
     const built = await buildReport({
       base: o.base as string | undefined,
+      harnesses,
+      sessionFiles: o.session as string[] | undefined,
+      since,
       scanAll: Boolean(o.scanAll),
       classify,
       model: o.model as string | undefined,
       onProgress: progress,
     });
     const report = o.redactPrompts ? redactReport(built, 'prompts') : built;
-    const section = renderReport(report, 'md', { maxChars: Math.max(1000, Math.min(60_000, sectionBudget(body))) });
-    const next = upsertSection(body, section);
+    const next = upsertSection(body, renderReport(report, 'md', { maxChars: budget }));
+    if (next.length > PR_BODY_LIMIT) throw new Error(`the new pull request description would be ${next.length} characters, over GitHub's ${PR_BODY_LIMIT}; shorten it and run again`);
     if (o.dryRun) {
       process.stdout.write(next);
       return;
@@ -210,6 +214,21 @@ program
     process.stderr.write(result.message ?? '');
     process.exitCode = 2;
   });
+
+function parseHarnesses(value: unknown): Harness[] | undefined {
+  if (!value) return undefined;
+  const list = String(value).split(',').map((s) => s.trim()).filter(Boolean) as Harness[];
+  const unknown = list.find((h) => !HARNESSES.includes(h));
+  if (unknown) throw new Error(`unknown harness "${unknown}" (use ${HARNESSES.join(', ')})`);
+  return list;
+}
+
+function parseSince(value: unknown): Date | undefined {
+  if (!value) return undefined;
+  const since = new Date(String(value));
+  if (Number.isNaN(since.getTime())) throw new Error(`invalid --since date "${String(value)}" (use ISO, e.g. 2026-10-31 or 2026-10-31T09:00)`);
+  return since;
+}
 
 function readStdin(): Promise<string> {
   if (process.stdin.isTTY) return Promise.resolve('');

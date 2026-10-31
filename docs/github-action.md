@@ -63,9 +63,27 @@ no `npm install` step.
 | `report` | Path of the Markdown report (also appended to the job summary). |
 | `exit-code` | `0` when clean, `1` when a `fail-on` check matched. |
 
-The comment is posted even when a `fail-on` check matches; the job fails after it.
-The comment starts with the marker `<!-- why-diff:comment -->`, which is how the
-action finds it again. Do not remove the marker if you edit the comment by hand.
+The report always goes to the job summary. The comment is posted even when a
+`fail-on` check matches; the job fails after it. Posting the comment never fails
+the job by itself: if a `gh api` call fails (for example a missing permission),
+the step logs a warning and the report stays in the job summary.
+
+The comment starts with the marker `<!-- why-diff:comment -->`. The action only
+updates a marker comment written by its own identity (`github-actions[bot]`, or
+the token's user when you pass a personal access token), so a marker comment
+planted by someone else is ignored and the action posts its own.
+
+## Pull requests from forks
+
+On a pull request from a fork, GitHub gives the workflow a read-only token, so
+the action cannot comment. It detects this (the PR head repository differs from
+the base repository), prints a notice, and leaves the report in the job summary.
+`fail-on` still applies.
+
+Do not switch the workflow to `pull_request_target` to get a write token for
+forks. That event runs with a write token and your secrets, and diffing the PR
+means checking out the fork's code (including its git config, hooks and
+scripts), so untrusted code would run with write access to your repository.
 
 ## Provenance from the PR author: `why-diff pr`
 
@@ -85,4 +103,9 @@ that section; the rest of the description is left as it is.
   branch (`gh pr edit --body-file -`). It never pushes and never creates a PR.
 - `--dry-run` prints the new description without changing anything.
 - `--base <ref>` sets the target branch (default: auto-detected).
+- `--session <files...>`, `--harness <list>`, `--since <date>` and `--scan-all`
+  pick the transcripts, as in the main command.
+- If the description is too long for the section, it is shrunk to fit GitHub's
+  65 536-character limit; if there is no room at all, nothing is changed and the
+  command exits with an error.
 - `--classify` adds the LLM intent check; `--redact-prompts` leaves prompt text out.

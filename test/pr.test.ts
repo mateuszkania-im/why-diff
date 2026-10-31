@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { buildReport } from '../src/pipeline.js';
 import { SECTION_END, SECTION_START, upsertSection } from '../src/pr.js';
-import { tempDir } from './helpers/claude-fixture.js';
+import { tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
 
 const root = path.resolve(__dirname, '..');
 const tsxLoader = pathToFileURL(path.join(root, 'node_modules', 'tsx', 'dist', 'esm', 'index.mjs')).href;
@@ -125,9 +125,19 @@ describe('risk-scan mode', () => {
     expect(r.stdout.startsWith('## why-diff risk scan\n')).toBe(true);
   });
 
-  it('--fail-on risk passes when the only finding would have been unattributed', () => {
-    const r = cli(['-f', 'md', '-q', '--fail-on', 'risk']);
-    expect(r.status).toBe(0);
+  it('--fail-on risk ignores the dropped unattributed labels but still fails on a real risk label', () => {
+    expect(cli(['-f', 'md', '-q', '--fail-on', 'risk']).status).toBe(0);
+    const skipped = path.join(repo, 'src', 'skip.test.js');
+    writeFileSync(skipped, 'it.skip("works", () => {});\n');
+    try {
+      const r = cli(['-f', 'md', '-q', '--fail-on', 'risk']);
+      expect(r.stdout.startsWith('## why-diff risk scan\n')).toBe(true);
+      expect(r.stdout).toContain('test-skip-added');
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('failing on risk');
+    } finally {
+      rmSync(skipped, { force: true });
+    }
   });
 
   it('--fail-on unattributed is ignored with a note', () => {
@@ -188,6 +198,49 @@ describe('why-diff pr', () => {
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('no pull request');
     expect(calls().map((c) => c.args[1])).toEqual(['view']);
+  });
+
+  it('shrinks the section to keep the body within the GitHub limit', () => {
+    writeFileSync(path.join(stubDir, 'body.md'), 'x'.repeat(63_000) + '\n');
+    const r = cli(['pr', '-q'], env());
+    expect(r.stderr).toBe('');
+    expect(r.status).toBe(0);
+    const body = readFileSync(path.join(stubDir, 'body.md'), 'utf8');
+    expect(body.length).toBeLessThanOrEqual(65_536);
+    expect(body).toContain('<!-- why-diff:end -->');
+  });
+
+  it('exits 2 without editing when the description leaves no room for the section', () => {
+    writeFileSync(path.join(stubDir, 'body.md'), 'x'.repeat(65_000));
+    const r = cli(['pr', '-q'], env());
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('65536');
+    expect(calls().map((c) => c.args[1])).toEqual(['view']);
+  });
+
+  it('validates --harness and --since like the main command', () => {
+    const h = cli(['pr', '--dry-run', '-q', '--harness', 'bogus'], env());
+    expect(h.status).toBe(2);
+    expect(h.stderr).toContain('unknown harness "bogus"');
+    const d = cli(['pr', '--dry-run', '-q', '--since', 'yesterday'], env());
+    expect(d.status).toBe(2);
+    expect(d.stderr).toContain('invalid --since date');
+  });
+
+  it('--session uses an explicit transcript, giving a provenance section', () => {
+    const elsewhere = realpathSync(tempDir('why-diff-pr-session-'));
+    try {
+      const now = Date.now();
+      const file = writeSyntheticTranscript(elsewhere, repo, 'dddddddd-1111-4222-8333-444444444444', [
+        { prompt: 'add b', at: new Date(now - 60_000).toISOString(), calls: [{ tool: 'Write', at: new Date(now - 50_000).toISOString(), input: { file_path: path.join(repo, 'src/b.js'), content: 'export const b = 1;\n' } }] },
+      ]);
+      const r = cli(['pr', '--dry-run', '-q', '--session', file], env());
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('<!-- why-diff:start -->\n## Provenance');
+      expect(r.stdout).toContain('add b');
+    } finally {
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
   });
 
   it('reports a missing gh clearly', () => {

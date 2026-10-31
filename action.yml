@@ -2,8 +2,8 @@ name: why-diff
 description: >-
   Risk scan of a pull request diff (skipped or weakened tests, new dependencies,
   CI and config changes, lint suppressions, secret-like strings), posted as one
-  sticky PR comment. Needs `permissions: pull-requests: write` and
-  `actions/checkout` with `fetch-depth: 0`.
+  sticky PR comment and the job summary. Needs `permissions: pull-requests: write`
+  and `actions/checkout` with `fetch-depth: 0`. Fork PRs get the job summary only.
 author: mateuszkania-im
 branding:
   icon: git-pull-request
@@ -64,18 +64,10 @@ runs:
         GH_TOKEN: ${{ github.token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
+        HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         REPORT: ${{ steps.report.outputs.report }}
-      run: |
-        marker='<!-- why-diff:comment -->'
-        body="$RUNNER_TEMP/why-diff-comment.md"
-        { echo "$marker"; cat "$REPORT"; } > "$body"
-        id=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
-          --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n 1)
-        if [ -n "$id" ]; then
-          gh api -X PATCH "repos/$REPO/issues/comments/$id" -F "body=@$body" > /dev/null
-        else
-          gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -F "body=@$body" > /dev/null
-        fi
+      # Never fails the job: forks (read-only token) get a notice, failed gh calls a warning.
+      run: bash "$GITHUB_ACTION_PATH/scripts/action-comment.sh"
 
     - name: Apply fail-on
       if: steps.report.outputs.exit-code == '1'

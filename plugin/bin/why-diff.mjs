@@ -8774,9 +8774,7 @@ program2.name("why-diff").enablePositionalOptions().version(VERSION, "-V, --vers
 `));
   }, format = o.html ? "html" : o.format ?? (o.out && String(o.out).endsWith(".html") ? "html" : "terminal");
   if (!isReportFormat(format)) throw new Error(`unknown format ${format}`);
-  let harnesses = o.harness ? String(o.harness).split(",").map((s) => s.trim()).filter(Boolean) : void 0, unknownHarness = harnesses?.find((h) => !HARNESSES.includes(h));
-  if (unknownHarness) throw new Error(`unknown harness "${unknownHarness}" (use ${HARNESSES.join(", ")})`);
-  let dd = process.argv.indexOf("--"), paths = dd >= 0 ? process.argv.slice(dd + 1) : [], range = rangeArg;
+  let harnesses = parseHarnesses(o.harness), dd = process.argv.indexOf("--"), paths = dd >= 0 ? process.argv.slice(dd + 1) : [], range = rangeArg;
   if (paths.length)
     pathArgs.length + (rangeArg === void 0 ? 0 : 1) > paths.length ? range = rangeArg : range = void 0;
   else if (pathArgs.length)
@@ -8791,10 +8789,7 @@ program2.name("why-diff").enablePositionalOptions().version(VERSION, "-V, --vers
   let failChecks = o.failOn ? String(o.failOn).split(",").map((x) => x.trim()).filter(Boolean) : [], badCheck = failChecks.find((c) => !FAIL_ON.includes(c));
   if (badCheck) throw new Error(`unknown --fail-on value "${badCheck}" (use ${FAIL_ON.join(", ")})`);
   if (failChecks.includes("unrequested") && classify === "none") throw new Error("--fail-on unrequested needs --classify");
-  let since;
-  if (o.since && (since = new Date(String(o.since)), Number.isNaN(since.getTime())))
-    throw new Error(`invalid --since date "${String(o.since)}" (use ISO, e.g. 2026-10-31 or 2026-10-31T09:00)`);
-  let built = await buildReport({
+  let since = parseSince(o.since), built = await buildReport({
     range,
     base: o.base,
     workingTree: !!o.workingTree,
@@ -8830,7 +8825,7 @@ program2.name("why-diff").enablePositionalOptions().version(VERSION, "-V, --vers
 `)), process.exitCode = 1);
   }
 });
-program2.command("pr").description("put the report into the current branch's pull request body (gh pr edit); never pushes or creates a PR").option("--base <ref>", "branch or ref the PR targets (default: auto-detected)").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--scan-all", "also scan transcripts started outside the repo that edited files in it; slower").option("--redact-prompts", "omit prompt text and agent rationales (secrets are always masked)").option("--dry-run", "print the new PR body instead of editing the PR").option("-q, --quiet", "no progress output").action(async (o) => {
+program2.command("pr").description("put the report into the current branch's pull request body (gh pr edit); never pushes or creates a PR").option("--base <ref>", "branch or ref the PR targets (default: auto-detected)").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo that edited files in it; slower").option("--redact-prompts", "omit prompt text and agent rationales (secrets are always masked)").option("--dry-run", "print the new PR body instead of editing the PR").option("-q, --quiet", "no progress output").action(async (o) => {
   let progress = (msg) => {
     o.quiet || process.stderr.write(import_picocolors2.default.dim(`\xB7 ${msg}
 `));
@@ -8840,13 +8835,19 @@ program2.command("pr").description("put the report into the current branch's pul
     if (!CLASSIFIERS.includes(o.classify)) throw new Error(`unknown --classify backend "${String(o.classify)}" (use ${CLASSIFIERS.join(", ")})`);
     classify = o.classify;
   }
-  let gh = ghRunner(), body = await readPrBody(gh), built = await buildReport({
+  let harnesses = parseHarnesses(o.harness), since = parseSince(o.since), gh = ghRunner(), body = await readPrBody(gh), budget = Math.min(6e4, sectionBudget(body));
+  if (budget < 1e3) throw new Error(`the pull request description is too long to add the why-diff section (GitHub allows ${PR_BODY_LIMIT} characters); shorten it and run again`);
+  let built = await buildReport({
     base: o.base,
+    harnesses,
+    sessionFiles: o.session,
+    since,
     scanAll: !!o.scanAll,
     classify,
     model: o.model,
     onProgress: progress
-  }), report = o.redactPrompts ? redactReport(built, "prompts") : built, section = renderReport(report, "md", { maxChars: Math.max(1e3, Math.min(6e4, sectionBudget(body))) }), next = upsertSection(body, section);
+  }), report = o.redactPrompts ? redactReport(built, "prompts") : built, next = upsertSection(body, renderReport(report, "md", { maxChars: budget }));
+  if (next.length > PR_BODY_LIMIT) throw new Error(`the new pull request description would be ${next.length} characters, over GitHub's ${PR_BODY_LIMIT}; shorten it and run again`);
   if (o.dryRun) {
     process.stdout.write(next);
     return;
@@ -8866,6 +8867,18 @@ program2.command("guard").description("Claude Code Stop hook: block the agent fr
   let blocking = new Set(o.on.split(",").map((s) => s.trim()).filter(Boolean)), result = await runGuard(payload, { blocking });
   result.block && (process.stderr.write(result.message ?? ""), process.exitCode = 2);
 });
+function parseHarnesses(value) {
+  if (!value) return;
+  let list = String(value).split(",").map((s) => s.trim()).filter(Boolean), unknown = list.find((h) => !HARNESSES.includes(h));
+  if (unknown) throw new Error(`unknown harness "${unknown}" (use ${HARNESSES.join(", ")})`);
+  return list;
+}
+function parseSince(value) {
+  if (!value) return;
+  let since = new Date(String(value));
+  if (Number.isNaN(since.getTime())) throw new Error(`invalid --since date "${String(value)}" (use ISO, e.g. 2026-10-31 or 2026-10-31T09:00)`);
+  return since;
+}
 function readStdin() {
   return process.stdin.isTTY ? Promise.resolve("") : new Promise((resolve) => {
     let data = "";
