@@ -163,10 +163,15 @@ export async function getDiff(cwd: string, target: DiffTarget, opts: DiffOptions
   try {
     return await getDiffUnwrapped(cwd, target, opts);
   } catch (err) {
-    if (err instanceof GitError && (await isShallow(cwd))) throw new Error(`${SHALLOW_HINT} (${err.stderr.trim()})`);
+    if (err instanceof GitError && MISSING_REVISION.test(err.stderr) && (await isShallow(cwd))) {
+      throw new Error(`${SHALLOW_HINT} (${err.stderr.trim()})`);
+    }
     throw err;
   }
 }
+
+/** Git errors a deeper fetch can fix: a revision or merge base the shallow history lacks. */
+const MISSING_REVISION = /unknown revision|bad revision|no merge base|ambiguous argument|not a valid object name|bad object|invalid symmetric difference/i;
 
 async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptions): Promise<string> {
   const unified = `--unified=${opts.unified ?? 3}`;
@@ -386,6 +391,7 @@ export async function commitTimes(cwd: string, target: DiffTarget): Promise<Time
     }
   } else if (target.baseRev) {
     baseRev = target.baseRev;
+    countRange = `${baseRev}..HEAD`;
   } else if (target.base) {
     baseRev = await mergeBase(cwd, target.base, 'HEAD');
     countRange = `${baseRev}..HEAD`;

@@ -122,7 +122,7 @@ why-diff pr              # writes the report into the current branch's PR descri
 why-diff pr --dry-run    # print the new description, change nothing
 ```
 
-It needs a logged-in `gh`, edits only the description of the PR that already exists for the branch (between `<!-- why-diff:start -->` and `<!-- why-diff:end -->`), and never pushes or creates a PR. Running it again replaces that section. It reports committed work (`<base>...HEAD`) like the PR itself; add `--working-tree` to include uncommitted changes. Add `--redact-prompts` to leave your prompt text out.
+It needs a logged-in `gh`, edits only the description of the PR that already exists for the branch (between `<!-- why-diff:start -->` and `<!-- why-diff:end -->`), and never pushes or creates a PR. Running it again replaces that section. It reports committed work (`<base>...HEAD`) like the PR itself; add `--include-uncommitted` to include uncommitted changes. Add `--redact-prompts` to leave your prompt text out.
 
 ### As a reviewer or in CI: the GitHub Action
 
@@ -227,7 +227,7 @@ why-diff [range] [options] [-- <paths>]
   -V, --version          print the version
 
 why-diff pr [options]    put the report into the current branch's PR description (gh pr edit)
-                         --dry-run, --base, --working-tree, --classify, --redact-prompts, transcript options as above
+                         --dry-run, --base, --include-uncommitted, --classify, --redact-prompts, transcript options as above
 why-diff guard [--on k]  Claude Code Stop hook (reads the hook payload from stdin)
 ```
 

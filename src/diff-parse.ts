@@ -14,7 +14,7 @@
  * line `-- foo` rendering as `--- foo`) is parsed correctly.
  */
 
-import type { Hunk } from './types.js';
+import { BINARY_HUNK_HEADER, type Hunk } from './types.js';
 
 /** Per-file state while walking the diff. */
 interface FileHeader {
@@ -264,7 +264,7 @@ function binaryHunk(file: FileHeader, n: number): Hunk {
     oldLines: 0,
     newStart: 0,
     newLines: 0,
-    header: 'Binary file changed',
+    header: BINARY_HUNK_HEADER,
     lines: [],
   };
 }

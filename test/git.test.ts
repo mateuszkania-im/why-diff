@@ -182,6 +182,17 @@ describe('base and window resolution', () => {
     expect(w.commits).toBe(1);
   });
 
+  it('commitTimes counts baseRev..HEAD when a baseRev is given', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'base');
+    const base = sh(repo, 'rev-parse', 'HEAD');
+    commitFile(repo, 'a.txt', 'one\ntwo\n', 'two');
+    commitFile(repo, 'a.txt', 'one\ntwo\nthree\n', 'three');
+    const w = await commitTimes(repo, { workingTree: true, baseRev: base });
+    expect(w.commits).toBe(2);
+    expect((await commitTimes(repo, { workingTree: true, baseRev: 'HEAD' })).commits).toBe(0);
+  });
+
   it('listUntracked ignores .why-diff/', async () => {
     const repo = freshRepo();
     commitFile(repo, 'a.txt', 'one\n', 'base');
@@ -236,6 +247,25 @@ describe('base and window resolution', () => {
     expect(await isShallow(clone)).toBe(true);
     await expect(buildReport({ cwd: clone, range: 'origin/main...HEAD', home: parent })).rejects.toThrow('fetch-depth: 0');
     await expect(buildReport({ cwd: clone, home: parent })).rejects.toThrow('fetch-depth: 0');
+  });
+
+  it('shallow clone: only missing-revision errors get the fetch-depth hint, others pass through unchanged', async () => {
+    const repo = freshRepo();
+    commitFile(repo, 'a.txt', 'one\n', 'base');
+    commitFile(repo, 'a.txt', 'one\ntwo\n', 'two');
+    const parent = tempDir('why-diff-shallow-');
+    dirs.push(parent);
+    const clone = path.join(parent, 'clone');
+    execFileSync('git', ['clone', '-q', '--depth', '1', `file://${repo}`, clone], { env: ENV });
+    // A typo in the range that is not a missing revision: git's own error, no hint.
+    const typo = await buildReport({ cwd: clone, range: 'HEAD:nope.txt', home: parent }).catch((e: Error) => e);
+    expect((typo as Error).message).toContain("path 'nope.txt' does not exist");
+    expect((typo as Error).message).not.toContain('fetch-depth');
+    const magic = await buildReport({ cwd: clone, workingTree: true, paths: [':(bad)x'], home: parent }).catch((e: Error) => e);
+    expect((magic as Error).message).toContain('pathspec magic');
+    expect((magic as Error).message).not.toContain('fetch-depth');
+    // A revision the shallow history does not have: the hint.
+    await expect(buildReport({ cwd: clone, range: 'HEAD~1..HEAD', home: parent })).rejects.toThrow('fetch-depth: 0');
   });
 
   it('shallow detached checkout with an explicit --base gives the fetch-depth hint, not "ref not found"', async () => {

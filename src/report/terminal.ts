@@ -130,6 +130,7 @@ export function renderTerminal(report: Report, opts: TerminalOptions = {}): stri
       `+${s.addedLines} −${s.removedLines}`,
       h.touchedTests ? `tests touched ${GLYPH.tests}` : 'tests untouched',
       ...(s.ignoredHunks ? [`${plural(s.ignoredHunks, 'hunk')} ignored by config`] : []),
+      ...(s.binaryFiles ? [plural(s.binaryFiles, 'binary file')] : []),
     ];
     for (const row of wrapParts(meta.map((m): Seg[] => [[m, dim]]), width - 2)) line(['  ', id], ...row);
   } else {
@@ -159,6 +160,7 @@ export function renderTerminal(report: Report, opts: TerminalOptions = {}): stri
     ];
     if (s.sessions > 0) meta.push(plural(s.prompts, 'prompt'));
     if (s.ignoredHunks) meta.push(`${plural(s.ignoredHunks, 'hunk')} ignored by config`);
+    if (s.binaryFiles) meta.push(`${plural(s.binaryFiles, 'binary file')}${s.unattributedBinaryFiles ? ` (${s.unattributedBinaryFiles} with no agent edit)` : ''}`);
     if (h.classifierModel) meta.push(`intent by ${h.classifierModel}`);
     for (const row of wrapParts(meta.map((m): Seg[] => [[m, dim]]), width - 2)) line(['  ', id], ...row);
     if (s.sessions === 0 && s.hunks > 0) line(['  ', id], [NO_SESSIONS_HINT, c.yellow]);

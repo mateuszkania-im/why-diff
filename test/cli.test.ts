@@ -1,6 +1,6 @@
 /** End-to-end CLI behaviour: argument validation, pathspec, binary files, JSON shape. Never calls an LLM. */
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -120,9 +120,81 @@ describe('json output', () => {
   });
 });
 
+describe('binary files', () => {
+  it('counts changed binary files in summary.binaryFiles and shows them in md and terminal', () => {
+    const rep = JSON.parse(cli(['-w', '-f', 'json', '-q']).stdout);
+    expect(rep.summary.binaryFiles).toBe(1);
+    expect(rep.summary.unattributedBinaryFiles).toBe(1);
+    expect(cli(['-w', '-f', 'md', '-q']).stdout).toContain('| Binary files | 1, 1 with no agent edit |');
+    expect(cli(['-w', '-q']).stdout).toContain('1 binary file');
+  });
+
+  it('--fail-on unattributed fails on a binary file no agent edit explains', () => {
+    expect(cli(['-w', '-f', 'md', '-q', '--fail-on', 'unattributed', '--', 'src/a.js']).status).toBe(0);
+    const r = cli(['-w', '-f', 'md', '-q', '--fail-on', 'unattributed', '--', 'src/a.js', 'logo.png']);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('failing on unattributed');
+  });
+
+  it('a binary file an agent shell command wrote counts as explained', () => {
+    writeFileSync(path.join(repo, 'icon.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 9, 9, 0, 255]));
+    const now = Date.now();
+    writeSyntheticTranscript(home, repo, 'eeeeeeee-1111-4222-8333-444444444444', [
+      { prompt: 'add the icon', at: new Date(now - 40_000).toISOString(), calls: [{ tool: 'Bash', at: new Date(now - 30_000).toISOString(), input: { command: `cp /tmp/icon.png ${path.join(repo, 'icon.png')}`, description: 'copy icon' } }] },
+    ]);
+    try {
+      const r = cli(['-w', '-f', 'json', '-q', '--fail-on', 'unattributed', '--', 'src/a.js', 'icon.png']);
+      expect(JSON.parse(r.stdout).summary.binaryFiles).toBe(1);
+      expect(JSON.parse(r.stdout).summary.unattributedBinaryFiles).toBe(0);
+      expect(r.status).toBe(0);
+    } finally {
+      rmSync(path.join(repo, 'icon.png'), { force: true });
+    }
+  });
+});
+
+describe('-o into .why-diff/', () => {
+  it('creates .why-diff/.gitignore when absent and never overwrites an existing one', () => {
+    const dir = path.join(repo, '.why-diff');
+    try {
+      expect(cli(['-w', '-f', 'md', '-q', '-o', '.why-diff/a.md']).status).toBe(0);
+      expect(readFileSync(path.join(dir, '.gitignore'), 'utf8')).toBe('*\n');
+      writeFileSync(path.join(dir, '.gitignore'), '*\n!keep.md\n');
+      expect(cli(['-w', '-f', 'md', '-q', '-o', '.why-diff/b.md']).status).toBe(0);
+      expect(readFileSync(path.join(dir, '.gitignore'), 'utf8')).toBe('*\n!keep.md\n');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('pathspec after --', () => {
   it('limits hunks to the given paths', () => {
     const r = cli(['-w', '-f', 'json', '-q', '--', 'src']);
+    expect(r.status).toBe(0);
+    const files = JSON.parse(r.stdout).hunks.map((h: { hunk: { file: string } }) => h.hunk.file);
+    expect(files).toEqual(['src/a.js']);
+  });
+});
+
+describe('pathspec separator', () => {
+  it('a literal -- given as an option value is not a pathspec separator', () => {
+    const r = cli(['-w', '-m', '--', '-f', 'json', '-q']);
+    expect(r.status).toBe(0);
+    const files = JSON.parse(r.stdout).hunks.map((h: { hunk: { file: string } }) => h.hunk.file);
+    expect(files).toContain('src/a.js');
+    expect(files).toContain('docs/readme.md');
+  });
+
+  it('a real -- after an option value of -- still separates paths', () => {
+    const r = cli(['-w', '-m', '--', '-f', 'json', '-q', '--', 'docs']);
+    expect(r.status).toBe(0);
+    const files = JSON.parse(r.stdout).hunks.map((h: { hunk: { file: string } }) => h.hunk.file);
+    expect(files).toEqual(['docs/readme.md']);
+  });
+
+  it('--opt=value forms and clustered short options do not hide the separator', () => {
+    const r = cli(['-w', '--model=x', '-qf', 'json', '--', 'src']);
     expect(r.status).toBe(0);
     const files = JSON.parse(r.stdout).hunks.map((h: { hunk: { file: string } }) => h.hunk.file);
     expect(files).toEqual(['src/a.js']);

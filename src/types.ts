@@ -198,7 +198,14 @@ export interface Summary {
   prompts: number;
   /** Hunks dropped by the `ignore` rule of the team config (absent when none) */
   ignoredHunks?: number;
+  /** Changed binary files (no lines to attribute) */
+  binaryFiles: number;
+  /** Changed binary files no agent edit names (a Write or shell command on the path explains one) */
+  unattributedBinaryFiles: number;
 }
+
+/** Header of the empty hunk that stands for a changed binary file. */
+export const BINARY_HUNK_HEADER = 'Binary file changed';
 
 /**
  * Labels that describe the file rather than the changed lines. Renderers

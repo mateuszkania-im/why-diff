@@ -111,8 +111,10 @@ that section; the rest of the description is left as it is.
 - `--dry-run` prints the new description without changing anything.
 - `--base <ref>` sets the target branch (default: auto-detected).
 - By default the report covers committed work only (`<base>...HEAD`), matching
-  what reviewers see in the PR. Add `--working-tree` to include uncommitted
-  changes; why-diff warns on stderr when the tree is dirty and the flag is absent.
+  what reviewers see in the PR. Add `--include-uncommitted` to include uncommitted
+  changes; why-diff warns on stderr when the tree is dirty, the flag is absent and
+  uncommitted changes are actually left out (on the base branch itself the
+  working tree is reported).
 - `--session <files...>`, `--harness <list>`, `--since <date>` and `--scan-all`
   pick the transcripts, as in the main command.
 - If the description is too long for the section, it is shrunk to fit GitHub's

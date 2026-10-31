@@ -61,9 +61,11 @@ program
 
     const harnesses = parseHarnesses(o.harness);
 
-    // Everything after a literal `--` is a pathspec; the optional range must come before it.
-    const dd = process.argv.indexOf('--');
-    const paths = dd >= 0 ? process.argv.slice(dd + 1) : [];
+    // Everything after the `--` separator is a pathspec; the optional range must come before it.
+    // A `--` consumed as an option value (`-m --`) is not the separator.
+    const argv = process.argv.slice(2);
+    const dd = separatorIndex(argv, program);
+    const paths = dd >= 0 ? argv.slice(dd + 1) : [];
     // Positionals that came before `--` (commander also lists the pathspecs after it).
     const positionals = [...(rangeArg === undefined ? [] : [rangeArg]), ...pathArgs];
     const beforeDd = dd >= 0 ? positionals.slice(0, Math.max(0, positionals.length - paths.length)) : positionals;
@@ -107,7 +109,10 @@ program
       await mkdir(path.dirname(path.resolve(outFile)), { recursive: true });
       await writeFile(outFile, out);
       const outDir = path.dirname(path.resolve(outFile));
-      if (path.basename(outDir) === '.why-diff') await writeFile(path.join(outDir, '.gitignore'), '*\n');
+      // Keep a user's own .why-diff/.gitignore: only create it when absent.
+      if (path.basename(outDir) === '.why-diff') await writeFile(path.join(outDir, '.gitignore'), '*\n', { flag: 'wx' }).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== 'EEXIST') throw err;
+      });
       progress(`wrote ${path.relative(process.cwd(), path.resolve(outFile)) || outFile}`);
       if (format === 'html' && o.open !== false && process.stdout.isTTY) openFile(path.resolve(outFile));
       if (format === 'html') process.stdout.write(renderReport(report, 'terminal', {}) + '\n');
@@ -130,7 +135,7 @@ program
         (c === 'risk' && report.hunks.some((h) => h.labels.some((l) => l.severity === 'risk'))) ||
         (c === 'unrequested' && (s.intent?.unrequested ?? 0) > 0) ||
         (c === 'tests' && s.touchedTests) ||
-        (c === 'unattributed' && report.mode !== 'risk-scan' && s.unattributedLines > 0));
+        (c === 'unattributed' && report.mode !== 'risk-scan' && (s.unattributedLines > 0 || s.unattributedBinaryFiles > 0)));
       if (failed.length) {
         process.stderr.write(pc.red(`why-diff: failing on ${failed.join(', ')}\n`));
         process.exitCode = 1;
@@ -147,7 +152,7 @@ program
   .command('pr')
   .description('put the report into the current branch\'s pull request body (gh pr edit); never pushes or creates a PR')
   .option('--base <ref>', 'branch or ref the PR targets (default: auto-detected)')
-  .option('-w, --working-tree', 'also include uncommitted changes (default: committed work only, <base>...HEAD)')
+  .option('--include-uncommitted', 'also include uncommitted changes (default: committed work only, <base>...HEAD)')
   .option('-c, --classify [backend]', 'LLM intent check: auto | claude-cli | anthropic | openai', false)
   .option('-m, --model <model>', 'model for the intent check (default: haiku)')
   .option('--harness <list>', 'comma list of harnesses: claude-code,codex,opencode')
@@ -171,10 +176,7 @@ program
     const body = await readPrBody(gh);
     const budget = Math.min(60_000, sectionBudget(body));
     if (budget < 1000) throw new Error(`the pull request description is too long to add the why-diff section (GitHub allows ${PR_BODY_LIMIT} characters); shorten it and run again`);
-    const withWorkingTree = Boolean(o.workingTree);
-    if (!withWorkingTree && (await isDirty(process.cwd()))) {
-      process.stderr.write(pc.yellow('why-diff: uncommitted changes are not included in the PR report (committed work only); use --working-tree to include them\n'));
-    }
+    const withWorkingTree = Boolean(o.includeUncommitted);
     const built = await buildReport({
       base: o.base as string | undefined,
       committedOnly: !withWorkingTree,
@@ -186,6 +188,11 @@ program
       model: o.model as string | undefined,
       onProgress: progress,
     });
+    // On the base branch (or with nothing committed beyond it) the report falls back to the working
+    // tree, so uncommitted changes ARE included: warn only when they were actually left out.
+    if (!withWorkingTree && !built.range.includes('working tree') && (await isDirty(process.cwd()))) {
+      process.stderr.write(pc.yellow('why-diff: uncommitted changes are not included in the PR report (committed work only); use --include-uncommitted to include them\n'));
+    }
     const report = o.redactPrompts ? redactReport(built, 'prompts') : built;
     const next = upsertSection(body, renderReport(report, 'md', { maxChars: budget }));
     if (next.length > PR_BODY_LIMIT) throw new Error(`the new pull request description would be ${next.length} characters, over GitHub's ${PR_BODY_LIMIT}; shorten it and run again`);
@@ -220,6 +227,45 @@ program
     process.stderr.write(result.message ?? '');
     process.exitCode = 2;
   });
+
+/**
+ * Index in `args` of the `--` that ends option parsing, walking the arguments the way commander
+ * does: an option with a required value consumes the next argument (even `--`), an optional value
+ * is taken only when the next argument does not start with `-`, and variadic values stop at the
+ * next `-` argument. -1 when there is none.
+ */
+function separatorIndex(args: string[], cmd: Command): number {
+  const byFlag = new Map<string, Option>();
+  for (const opt of cmd.options) {
+    if (opt.short) byFlag.set(opt.short, opt);
+    if (opt.long) byFlag.set(opt.long, opt);
+  }
+  const takesNext = (opt: Option | undefined, next: string | undefined): number => {
+    if (!opt || next === undefined) return 0;
+    if (opt.required) return 1;
+    return opt.optional && !next.startsWith('-') ? 1 : 0;
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i] ?? '';
+    if (a === '--') return i;
+    if (a.startsWith('--')) {
+      if (a.includes('=')) continue;
+      i += takesNext(byFlag.get(a), args[i + 1]);
+      continue;
+    }
+    if (a.startsWith('-') && a.length > 1) {
+      // `-qf json`: walk the cluster; the first flag that takes a value ends it.
+      for (let j = 1; j < a.length; j++) {
+        const opt = byFlag.get(`-${a[j]}`);
+        if (opt && (opt.required || opt.optional)) {
+          if (j === a.length - 1) i += takesNext(opt, args[i + 1]);
+          break;
+        }
+      }
+    }
+  }
+  return -1;
+}
 
 async function isDirty(cwd: string): Promise<boolean> {
   try {

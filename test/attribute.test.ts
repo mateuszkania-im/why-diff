@@ -597,6 +597,8 @@ describe('summarize', () => {
       sessions: 0,
       sessionsFound: 1,
       prompts: 0,
+      binaryFiles: 0,
+      unattributedBinaryFiles: 0,
     });
     expect(summarize([], []).intent).toBeUndefined();
   });

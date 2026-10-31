@@ -171,18 +171,36 @@ describe('why-diff pr', () => {
     expect(r.status).toBe(0);
     expect(r.stdout.startsWith('Fixes #3.\n\nSome notes.\n\n<!-- why-diff:start -->\n## why-diff risk scan')).toBe(true);
     expect(r.stdout).toContain('src/a.js');
-    expect(r.stdout).not.toContain('src/b.js'); // uncommitted: only with --working-tree
+    expect(r.stdout).not.toContain('src/b.js'); // uncommitted: only with --include-uncommitted
     expect(r.stdout).toContain('main...HEAD');
     expect(calls().map((c) => c.args.slice(0, 2).join(' '))).toEqual(['pr view']);
     expect(readFileSync(path.join(stubDir, 'body.md'), 'utf8')).toBe('Fixes #3.\n\nSome notes.\n');
   });
 
-  it('--working-tree includes uncommitted changes and does not warn', () => {
-    const r = cli(['pr', '--dry-run', '-q', '--working-tree'], env());
+  it('--include-uncommitted includes uncommitted changes and does not warn', () => {
+    const r = cli(['pr', '--dry-run', '-q', '--include-uncommitted'], env());
     expect(r.stderr).toBe('');
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('src/b.js');
     expect(r.stdout).toContain('src/a.js');
+  });
+
+  it('the old --working-tree flag is gone (renamed to --include-uncommitted)', () => {
+    const r = cli(['pr', '--dry-run', '-q', '--working-tree'], env());
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("unknown option '--working-tree'");
+  });
+
+  it('does not warn about excluded changes on the base branch, where the working tree is reported', () => {
+    git(repo, 'checkout', '-q', 'main');
+    try {
+      const r = cli(['pr', '--dry-run', '-q'], env());
+      expect(r.status).toBe(0);
+      expect(r.stderr).not.toContain('uncommitted');
+      expect(r.stdout).toContain('src/b.js');
+    } finally {
+      git(repo, 'checkout', '-q', 'feature');
+    }
   });
 
   it('edits the existing PR body via gh pr edit --body-file -, and replaces its own section on the next run', () => {
@@ -243,7 +261,7 @@ describe('why-diff pr', () => {
       const file = writeSyntheticTranscript(elsewhere, repo, 'dddddddd-1111-4222-8333-444444444444', [
         { prompt: 'add b', at: new Date(now - 60_000).toISOString(), calls: [{ tool: 'Write', at: new Date(now - 50_000).toISOString(), input: { file_path: path.join(repo, 'src/b.js'), content: 'export const b = 1;\n' } }] },
       ]);
-      const r = cli(['pr', '--dry-run', '-q', '--working-tree', '--session', file], env());
+      const r = cli(['pr', '--dry-run', '-q', '--include-uncommitted', '--session', file], env());
       expect(r.status).toBe(0);
       expect(r.stdout).toContain('<!-- why-diff:start -->\n## Provenance');
       expect(r.stdout).toContain('add b');

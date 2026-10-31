@@ -2,7 +2,7 @@
  * Report-header aggregates computed from attributed hunks.
  */
 
-import { FILE_LEVEL_LABELS, type AttributedHunk, type IntentVerdict, type LabelKind, type Session, type Summary } from './types.js';
+import { BINARY_HUNK_HEADER, FILE_LEVEL_LABELS, type AttributedHunk, type IntentVerdict, type LabelKind, type Session, type Summary } from './types.js';
 
 const TEST_LABELS: ReadonlySet<LabelKind> = new Set<LabelKind>(['test-modified', 'test-skip-added', 'assertion-removed', 'tests-disabled']);
 
@@ -34,9 +34,13 @@ export function summarize(hunks: AttributedHunk[], sessions: Session[]): Summary
   let intent: Record<IntentVerdict['verdict'], number> | undefined;
   let touchedTests = false;
   const promptIds = new Set<string>();
+  const binary = new Map<string, boolean>(); // file -> explained by an agent edit
 
-  for (const { hunk, coverage, labels: hunkLabels, intent: verdict, prompt } of hunks) {
+  for (const { hunk, coverage, labels: hunkLabels, intent: verdict, prompt, editIds } of hunks) {
     files.add(hunk.file);
+    if (hunk.header === BINARY_HUNK_HEADER && hunk.lines.length === 0) {
+      binary.set(hunk.file, (binary.get(hunk.file) ?? false) || editIds.length > 0);
+    }
     if (prompt) promptIds.add(prompt.id);
     let added = 0;
     for (const line of hunk.lines) {
@@ -79,5 +83,7 @@ export function summarize(hunks: AttributedHunk[], sessions: Session[]): Summary
     sessions: contributingKnown,
     sessionsFound: sessions.length,
     prompts: promptIds.size,
+    binaryFiles: binary.size,
+    unattributedBinaryFiles: [...binary.values()].filter((explained) => !explained).length,
   };
 }

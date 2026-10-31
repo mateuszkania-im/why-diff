@@ -122,6 +122,7 @@ function build(report: Report, o: BuildOpts): string {
     out.push(`| Intent | ${i.requested} requested · ${i.implied} implied · ${i.unrequested} unrequested · ${i.unclear} unclear${h.classifierModel ? ` (${code(h.classifierModel)})` : ''} |`);
   }
   out.push(`| Tests | ${s.touchedTests ? 'touched' : 'untouched'} |`);
+  if (s.binaryFiles) out.push(`| Binary files | ${s.binaryFiles}${!scan && s.unattributedBinaryFiles ? `, ${s.unattributedBinaryFiles} with no agent edit` : ''} |`);
   if (s.ignoredHunks) out.push(`| Ignored | ${plural(s.ignoredHunks, 'hunk')} ignored by config |`);
   out.push('');
 
