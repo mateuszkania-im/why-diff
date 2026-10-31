@@ -8281,7 +8281,7 @@ async function runGuard(payload, opts) {
 }
 async function guard(payload, opts) {
   if (payload.stop_hook_active || !payload.transcript_path) return NO_BLOCK;
-  let root = await repoRoot(payload.cwd ?? process.cwd()), session = await claudeCodeAdapter.parse(payload.transcript_path), paths = [...new Set(session.edits.filter((e) => !e.failed).map((e) => path10.relative(root, e.filePath)).filter((p) => p && !p.startsWith("..") && !path10.isAbsolute(p)))].map((p) => `:(literal)${p.split(path10.sep).join("/")}`);
+  let root = await repoRoot(payload.cwd ?? process.cwd()), session = await claudeCodeAdapter.parse(payload.transcript_path), roots = [root, ...await worktreeRoots(root)].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdVariants = rootVariants(session.cwd), paths = [...new Set(session.edits.filter((e) => !e.failed).map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants)).filter((p) => !!p))].map((p) => `:(literal)${p.split(path10.sep).join("/")}`);
   if (!paths.length) return NO_BLOCK;
   let baseRev = "HEAD";
   if (await hasHead(root)) {
@@ -8302,8 +8302,15 @@ async function guard(payload, opts) {
       for (let l of h.labels)
         opts.blocking.has(l.kind) && (hits.push(`- ${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`), keys.push(`${h.hunk.file}	${l.kind}	${l.detail}`));
   let stateDir = opts.stateDir ?? path10.join(root, ".why-diff"), stateFile = path10.join(stateDir, "guard-state.json"), sessionKey = payload.session_id ?? session.id, hash = createHash2("sha256").update(keys.sort().join(`
-`)).digest("hex"), state = await readState(stateFile);
-  return state[sessionKey] === hash ? { block: !1, hits } : (state[sessionKey] = hash, await writeState(stateDir, stateFile, state), hits.length ? {
+`)).digest("hex"), state = await readState(stateFile), prev = state[sessionKey];
+  if (prev?.hash === hash) return { block: !1, hits };
+  if (hits.length || prev) {
+    state[sessionKey] = { hash, at: (/* @__PURE__ */ new Date()).toISOString() };
+    let cutoff = Date.now() - STATE_TTL_MS;
+    for (let [k, v] of Object.entries(state)) Date.parse(v.at) >= cutoff || delete state[k];
+    await writeState(stateDir, stateFile, state);
+  }
+  return hits.length ? {
     block: !0,
     hits,
     message: `why-diff guard: your changes in this session include risky edits:
@@ -8312,8 +8319,9 @@ ${hits.join(`
 
 Before finishing: if you skipped, weakened or removed tests (or changed CI/secrets), either revert that change or tell the user explicitly what you changed and why, so they can decide. Do not hide it.
 `
-  } : NO_BLOCK);
+  } : NO_BLOCK;
 }
+var STATE_TTL_MS = 30 * 864e5;
 async function readState(file) {
   try {
     let parsed = JSON.parse(await readFile6(file, "utf8"));
@@ -8325,7 +8333,8 @@ async function readState(file) {
 async function writeState(dir, file, state) {
   try {
     await mkdir2(dir, { recursive: !0 }), path10.basename(dir) === ".why-diff" && await writeFile2(path10.join(dir, ".gitignore"), `*
-`), await writeFile2(file, JSON.stringify(state));
+`, { flag: "wx" }).catch(() => {
+    }), await writeFile2(file, JSON.stringify(state));
   } catch {
   }
 }

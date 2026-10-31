@@ -1,5 +1,6 @@
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runGuard } from '../src/guard.js';
@@ -37,8 +38,9 @@ function testFile(): string {
   return s;
 }
 
-function makeRepo(): { repo: string; home: string; stateDir: string } {
-  const repo = temp('why-diff-guard-repo-');
+function makeRepo(realRoot = true): { repo: string; home: string; stateDir: string } {
+  const repo = realRoot ? temp('why-diff-guard-repo-') : mkdtempSync(path.join(os.tmpdir(), 'why-diff-guard-sym-'));
+  if (!realRoot) dirs.push(repo);
   mkdirSync(path.join(repo, 'test'));
   writeFileSync(path.join(repo, 'test', 'f.test.js'), testFile());
   sh(repo, ['init', '-q', '-b', 'main']);
@@ -134,11 +136,40 @@ describe('runGuard', () => {
     expect(r.block).toBe(false);
   });
 
-  it('skips huge untracked files outside the transcript paths', async () => {
-    const { repo, home, stateDir } = makeRepo();
-    const transcript = writeSyntheticTranscript(home, repo, 's-big', [{ prompt: 'add an assertion to t2', at: SESSION_AT, calls: [editCall(repo, ASSERT_OLD, ASSERT_NEW)] }]);
+  it('blocks when the transcript uses a symlinked (non-realpath) location of the repo', async () => {
+    const { repo, home, stateDir } = makeRepo(false);
+    const transcript = writeSyntheticTranscript(home, repo, 's-sym', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
+    applyEdit(repo, SKIP_OLD, SKIP_NEW);
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sym' }, { blocking: BLOCKING, home, stateDir });
+    expect(r.block).toBe(true);
+  });
+
+  it('does not create .why-diff on a clean turn', async () => {
+    const { repo, home } = makeRepo();
+    const transcript = writeSyntheticTranscript(home, repo, 's-clean', [{ prompt: 'add an assertion to t2', at: SESSION_AT, calls: [editCall(repo, ASSERT_OLD, ASSERT_NEW)] }]);
     applyEdit(repo, ASSERT_OLD, ASSERT_NEW);
+    await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-clean' }, { blocking: BLOCKING, home });
+    expect(existsSync(path.join(repo, '.why-diff'))).toBe(false);
+  });
+
+  it('keeps an existing .why-diff/.gitignore and prunes state entries older than 30 days', async () => {
+    const { repo, home } = makeRepo();
+    mkdirSync(path.join(repo, '.why-diff'));
+    writeFileSync(path.join(repo, '.why-diff', '.gitignore'), 'custom\n');
+    const old = new Date(Date.now() - 31 * 86_400_000).toISOString();
+    writeFileSync(path.join(repo, '.why-diff', 'guard-state.json'), JSON.stringify({ stale: { hash: 'x', at: old } }));
+    const transcript = writeSyntheticTranscript(home, repo, 's-prune', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
+    applyEdit(repo, SKIP_OLD, SKIP_NEW);
+    await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-prune' }, { blocking: BLOCKING, home });
+    expect(readFileSync(path.join(repo, '.why-diff', '.gitignore'), 'utf8')).toBe('custom\n');
+    const state = JSON.parse(readFileSync(path.join(repo, '.why-diff', 'guard-state.json'), 'utf8')) as Record<string, unknown>;
+    expect(Object.keys(state)).toEqual(['s-prune']);
+  });
+
+  it('skips a huge untracked file the agent wrote (2 MB cap)', async () => {
+    const { repo, home, stateDir } = makeRepo();
     const big = path.join(repo, 'dump.log');
+    const transcript = writeSyntheticTranscript(home, repo, 's-big', [{ prompt: 'write a dump', at: SESSION_AT, calls: [{ tool: 'Write', at: CALL_AT, input: { file_path: big, content: 'it.skip("x")\n' } }] }]);
     writeFileSync(big, Buffer.alloc(50 * 1024 * 1024, 'a'));
     try {
       const t0 = Date.now();
@@ -148,5 +179,19 @@ describe('runGuard', () => {
     } finally {
       rmSync(big, { force: true });
     }
+  });
+});
+
+describe('why-diff guard CLI', () => {
+  it('exits 2 with the message on stderr when the agent skipped a test, 0 otherwise', () => {
+    const { repo, home } = makeRepo();
+    const transcript = writeSyntheticTranscript(home, repo, 's-cli', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
+    applyEdit(repo, SKIP_OLD, SKIP_NEW);
+    const run = (payload: object) => spawnSync(path.resolve('node_modules/.bin/tsx'), [path.resolve('src/cli.ts'), 'guard'], { input: JSON.stringify(payload), encoding: 'utf8', cwd: repo });
+    const first = run({ transcript_path: transcript, cwd: repo, session_id: 's-cli' });
+    expect(first.status).toBe(2);
+    expect(first.stderr).toContain('test-skip-added');
+    expect(run({ transcript_path: transcript, cwd: repo, session_id: 's-cli' }).status).toBe(0);
+    expect(run({ cwd: repo }).status).toBe(0);
   });
 });

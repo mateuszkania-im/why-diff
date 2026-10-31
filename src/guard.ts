@@ -12,7 +12,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
-import { git, hasHead, repoRoot } from './git.js';
+import { git, hasHead, repoRoot, worktreeRoots } from './git.js';
+import { repoRelativePath, rootVariants } from './attribute.js';
 import type { LabelKind } from './types.js';
 
 export interface GuardPayload {
@@ -52,10 +53,12 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
 
   const root = await repoRoot(payload.cwd ?? process.cwd());
   const session = await claudeCodeAdapter.parse(payload.transcript_path);
+  const roots = [root, ...(await worktreeRoots(root))].flatMap(rootVariants).sort((a, b) => b.length - a.length);
+  const cwdVariants = rootVariants(session.cwd);
   const paths = [...new Set(session.edits
     .filter((e) => !e.failed)
-    .map((e) => path.relative(root, e.filePath))
-    .filter((p) => p && !p.startsWith('..') && !path.isAbsolute(p)))]
+    .map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants))
+    .filter((p): p is string => Boolean(p)))]
     .map((p) => `:(literal)${p.split(path.sep).join('/')}`);
   if (!paths.length) return NO_BLOCK;
 
@@ -92,9 +95,14 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   const sessionKey = payload.session_id ?? session.id;
   const hash = createHash('sha256').update(keys.sort().join('\n')).digest('hex');
   const state = await readState(stateFile);
-  if (state[sessionKey] === hash) return { block: false, hits };
-  state[sessionKey] = hash;
-  await writeState(stateDir, stateFile, state);
+  const prev = state[sessionKey];
+  if (prev?.hash === hash) return { block: false, hits };
+  if (hits.length || prev) {
+    state[sessionKey] = { hash, at: new Date().toISOString() };
+    const cutoff = Date.now() - STATE_TTL_MS;
+    for (const [k, v] of Object.entries(state)) if (!(Date.parse(v.at) >= cutoff)) delete state[k];
+    await writeState(stateDir, stateFile, state);
+  }
 
   if (!hits.length) return NO_BLOCK;
   return {
@@ -107,19 +115,24 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   };
 }
 
-async function readState(file: string): Promise<Record<string, string>> {
+type GuardState = Record<string, { hash: string; at: string }>;
+const STATE_TTL_MS = 30 * 86_400_000;
+
+async function readState(file: string): Promise<GuardState> {
   try {
     const parsed: unknown = JSON.parse(await readFile(file, 'utf8'));
-    return parsed && typeof parsed === 'object' ? (parsed as Record<string, string>) : {};
+    return parsed && typeof parsed === 'object' ? (parsed as GuardState) : {};
   } catch {
     return {};
   }
 }
 
-async function writeState(dir: string, file: string, state: Record<string, string>): Promise<void> {
+async function writeState(dir: string, file: string, state: GuardState): Promise<void> {
   try {
     await mkdir(dir, { recursive: true });
-    if (path.basename(dir) === '.why-diff') await writeFile(path.join(dir, '.gitignore'), '*\n');
+    if (path.basename(dir) === '.why-diff') {
+      await writeFile(path.join(dir, '.gitignore'), '*\n', { flag: 'wx' }).catch(() => {});
+    }
     await writeFile(file, JSON.stringify(state));
   } catch {
     // state is best effort; a failed write only means a possible repeat block

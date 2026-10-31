@@ -423,7 +423,7 @@ export function repoRelativePath(
   return null;
 }
 
-function rootVariants(p: string): string[] {
+export function rootVariants(p: string): string[] {
   if (!p) return [];
   const normalised = path.resolve(p);
   const out = new Set<string>([normalised]);
