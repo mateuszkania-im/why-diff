@@ -73,6 +73,16 @@ describe('Windows-style paths (path logic only)', () => {
     expect(repoRelativePath('D:\\Users\\Dev\\Repo\\a.js', [root])).toBeNull();
   });
 
+  it('resolves . and .. segments before checking containment', () => {
+    expect(repoRelativePath('C:/Users/Dev/Repo/../other/x.js', [root])).toBeNull();
+    expect(repoRelativePath('C:\\Users\\Dev\\Repo\\src\\..\\..\\secret', [root])).toBeNull();
+    expect(repoRelativePath('..\\..\\secret', [root], root)).toBeNull();
+    expect(repoRelativePath('C:/Users/Dev/Repo/./src/a.js', [root])).toBe('src/a.js');
+    expect(repoRelativePath('C:\\Users\\Dev\\Repo\\src\\x\\..\\a.js', [root])).toBe('src/a.js');
+    expect(repoRelativePath('/work/repo/../other/x.js', ['/work/repo'])).toBeNull();
+    expect(repoRelativePath('/work/repo/src/../a.js', ['/work/repo'])).toBe('a.js');
+  });
+
   it('compares session folders case-insensitively on drive paths', () => {
     expect(pathWithin(root, 'c:\\users\\dev\\repo\\sub')).toBe(true);
     expect(pathWithin(root, 'C:/Users/Dev/Repo')).toBe(true);

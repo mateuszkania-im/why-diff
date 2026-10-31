@@ -3304,10 +3304,14 @@ function repoRelativePath(filePath, roots, cwd = "", cwdVariants = rootVariants(
   return null;
 }
 function driveRelativePath(filePath, roots, cwd) {
-  let abs = (DRIVE_PATH.test(filePath) ? filePath : `${cwd}/${filePath}`).normalize("NFC").replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/(?:\.\/)+/g, "/").replace(/\/$/, ""), lower = abs.toLowerCase();
+  let resolved = DRIVE_PATH.test(filePath) ? path3.win32.resolve(filePath) : DRIVE_PATH.test(cwd) ? path3.win32.resolve(cwd, filePath) : null;
+  if (!resolved) return null;
+  let abs = resolved.normalize("NFC").replace(/\\/g, "/").replace(/\/$/, "");
+  if (abs.split("/").includes("..")) return null;
+  let lower = abs.toLowerCase();
   for (let root of roots) {
     if (!DRIVE_PATH.test(root)) continue;
-    let r = driveKey(root.normalize("NFC"));
+    let r = driveKey(path3.win32.resolve(root.normalize("NFC")));
     if (lower === r) return "";
     if (lower.startsWith(`${r}/`) && abs.length === lower.length) return abs.slice(r.length + 1);
   }

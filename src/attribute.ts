@@ -449,11 +449,15 @@ export function repoRelativePath(
 
 /** {@link repoRelativePath} for Windows drive paths: case-insensitive, either slash style. */
 function driveRelativePath(filePath: string, roots: string[], cwd: string): string | null {
-  const abs = (DRIVE_PATH.test(filePath) ? filePath : `${cwd}/${filePath}`).normalize('NFC').replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/(?:\.\/)+/g, '/').replace(/\/$/, '');
+  // win32 resolution handles both slash styles and resolves `.` / `..` before containment is checked.
+  const resolved = DRIVE_PATH.test(filePath) ? path.win32.resolve(filePath) : DRIVE_PATH.test(cwd) ? path.win32.resolve(cwd, filePath) : null;
+  if (!resolved) return null;
+  const abs = resolved.normalize('NFC').replace(/\\/g, '/').replace(/\/$/, '');
+  if (abs.split('/').includes('..')) return null;
   const lower = abs.toLowerCase();
   for (const root of roots) {
     if (!DRIVE_PATH.test(root)) continue;
-    const r = driveKey(root.normalize('NFC'));
+    const r = driveKey(path.win32.resolve(root.normalize('NFC')));
     if (lower === r) return '';
     if (lower.startsWith(`${r}/`) && abs.length === lower.length) return abs.slice(r.length + 1);
   }
