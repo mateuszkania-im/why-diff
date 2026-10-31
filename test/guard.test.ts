@@ -116,7 +116,7 @@ describe('runGuard', () => {
 
   describe('shell deletes and renames of tests', () => {
     const BL = new Set<LabelKind>(['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path']);
-    async function run(cmd: string | null, act: (repo: string) => void): Promise<{ block: boolean; message?: string }> {
+    async function run(cmd: string | null, act: (repo: string) => void, blocking = BL): Promise<{ block: boolean; message?: string }> {
       const { repo, home, stateDir } = makeRepo();
       mkdirSync(path.join(repo, 'src'), { recursive: true });
       writeFileSync(path.join(repo, 'src', 'x.js'), 'export const x = 1;\n');
@@ -127,7 +127,7 @@ describe('runGuard', () => {
       const transcript = writeSyntheticTranscript(home, repo, 's-sh', [{ prompt: 'tidy up', at: SESSION_AT, calls }]);
       writeFileSync(path.join(repo, 'src', 'x.js'), 'export const x = 2;\n');
       act(repo);
-      return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sh' }, { blocking: BL, home, stateDir });
+      return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sh' }, { blocking, home, stateDir });
     }
     it('blocks on rm of a test file', async () => {
       const r = await run('rm $R/test/f.test.js', (repo) => rmSync(path.join(repo, 'test', 'f.test.js')));
@@ -140,6 +140,18 @@ describe('runGuard', () => {
     });
     it('blocks on mv that disables a test file', async () => {
       const r = await run('mv $R/test/f.test.js $R/test/f.test.js.disabled', (repo) => sh(repo, ['mv', 'test/f.test.js', 'test/f.test.js.disabled']));
+      expect(r.block).toBe(true);
+    });
+    it('blocks on git rm -r of the test directory', async () => {
+      const r = await run('cd $R && git rm -r test', (repo) => sh(repo, ['rm', '-rq', 'test']));
+      expect(r.block).toBe(true);
+    });
+    it('blocks on rm -rf of the test directory', async () => {
+      const r = await run('rm -rf $R/test/', (repo) => rmSync(path.join(repo, 'test'), { recursive: true }));
+      expect(r.block).toBe(true);
+    });
+    it('counts a relative git mv of the test directory (test-modified is blocking here: the files keep test names)', async () => {
+      const r = await run('cd $R && git mv test old-test', (repo) => sh(repo, ['mv', 'test', 'old-test']), new Set<LabelKind>(['test-modified']));
       expect(r.block).toBe(true);
     });
     it('does not block on a human rm with no transcript edit', async () => {
