@@ -5,12 +5,12 @@
 Every hunk of an agent's diff, traced back to the prompt you typed and the tool call that wrote it. Hunks nobody asked for, tests that were skipped or weakened, new dependencies and CI edits are flagged before you commit.
 
 ```bash
-npx why-diff            # branch + working tree, in your terminal
-npx why-diff --html     # interactive review page
-npx why-diff --classify # + "did I actually ask for this?" check per hunk
+npx github:mateuszkania-im/why-diff            # branch + working tree, in your terminal
+npx github:mateuszkania-im/why-diff --html     # interactive review page
+npx github:mateuszkania-im/why-diff --classify # + "did I actually ask for this?" check per hunk
 ```
 
-> Not on npm yet? Run it straight from GitHub: `npx github:mateuszkania-im/why-diff` (same flags).
+Installs and builds straight from this repo (Node 20+). Tip: `alias why-diff="npx -y github:mateuszkania-im/why-diff"`. The examples below use `why-diff` for short.
 
 Works with **Claude Code**, **Codex** and **OpenCode** transcripts. Runs locally. No account, no server, no telemetry.
 
@@ -40,7 +40,7 @@ The transcript knows which is which. Claude Code, Codex and OpenCode already rec
 
 ## What you get
 
-The same session in the terminal (`npx why-diff --classify`). One git hunk in `src/cart.js` mixed both prompts and my manual line; why-diff splits it:
+The same session in the terminal (`why-diff --classify`). One git hunk in `src/cart.js` mixed both prompts and my manual line; why-diff splits it:
 
 ```
 why-diff  why-diff-demo  working tree                 fix/discount · 31 Oct 2026
@@ -130,7 +130,7 @@ why-diff guard           Claude Code Stop hook (reads the hook payload from stdi
 Put the Markdown in your PR:
 
 ```bash
-npx why-diff main...HEAD --format md --classify > provenance.md
+why-diff main...HEAD --format md --classify > provenance.md
 gh pr create --body-file provenance.md
 ```
 
