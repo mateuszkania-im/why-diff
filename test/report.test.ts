@@ -385,6 +385,54 @@ describe('renderMarkdown with many long prompts', () => {
   });
 });
 
+describe('control characters from prompts and file names', () => {
+  const ESC = '\u001b';
+  const NASTY = `${ESC}]8;;https://evil.example/${ESC}\\CLICK${ESC}]8;;${ESC}\\ ${ESC}[2J${ESC}[H\u009b31m\u0007bell‮evil⁦x⁩`;
+  function hostile(): Report {
+    const r = clone(sample);
+    for (const p of r.prompts) p.text = `fix it ${NASTY}\tdone\nsecond line`;
+    for (const h of r.hunks) {
+      h.hunk.file = `src/esc${NASTY}.js`;
+      if (h.prompt) h.prompt.text = `fix it ${NASTY}`;
+      for (const e of h.edits) e.rationale = `because ${NASTY}`;
+      h.labels.push({ kind: 'secret-like', severity: 'risk', detail: `detail ${NASTY}` });
+    }
+    r.repo.branch = `main${NASTY}`;
+    r.repo.name = `repo${NASTY}`;
+    return r;
+  }
+  const C0C1 = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
+  const BIDI = /[‪-‮⁦-⁩]/;
+
+  it('the terminal shows escapes as visible glyphs and drops nothing else', () => {
+    for (const verbose of [false, true]) {
+      const out = renderTerminal(hostile(), { color: false, width: 200, verbose });
+      expect(out).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
+      expect(out).not.toMatch(BIDI);
+      expect(out).toContain('␛[2J');
+    }
+    const colored = renderTerminal(hostile(), { color: true, width: 200, verbose: true });
+    expect(colored.replace(/\u001b\[[0-9;]*m/g, '')).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
+  });
+
+  it('the HTML title carries no control or bidi characters', () => {
+    const title = /<title>([^<]*)<\/title>/.exec(renderHtml(hostile()))?.[1] ?? '';
+    expect(title).not.toMatch(C0C1);
+    expect(title).not.toMatch(BIDI);
+  });
+
+  it('markdown and JSON keep the text but strip C0/C1 controls, keeping newlines and tabs', () => {
+    const md = renderMarkdown(hostile());
+    expect(md).not.toMatch(C0C1);
+    expect(md).toContain('CLICK');
+    const json = renderJson(hostile());
+    const parsed = JSON.parse(json) as Report;
+    expect(JSON.stringify(parsed)).not.toMatch(/\\u00(?:0[0-8bcef]|1[0-9a-f]|7f)/);
+    expect(json).not.toMatch(/[\u0080-\u009f]/);
+    expect(parsed.prompts[0]!.text).toContain('\tdone\nsecond line');
+  });
+});
+
 describe('renderHtml', () => {
   const html = renderHtml(sample);
 

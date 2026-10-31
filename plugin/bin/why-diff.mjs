@@ -7781,10 +7781,33 @@ var HTML_ESCAPES = {
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => HTML_ESCAPES[c] ?? c);
 }
+var TERMINAL_UNSAFE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/g, DOCUMENT_UNSAFE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
+function terminalSafe(s) {
+  return s.replace(TERMINAL_UNSAFE, (ch) => {
+    let code2 = ch.charCodeAt(0);
+    return code2 < 32 ? String.fromCharCode(9216 + code2) : code2 === 127 ? "\u2421" : "\uFFFD";
+  });
+}
+function stripControls(s) {
+  return s.replace(DOCUMENT_UNSAFE, "");
+}
+function mapStrings(value, fn) {
+  let walk = (v) => {
+    if (typeof v == "string") return fn(v);
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v == "object") {
+      let out = {};
+      for (let [k, x] of Object.entries(v)) out[fn(k)] = walk(x);
+      return out;
+    }
+    return v;
+  };
+  return walk(value);
+}
 
 // src/report/html.ts
 function renderHtml(report) {
-  let hash = reportHash(report), h = headline(report), s = report.summary, title = `${report.repo.name} \xB7 ${report.range} \xB7 why-diff`, payload = safeJson({ report, hash }), summaryLine = [
+  let hash = reportHash(report), h = headline(report), s = report.summary, title = terminalSafe(`${report.repo.name} \xB7 ${report.range} \xB7 why-diff`), payload = safeJson({ report, hash }), summaryLine = [
     h.noAddedLines ? "no added lines" : `${h.tracedPct}% of added lines trace to a prompt`,
     h.intentRan ? `${plural(h.unrequestedHunks, "hunk")} nobody asked for` : null,
     h.touchedTests ? "tests touched" : "tests untouched",
@@ -8614,14 +8637,14 @@ kbd{display:inline-block;min-width:18px;padding:0 5px;border-radius:4px;border:1
 
 // src/report/json.ts
 function renderJson(report) {
-  return JSON.stringify(report, null, 2) + `
+  return JSON.stringify(mapStrings(report, stripControls), null, 2) + `
 `;
 }
 
 // src/report/markdown.ts
 var DEFAULT_MAX_CHARS = 6e4, MAX_QUOTE = 1500;
-function renderMarkdown(report, opts = {}) {
-  let maxChars = opts.maxChars ?? DEFAULT_MAX_CHARS, maxHunks = Math.max(0, opts.maxHunks ?? 200), maxRisks = Math.max(0, opts.maxRisks ?? 30), maxPrompts = Number.POSITIVE_INFINITY, render = () => build(report, { ...opts, maxHunks, maxRisks, maxPrompts }), md = render();
+function renderMarkdown(untrusted, opts = {}) {
+  let report = mapStrings(untrusted, stripControls), maxChars = opts.maxChars ?? DEFAULT_MAX_CHARS, maxHunks = Math.max(0, opts.maxHunks ?? 200), maxRisks = Math.max(0, opts.maxRisks ?? 30), maxPrompts = Number.POSITIVE_INFINITY, render = () => build(report, { ...opts, maxHunks, maxRisks, maxPrompts }), md = render();
   for (; md.length > maxChars && (maxHunks > 0 || maxRisks > 0); )
     maxHunks = maxHunks > 4 ? Math.floor(maxHunks / 2) : 0, maxRisks = maxRisks > 4 ? Math.floor(maxRisks / 2) : 0, md = render();
   for (md.length > maxChars && (maxPrompts = report.prompts.length); md.length > maxChars && maxPrompts > 0; )
@@ -8769,8 +8792,8 @@ var vlen = (s) => [...s].length, GLYPH = {
   none: "\u2013",
   tests: "\u26A0"
 };
-function renderTerminal(report, opts = {}) {
-  let color = opts.color ?? detectColor(), width = Math.max(MIN_WIDTH, opts.width ?? detectWidth()), verbose = opts.verbose ?? !1, c = import_picocolors.default.createColors(color), wide = width >= WIDE_LAYOUT, bold = c.bold, dim = c.dim, id = (s2) => s2, sevStyle = { risk: c.red, warn: c.yellow, info: c.dim }, verdictStyle = {
+function renderTerminal(untrusted, opts = {}) {
+  let report = mapStrings(untrusted, terminalSafe), color = opts.color ?? detectColor(), width = Math.max(MIN_WIDTH, opts.width ?? detectWidth()), verbose = opts.verbose ?? !1, c = import_picocolors.default.createColors(color), wide = width >= WIDE_LAYOUT, bold = c.bold, dim = c.dim, id = (s2) => s2, sevStyle = { risk: c.red, warn: c.yellow, info: c.dim }, verdictStyle = {
     requested: c.green,
     implied: c.cyan,
     unrequested: c.red,
@@ -9205,7 +9228,7 @@ async function writePrBody(gh, body) {
 var HARNESSES = ["claude-code", "codex", "opencode"], CLASSIFIERS = ["auto", "claude-cli", "anthropic", "openai"], FAIL_ON = ["risk", "unrequested", "tests", "unattributed"], VERSION = "0.2.1", program2 = new Command();
 program2.name("why-diff").enablePositionalOptions().version(VERSION, "-V, --version").description("Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it.").argument("[range]", "git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree").argument("[paths...]", "limit to these paths (give them after --, e.g. why-diff -- src)").option("--base <ref>", "branch or ref to compare against (default: auto-detected, incl. CI pull request targets)").option("-w, --working-tree", "only uncommitted changes vs HEAD").addOption(new Option("-f, --format <format>", "output format").choices(["terminal", "md", "html", "json"])).option("--html", "shortcut for --format html (writes .why-diff/report.html and opens it)").option("-o, --out <file>", "write output to a file instead of stdout").option("--no-open", "do not open the HTML report in a browser").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo (sibling folders, workspace roots) that edited files in it; slower").option("-v, --verbose", "show rationale, commands and label details").option("--fail-on <what>", "exit 1 if: risk | unrequested | tests | unattributed (comma list) \u2014 for CI and hooks").option("--redact-prompts", "omit prompt text and agent rationales from the output (secrets are always masked)").option("-q, --quiet", "no progress output").action(async (rangeArg, pathArgs, o) => {
   let progress = (msg) => {
-    o.quiet || process.stderr.write(import_picocolors2.default.dim(`\xB7 ${msg}
+    o.quiet || process.stderr.write(import_picocolors2.default.dim(`\xB7 ${terminalSafe(msg)}
 `));
   }, format = o.html ? "html" : o.format ?? (o.out && String(o.out).endsWith(".html") ? "html" : "terminal");
   if (!isReportFormat(format)) throw new Error(`unknown format ${format}`);
@@ -9262,7 +9285,7 @@ program2.name("why-diff").enablePositionalOptions().version(VERSION, "-V, --vers
 });
 program2.command("pr").description("put the report into the current branch's pull request body (gh pr edit); never pushes or creates a PR").option("--base <ref>", "branch or ref the PR targets (default: auto-detected)").option("--include-uncommitted", "also include uncommitted changes (default: committed work only, <base>...HEAD)").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo that edited files in it; slower").option("--redact-prompts", "omit prompt text and agent rationales (secrets are always masked)").option("--dry-run", "print the new PR body instead of editing the PR").option("-q, --quiet", "no progress output").action(async (o) => {
   let progress = (msg) => {
-    o.quiet || process.stderr.write(import_picocolors2.default.dim(`\xB7 ${msg}
+    o.quiet || process.stderr.write(import_picocolors2.default.dim(`\xB7 ${terminalSafe(msg)}
 `));
   }, classify = "none";
   if (o.classify === !0) classify = "auto";
@@ -9304,7 +9327,7 @@ program2.command("guard").description("Claude Code Stop hook: block the agent fr
   } catch {
   }
   let blocking = o.on === void 0 ? void 0 : new Set(o.on.split(",").map((s) => s.trim()).filter(Boolean)), result = await runGuard(payload, { blocking });
-  result.block && (process.stderr.write(result.message ?? ""), process.exitCode = 2);
+  result.block && (process.stderr.write(terminalSafe(result.message ?? "")), process.exitCode = 2);
 });
 function separatorIndex(args, cmd) {
   let byFlag = /* @__PURE__ */ new Map();
@@ -9364,6 +9387,6 @@ function openFile(file) {
 }
 program2.parseAsync().catch((err) => {
   let msg = err instanceof Error ? err.message : String(err);
-  process.stderr.write(import_picocolors2.default.red(`why-diff: ${msg}
+  process.stderr.write(import_picocolors2.default.red(`why-diff: ${terminalSafe(msg)}
 `)), process.exitCode = 2;
 });

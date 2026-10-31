@@ -22,6 +22,8 @@ import {
   shortSession,
   shortTime,
   sortLabels,
+  terminalSafe,
+  mapStrings,
   truncate,
 } from './shared.js';
 
@@ -68,7 +70,9 @@ const GLYPH = {
   tests: '⚠',
 } as const;
 
-export function renderTerminal(report: Report, opts: TerminalOptions = {}): string {
+export function renderTerminal(untrusted: Report, opts: TerminalOptions = {}): string {
+  // Prompts, file names, branch names and label details are untrusted: no escape sequence reaches the terminal.
+  const report = mapStrings(untrusted, terminalSafe);
   const color = opts.color ?? detectColor();
   const width = Math.max(MIN_WIDTH, opts.width ?? detectWidth());
   const verbose = opts.verbose ?? false;

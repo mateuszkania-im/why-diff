@@ -3,7 +3,8 @@
  * Key order follows the Report type so diffs between runs stay readable.
  */
 import type { Report } from '../types.js';
+import { mapStrings, stripControls } from './shared.js';
 
 export function renderJson(report: Report): string {
-  return JSON.stringify(report, null, 2) + '\n';
+  return JSON.stringify(mapStrings(report, stripControls), null, 2) + '\n';
 }

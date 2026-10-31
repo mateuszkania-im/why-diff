@@ -23,6 +23,8 @@ import {
   shortSession,
   shortTime,
   sortLabels,
+  mapStrings,
+  stripControls,
   truncate,
   type RiskItem,
 } from './shared.js';
@@ -42,7 +44,8 @@ const DEFAULT_MAX_CHARS = 60_000;
 /** Longest prompt quote, in characters, before it is cut with an ellipsis. */
 const MAX_QUOTE = 1500;
 
-export function renderMarkdown(report: Report, opts: MarkdownOptions = {}): string {
+export function renderMarkdown(untrusted: Report, opts: MarkdownOptions = {}): string {
+  const report = mapStrings(untrusted, stripControls);
   const maxChars = opts.maxChars ?? DEFAULT_MAX_CHARS;
   let maxHunks = Math.max(0, opts.maxHunks ?? 200);
   let maxRisks = Math.max(0, opts.maxRisks ?? 30);

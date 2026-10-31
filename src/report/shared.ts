@@ -261,3 +261,44 @@ export function escapeHtml(s: string): string {
 }
 
 export const VERDICT_ORDER = ['unrequested', 'unclear', 'implied', 'requested'] as const;
+
+// ---------------------------------------------------------------------------
+// Control characters (prompts and file names are untrusted text)
+// ---------------------------------------------------------------------------
+
+const TERMINAL_UNSAFE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/g;
+const DOCUMENT_UNSAFE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
+
+/**
+ * Text safe to print on a terminal: C0 controls become their visible Control Pictures
+ * (ESC shows as `␛`, DEL as `␡`), C1 controls and bidi overrides/isolates become U+FFFD.
+ * Tab and newline stay.
+ */
+export function terminalSafe(s: string): string {
+  return s.replace(TERMINAL_UNSAFE, (ch) => {
+    const code = ch.charCodeAt(0);
+    if (code < 0x20) return String.fromCharCode(0x2400 + code);
+    if (code === 0x7f) return '␡';
+    return '�';
+  });
+}
+
+/** Text for Markdown and JSON: C0/C1 controls removed, except tab, newline and carriage return. */
+export function stripControls(s: string): string {
+  return s.replace(DOCUMENT_UNSAFE, '');
+}
+
+/** A deep copy of `value` with `fn` applied to every string in it (object keys included). */
+export function mapStrings<T>(value: T, fn: (s: string) => string): T {
+  const walk = (v: unknown): unknown => {
+    if (typeof v === 'string') return fn(v);
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [k, x] of Object.entries(v as Record<string, unknown>)) out[fn(k)] = walk(x);
+      return out;
+    }
+    return v;
+  };
+  return walk(value) as T;
+}

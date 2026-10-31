@@ -14,6 +14,7 @@ import pc from 'picocolors';
 import { buildReport } from './pipeline.js';
 import { redactReport } from './redact.js';
 import { renderReport, isReportFormat, type ReportFormat } from './report/index.js';
+import { terminalSafe } from './report/shared.js';
 import type { Harness, LabelKind } from './types.js';
 import { git } from './git.js';
 import { runGuard, type GuardPayload } from './guard.js';
@@ -55,7 +56,7 @@ program
   .option('--redact-prompts', 'omit prompt text and agent rationales from the output (secrets are always masked)')
   .option('-q, --quiet', 'no progress output')
   .action(async (rangeArg: string | undefined, pathArgs: string[], o: Record<string, unknown>) => {
-    const progress = (msg: string) => { if (!o.quiet) process.stderr.write(pc.dim(`· ${msg}\n`)); };
+    const progress = (msg: string) => { if (!o.quiet) process.stderr.write(pc.dim(`· ${terminalSafe(msg)}\n`)); };
     const format: ReportFormat = o.html ? 'html' : (o.format as ReportFormat | undefined) ?? (o.out && String(o.out).endsWith('.html') ? 'html' : 'terminal');
     if (!isReportFormat(format)) throw new Error(`unknown format ${format}`);
 
@@ -163,7 +164,7 @@ program
   .option('--dry-run', 'print the new PR body instead of editing the PR')
   .option('-q, --quiet', 'no progress output')
   .action(async (o: Record<string, unknown>) => {
-    const progress = (msg: string) => { if (!o.quiet) process.stderr.write(pc.dim(`· ${msg}\n`)); };
+    const progress = (msg: string) => { if (!o.quiet) process.stderr.write(pc.dim(`· ${terminalSafe(msg)}\n`)); };
     let classify: ClassifierKind = 'none';
     if (o.classify === true) classify = 'auto';
     else if (o.classify) {
@@ -224,7 +225,7 @@ program
     const blocking = o.on === undefined ? undefined : (new Set(o.on.split(',').map((s) => s.trim()).filter(Boolean)) as Set<LabelKind>);
     const result = await runGuard(payload, { blocking });
     if (!result.block) return;
-    process.stderr.write(result.message ?? '');
+    process.stderr.write(terminalSafe(result.message ?? ''));
     process.exitCode = 2;
   });
 
@@ -310,6 +311,6 @@ function openFile(file: string): void {
 
 program.parseAsync().catch((err: unknown) => {
   const msg = err instanceof Error ? err.message : String(err);
-  process.stderr.write(pc.red(`why-diff: ${msg}\n`));
+  process.stderr.write(pc.red(`why-diff: ${terminalSafe(msg)}\n`));
   process.exitCode = 2;
 });

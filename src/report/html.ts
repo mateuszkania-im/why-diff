@@ -9,13 +9,13 @@
  * createElement); innerHTML is never used with report content.
  */
 import type { Report } from '../types.js';
-import { escapeHtml, headline, plural, reportHash } from './shared.js';
+import { escapeHtml, headline, plural, reportHash, terminalSafe } from './shared.js';
 
 export function renderHtml(report: Report): string {
   const hash = reportHash(report);
   const h = headline(report);
   const s = report.summary;
-  const title = `${report.repo.name} · ${report.range} · why-diff`;
+  const title = terminalSafe(`${report.repo.name} · ${report.range} · why-diff`);
   const payload = safeJson({ report, hash });
   const summaryLine = [
     h.noAddedLines ? 'no added lines' : `${h.tracedPct}% of added lines trace to a prompt`,
