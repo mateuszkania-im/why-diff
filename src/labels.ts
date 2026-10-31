@@ -631,7 +631,8 @@ function detectTestsDisabled(path: string, hunk: AttributedHunk['hunk'], lines: 
   const base = posix.basename(path);
 
   // A test file deleted outright (unless the code it tests is deleted or moved in the same diff).
-  const sourceGone = (scope.goneSourceStems.get(testStem(base)) ?? []).some((dir) => relatedDirs(path, dir));
+  const goneDirs = scope.goneSourceStems.get(testStem(base)) ?? [];
+  const sourceGone = goneDirs.some((dir) => relatedDirs(path, dir, goneDirs.length));
   if (hunk.status === 'deleted' && isTestFile(path) && !sourceGone) {
     hits.push(`Deletes test file ${base}`);
   }
@@ -709,18 +710,29 @@ const PY_TEST_NAME = /^test_[^/]*\.py$|_test\.py$/;
  * Is a test at `testPath` plausibly the test of a source file in `srcDir`? Same directory, or the
  * trees mirror each other once layout-only segments are dropped: `test/x.test.js` and `src/x.js`,
  * `__tests__/x.test.js` and `x.js`, `src/test/java/com/a/FooTest.java` and
- * `src/main/java/com/a/Foo.java`. Python tests (`test_<stem>.py`, `<stem>_test.py`) in a top-level
- * test tree pair with the package anywhere (`tests/test_foo.py` and `src/pkg/foo.py`).
+ * `src/main/java/com/a/Foo.java`. A Python test (`test_<stem>.py`, `<stem>_test.py`) in a
+ * top-level test tree (`tests/test_foo.py`) pairs with a package source only when it is the one
+ * same-stem source gone in the diff (`candidates`) and sits at the repo root, under `src/`/`lib/`
+ * or in a package directory, not in a tooling root such as `tools/` or `scripts/`.
  */
-function relatedDirs(testPath: string, srcDir: string): boolean {
+function relatedDirs(testPath: string, srcDir: string, candidates: number): boolean {
   const testDir = posix.dirname(testPath);
   if (testDir === srcDir) return true;
   const norm = (dir: string): string => dir.split('/').filter((s) => s && s !== '.' && !LAYOUT_SEGMENTS.has(s)).join('/');
   const t = norm(testDir);
   const src = norm(srcDir);
   if (t === src) return true;
-  if (PY_TEST_NAME.test(posix.basename(testPath))) return t === '' || src.endsWith(`/${t}`);
+  if (PY_TEST_NAME.test(posix.basename(testPath))) return t === '' ? candidates === 1 && sourceLikeDir(srcDir) : src.endsWith(`/${t}`);
   return false;
+}
+
+/** Top-level directories that hold tooling, not the package under test. */
+const NON_SOURCE_ROOTS = new Set(['tools', 'tool', 'scripts', 'script', 'bin', 'docs', 'doc', 'examples', 'example', 'build', 'dist', 'vendor', 'third_party', 'bench', 'benchmarks', 'migrations', 'ci', '.github']);
+
+/** The repo root, `src/`, `lib/`, or a top-level package directory (anything but a tooling root). */
+function sourceLikeDir(dir: string): boolean {
+  if (dir === '.') return true;
+  return !NON_SOURCE_ROOTS.has(dir.split('/')[0] ?? '');
 }
 
 function detectCiSwallowedTests(lines: DiffLine[], added: Set<DiffLine>): string[] {

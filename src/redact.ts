@@ -121,8 +121,24 @@ export function redactKeys(text: string): string {
   return out;
 }
 
-/** Mask secrets in free text (prompts, rationales). Idempotent; ordinary text is returned unchanged. */
-export function redactSecrets(text: string): string {
+/**
+ * How much a dotted value after a secret name (`password = my.secret.pass`) is trusted to be code.
+ * - `strict` (default): prompts, rationales, intent reasons, session titles, classifier input.
+ *   Masked whatever the spacing and punctuation, unless it starts at a known code root or is a call.
+ * - `code`: edit bodies and commands, where such lines are mostly code. Masked only on .env, CLI
+ *   and YAML-shaped lines (see {@link dottedSecret}).
+ */
+export type RedactMode = 'strict' | 'code';
+
+/** Code roots that keep a dotted value in strict mode (`password = body.pass` names a field, not a secret). */
+const STRICT_CODE_ROOTS = /^(?:(?:process|config|env|os|self|this|settings|event|req|res|response|body)\.|e\.target\.)/i;
+
+function strictDotted(segs: string[], v: string): boolean {
+  return EXACT_SECRET_NAMES.has(segs[segs.length - 1] ?? '') && !/\d/.test(v) && !STRICT_CODE_ROOTS.test(v);
+}
+
+/** Mask secrets in free text (prompts, rationales; `code` mode for edit bodies). Idempotent; ordinary text is returned unchanged. */
+export function redactSecrets(text: string, mode: RedactMode = 'strict'): string {
   if (!text) return text;
   let out = redactKeys(text);
   out = out.replace(NAME_VALUE, (m: string, head: string, q: string, name: string, op: string, dq?: string, sq?: string, bare?: string, offset?: number, str?: string) => {
@@ -138,10 +154,13 @@ export function redactSecrets(text: string): string {
     }
     const v = bare ?? '';
     if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase())) return m;
-    if (MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dottedSecret(segs, v, head, op, str ?? '', offset ?? 0, (offset ?? 0) + m.length)) return m;
+    const dotted = MEMBER_PATH.test(v) && (mode === 'strict'
+      ? strictDotted(segs, v)
+      : dottedSecret(segs, v, head, op, str ?? '', offset ?? 0, (offset ?? 0) + m.length));
+    if (MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dotted) return m;
     if (!strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
     // `name: word` is usually prose; an all-letter (or dotted all-letter) value needs a config-like line.
-    if (op === ':' && /^[A-Za-z]+(?:\.[A-Za-z]+)*$/.test(v)) {
+    if (op === ':' && /^[A-Za-z]+(?:\.[A-Za-z]+)*$/.test(v) && !(mode === 'strict' && dotted)) {
       const text = str ?? '';
       const at = offset ?? 0;
       // Bounded look-around keeps this linear on very long lines.
@@ -171,6 +190,7 @@ const mapOpt = (v: string | null | undefined, f: (s: string) => string) => (type
 export function redactReport(report: Report, mode: 'secrets' | 'prompts'): Report {
   const strip = mode === 'prompts';
   const text = (s: string) => redactSecrets(s);
+  const code = (s: string) => redactSecrets(s, 'code');
   const promptText = (p: { index: number; text: string }) => (strip ? `[prompt ${p.index + 1} redacted]` : text(p.text));
   const rationale = <T extends { rationale?: string }>(e: T): T => {
     const { rationale: r, ...rest } = e;
@@ -182,9 +202,9 @@ export function redactReport(report: Report, mode: 'secrets' | 'prompts'): Repor
     const r = rationale(e);
     edits[id] = {
       ...r,
-      oldText: mapOpt(r.oldText, text) as string | null,
-      newText: mapOpt(r.newText, text) as string | null,
-      ...(r.command !== undefined ? { command: text(r.command) } : {}),
+      oldText: mapOpt(r.oldText, code) as string | null,
+      newText: mapOpt(r.newText, code) as string | null,
+      ...(r.command !== undefined ? { command: code(r.command) } : {}),
     };
   }
   return {

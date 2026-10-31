@@ -933,6 +933,18 @@ describe('tests-disabled', () => {
     expect(t?.labels.map((l) => l.kind)).not.toContain('tests-disabled');
   });
 
+  it('Python: a top-level test pairs only with a single same-stem source under a source-like root', () => {
+    const labelsOf = (testPath: string, ...srcs: string[]): LabelKind[] => {
+      const test = renameHunk(testPath, '', 'deleted', ['-def test_x(): pass']);
+      const gone = srcs.map((p) => renameHunk(p, '', 'deleted', ['-x = 1']));
+      return labelHunks([test, ...gone], ctx)[0]?.labels.map((l) => l.kind) ?? [];
+    };
+    expect(labelsOf('tests/test_foo.py', 'src/pkg/foo.py')).not.toContain('tests-disabled');
+    expect(labelsOf('tests/test_foo.py', 'foo.py')).not.toContain('tests-disabled');
+    expect(labelsOf('tests/test_foo.py', 'scripts/old/foo.py', 'src/pkg/foo.py')).toContain('tests-disabled');
+    expect(labelsOf('tests/test_foo.py', 'tools/foo.py')).toContain('tests-disabled');
+  });
+
   it.each([
     ['test/index.test.js', 'x/index.js'],
     ['src/test/java/com/a/FooTest.java', 'src/main/java/com/b/Foo.java'],

@@ -245,8 +245,39 @@ describe('redactSecrets: residuals (0.2.1)', () => {
     'password = body.pass',
     'const secret = crypto.webcrypto',
     'let password=form.value;',
-  ])('keeps code references: %s', (t) => {
+  ])('keeps code references in code mode (edit bodies): %s', (t) => {
+    expect(redactSecrets(t, 'code')).toBe(t);
+  });
+  it.each([
+    ['use password = my.secret.pass; then deploy', 'my.secret.pass'],
+    ['password: hunter.two, and', 'hunter.two'],
+    ['set pwd=alpha.beta, then run', 'alpha.beta'],
+    ['the secret is secret = open.sesame;', 'open.sesame'],
+  ])('strict mode (prompts, the default) masks dotted values whatever the shape: %s', (t, leak) => {
+    expect(redactSecrets(t)).not.toContain(leak);
+    expect(redactSecrets(t, 'strict')).not.toContain(leak);
+  });
+  it.each([
+    'password = body.pass',
+    'password = event.target.value',
+    'password = e.target.value;',
+    'secret = response.data',
+    'password = req.body',
+    'password = config.db.password',
+    'password = getPassword()',
+  ])('strict mode keeps code roots and calls: %s', (t) => {
     expect(redactSecrets(t)).toBe(t);
+  });
+  it('redactReport masks prompts strictly and edit bodies in code mode', () => {
+    const report = {
+      prompts: [{ id: 'p', index: 0, text: 'use password = my.secret.pass; then deploy' }],
+      sessions: [],
+      edits: { e: { id: 'e', oldText: null, newText: 'const password = e.target.value;', command: 'echo ok' } },
+      hunks: [],
+    } as unknown as Report;
+    const out = redactReport(report, 'secrets');
+    expect(out.prompts[0]?.text).not.toContain('my.secret.pass');
+    expect(out.edits.e?.newText).toBe('const password = e.target.value;');
   });
   it('masks a bare Basic credential without digits when it decodes to user:pass', () => {
     expect(Buffer.from('dXNlcjpwYXNz', 'base64').toString()).toBe('user:pass');

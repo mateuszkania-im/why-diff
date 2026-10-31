@@ -3645,7 +3645,11 @@ function redactKeys(text2) {
     re.source.includes("PRIVATE KEY") || (out = out.replace(new RegExp(re.source, "g"), (m) => `${m.slice(0, m.startsWith("sk-ant-") ? 7 : 4)}${DOTS}`));
   return out;
 }
-function redactSecrets(text2) {
+var STRICT_CODE_ROOTS = /^(?:(?:process|config|env|os|self|this|settings|event|req|res|response|body)\.|e\.target\.)/i;
+function strictDotted(segs, v) {
+  return EXACT_SECRET_NAMES.has(segs[segs.length - 1] ?? "") && !/\d/.test(v) && !STRICT_CODE_ROOTS.test(v);
+}
+function redactSecrets(text2, mode = "strict") {
   if (!text2) return text2;
   let out = redactKeys(text2);
   return out = out.replace(NAME_VALUE, (m, head, q, name, op, dq, sq, bare, offset, str3) => {
@@ -3657,8 +3661,10 @@ function redactSecrets(text2) {
       return `${head}${quote2}${DOTS}${quote2}`;
     }
     let v = bare ?? "";
-    if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase()) || MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dottedSecret(segs, v, head, op, str3 ?? "", offset ?? 0, (offset ?? 0) + m.length) || !strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
-    if (op === ":" && /^[A-Za-z]+(?:\.[A-Za-z]+)*$/.test(v)) {
+    if (ENV_REF.test(v) || CALL.test(v) || CODE_WORDS.has(v.toLowerCase())) return m;
+    let dotted = MEMBER_PATH.test(v) && (mode === "strict" ? strictDotted(segs, v) : dottedSecret(segs, v, head, op, str3 ?? "", offset ?? 0, (offset ?? 0) + m.length));
+    if (MEMBER_PATH.test(v) && (!/\d/.test(v) || CODE_ROOTS.test(v)) && !dotted || !strong && !(secretSuffix(segs) && /^(?=.*\d)(?=.*[A-Za-z]).{8,}$/.test(v))) return m;
+    if (op === ":" && /^[A-Za-z]+(?:\.[A-Za-z]+)*$/.test(v) && !(mode === "strict" && dotted)) {
       let text3 = str3 ?? "", at = offset ?? 0, WINDOW = 200, back = text3.slice(Math.max(0, at - WINDOW), at), nl = back.lastIndexOf(`
 `), prefix = nl !== -1 ? back.slice(nl + 1) : at <= WINDOW || /^\s*$/.test(back) ? back : null, configLike = q !== "" || prefix !== null && /^[\s{,-]*$/.test(prefix), after = at + m.length, rest = text3.slice(after, after + WINDOW).split(`
 `, 1)[0] ?? "";
@@ -3669,7 +3675,7 @@ function redactSecrets(text2) {
 }
 var mapOpt = (v, f) => typeof v == "string" ? f(v) : v;
 function redactReport(report, mode) {
-  let strip = mode === "prompts", text2 = (s) => redactSecrets(s), promptText = (p) => strip ? `[prompt ${p.index + 1} redacted]` : text2(p.text), rationale = (e) => {
+  let strip = mode === "prompts", text2 = (s) => redactSecrets(s), code2 = (s) => redactSecrets(s, "code"), promptText = (p) => strip ? `[prompt ${p.index + 1} redacted]` : text2(p.text), rationale = (e) => {
     let { rationale: r, ...rest } = e;
     return strip || r === void 0 ? rest : { ...rest, rationale: text2(r) };
   }, edits = {};
@@ -3677,9 +3683,9 @@ function redactReport(report, mode) {
     let r = rationale(e);
     edits[id] = {
       ...r,
-      oldText: mapOpt(r.oldText, text2),
-      newText: mapOpt(r.newText, text2),
-      ...r.command !== void 0 ? { command: text2(r.command) } : {}
+      oldText: mapOpt(r.oldText, code2),
+      newText: mapOpt(r.newText, code2),
+      ...r.command !== void 0 ? { command: code2(r.command) } : {}
     };
   }
   return {
@@ -4071,7 +4077,7 @@ function detectPytestOptions(lines, added, base) {
   return hits;
 }
 function detectTestsDisabled(path13, hunk, lines, scope) {
-  let hits = [], base = posix.basename(path13), sourceGone = (scope.goneSourceStems.get(testStem(base)) ?? []).some((dir) => relatedDirs(path13, dir));
+  let hits = [], base = posix.basename(path13), goneDirs = scope.goneSourceStems.get(testStem(base)) ?? [], sourceGone = goneDirs.some((dir) => relatedDirs(path13, dir, goneDirs.length));
   if (hunk.status === "deleted" && isTestFile(path13) && !sourceGone && hits.push(`Deletes test file ${base}`), hunk.status === "renamed" && hunk.oldFile && isTestFile(hunk.oldFile)) {
     let oldBase = posix.basename(hunk.oldFile);
     if (oldBase !== base && TEST_BASENAME.test(oldBase)) {
@@ -4119,11 +4125,15 @@ function goneSourceStems(hunks, repoRoot2) {
   return out;
 }
 var LAYOUT_SEGMENTS = /* @__PURE__ */ new Set(["test", "tests", "__tests__", "__test__", "spec", "specs", "src", "lib", "source", "main", "app"]), PY_TEST_NAME = /^test_[^/]*\.py$|_test\.py$/;
-function relatedDirs(testPath, srcDir) {
+function relatedDirs(testPath, srcDir, candidates) {
   let testDir = posix.dirname(testPath);
   if (testDir === srcDir) return !0;
   let norm = (dir) => dir.split("/").filter((s) => s && s !== "." && !LAYOUT_SEGMENTS.has(s)).join("/"), t = norm(testDir), src = norm(srcDir);
-  return t === src ? !0 : PY_TEST_NAME.test(posix.basename(testPath)) ? t === "" || src.endsWith(`/${t}`) : !1;
+  return t === src ? !0 : PY_TEST_NAME.test(posix.basename(testPath)) ? t === "" ? candidates === 1 && sourceLikeDir(srcDir) : src.endsWith(`/${t}`) : !1;
+}
+var NON_SOURCE_ROOTS = /* @__PURE__ */ new Set(["tools", "tool", "scripts", "script", "bin", "docs", "doc", "examples", "example", "build", "dist", "vendor", "third_party", "bench", "benchmarks", "migrations", "ci", ".github"]);
+function sourceLikeDir(dir) {
+  return dir === "." ? !0 : !NON_SOURCE_ROOTS.has(dir.split("/")[0] ?? "");
 }
 function detectCiSwallowedTests(lines, added) {
   let hits = [], indentOf = (t) => t.length - t.trimStart().length, stepStart = /^\s*-\s+[\w-]+:/, block = [], boundary = -1, implicit = !1, flush = () => {
