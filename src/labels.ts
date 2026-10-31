@@ -14,6 +14,7 @@
  */
 import { posix } from 'node:path';
 import type { AttributedHunk, DiffLine, Label, LabelKind, Prompt } from './types.js';
+import { SECRET_RULES } from './redact.js';
 
 export interface LabelContext {
   prompts: Prompt[];
@@ -1071,25 +1072,6 @@ function detectTypeAny(path: string, lines: DiffLine[]): string[] {
 // ---------------------------------------------------------------------------
 // secret-like
 // ---------------------------------------------------------------------------
-
-interface SecretRule {
-  re: RegExp;
-  name: string;
-}
-
-/** Well-known token formats. Matches are masked to their public prefix. */
-const SECRET_RULES: readonly SecretRule[] = [
-  { re: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/, name: 'private key' },
-  { re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/, name: 'AWS access key' },
-  { re: /\bsk-(?:proj-|ant-(?:api\d\d-)?)?[A-Za-z0-9_-]{20,}/, name: 'API secret key (sk-)' },
-  { re: /\b(?:sk|rk)_live_[0-9a-zA-Z]{20,}/, name: 'Stripe live key' },
-  { re: /\bgh[pousr]_[A-Za-z0-9]{36,}\b/, name: 'GitHub token' },
-  { re: /\bgithub_pat_[A-Za-z0-9_]{40,}/, name: 'GitHub token' },
-  { re: /\bglpat-[A-Za-z0-9_-]{20,}/, name: 'GitLab token' },
-  { re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/, name: 'Slack token' },
-  { re: /\bAIza[0-9A-Za-z_-]{35}\b/, name: 'Google API key' },
-  { re: /\bnpm_[A-Za-z0-9]{36}\b/, name: 'npm token' },
-];
 
 /** Quoted 32+ char values, the candidates for `apiKey = "…"`, `"client_secret": "…"`, `token := "…"`. */
 const QUOTED_LONG_VALUE = /["'`]([^"'`\s]{32,})["'`]/g;

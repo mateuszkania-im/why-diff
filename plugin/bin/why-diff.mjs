@@ -3545,6 +3545,57 @@ function shorten(s, max) {
 
 // src/labels.ts
 import { posix } from "node:path";
+
+// src/redact.ts
+var SECRET_RULES = [
+  { re: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/, name: "private key" },
+  { re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/, name: "AWS access key" },
+  { re: /\bsk-(?:proj-|ant-(?:api\d\d-)?)?[A-Za-z0-9_-]{20,}/, name: "API secret key (sk-)" },
+  { re: /\b(?:sk|rk)_live_[0-9a-zA-Z]{20,}/, name: "Stripe live key" },
+  { re: /\bgh[pousr]_[A-Za-z0-9]{36,}\b/, name: "GitHub token" },
+  { re: /\bgithub_pat_[A-Za-z0-9_]{40,}/, name: "GitHub token" },
+  { re: /\bglpat-[A-Za-z0-9_-]{20,}/, name: "GitLab token" },
+  { re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/, name: "Slack token" },
+  { re: /\bAIza[0-9A-Za-z_-]{35}\b/, name: "Google API key" },
+  { re: /\bnpm_[A-Za-z0-9]{36}\b/, name: "npm token" }
+], DOTS = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022", PRIVATE_KEY_BLOCK = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:'"`]+:[^\s/@'"`]+@/gi, ASSIGNMENT = /\b((?:[A-Za-z_][\w.-]*?)?(?:passw(?:or)?d|passwd|pwd|secret|token|api[_-]?key|credentials?)[\w-]*)(\s*=\s*)(["']?)([^\s"'`]+)\3/gi, EMAIL = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/g;
+function redactSecrets(text2) {
+  if (!text2) return text2;
+  let out = text2.replace(PRIVATE_KEY_BLOCK, "-----PRIVATE KEY REDACTED-----");
+  out = out.replace(URL_CREDENTIALS, (_m, scheme) => `${scheme}${DOTS}@`);
+  for (let { re } of SECRET_RULES)
+    re.source.includes("PRIVATE KEY") || (out = out.replace(new RegExp(re.source, "g"), (m) => `${m.slice(0, m.startsWith("sk-ant-") ? 7 : 4)}${DOTS}`));
+  return out = out.replace(ASSIGNMENT, (m, name, eq, q, value) => /^[•$]|^\{\{|^process\.env|^os\.environ/.test(value) ? m : `${name}${eq}${q}${DOTS}${q}`), out = out.replace(EMAIL, "[email redacted]"), out;
+}
+var mapOpt = (v, f) => typeof v == "string" ? f(v) : v;
+function redactReport(report, mode) {
+  let strip = mode === "prompts", text2 = (s) => redactSecrets(s), promptText = (p) => strip ? `[prompt ${p.index + 1} redacted]` : text2(p.text), rationale = (e) => {
+    let { rationale: r, ...rest } = e;
+    return strip || r === void 0 ? rest : { ...rest, rationale: text2(r) };
+  }, edits = {};
+  for (let [id, e] of Object.entries(report.edits)) {
+    let r = rationale(e);
+    edits[id] = {
+      ...r,
+      oldText: mapOpt(r.oldText, text2),
+      newText: mapOpt(r.newText, text2),
+      ...r.command !== void 0 ? { command: text2(r.command) } : {}
+    };
+  }
+  return {
+    ...report,
+    sessions: report.sessions.map((s) => strip ? { ...s, title: void 0 } : { ...s, ...s.title !== void 0 ? { title: text2(s.title) } : {} }),
+    prompts: report.prompts.map((p) => ({ ...p, text: promptText(p) })),
+    edits,
+    hunks: report.hunks.map((h) => ({
+      ...h,
+      edits: h.edits.map(rationale),
+      ...h.prompt ? { prompt: { ...h.prompt, text: promptText(h.prompt) } } : {}
+    }))
+  };
+}
+
+// src/labels.ts
 var DETAIL_MAX = 120;
 function labelHunks(hunks, ctx) {
   let scope = buildScopeIndex(hunks, ctx);
@@ -3918,11 +3969,11 @@ function parseAssertion(line, path12) {
   }
   return SHOULD.test(code2) ? { ...base, matcher: "should", display: "should", negated: /should_not|\.not\b/.test(code2), operands: [] } : null;
 }
-var ASSIGNMENT = /^\s*(?:(?:const|let|var|val|final|auto)\s+)?(?:[A-Z][\w<>[\],.?]*\s+)?([A-Za-z_$][\w$]*)(?:\s*:\s*[^=]+?)?\s*(?::=|=(?![=>]))\s*(.+?)\s*;?\s*$/;
+var ASSIGNMENT2 = /^\s*(?:(?:const|let|var|val|final|auto)\s+)?(?:[A-Z][\w<>[\],.?]*\s+)?([A-Za-z_$][\w$]*)(?:\s*:\s*[^=]+?)?\s*(?::=|=(?![=>]))\s*(.+?)\s*;?\s*$/;
 function collectAliases(lines, path12) {
   let style = commentStyle(path12), out = /* @__PURE__ */ new Map();
   for (let l of lines) {
-    let m = ASSIGNMENT.exec(codeOf(l.text, style));
+    let m = ASSIGNMENT2.exec(codeOf(l.text, style));
     m?.[1] && m[2] && !EXPECT_CALL.test(m[2]) && out.set(m[1], m[2].replace(/\s+/g, ""));
   }
   return out;
@@ -4198,18 +4249,7 @@ function detectTypeAny(path12, lines) {
   }
   return uniq(hits);
 }
-var SECRET_RULES = [
-  { re: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/, name: "private key" },
-  { re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/, name: "AWS access key" },
-  { re: /\bsk-(?:proj-|ant-(?:api\d\d-)?)?[A-Za-z0-9_-]{20,}/, name: "API secret key (sk-)" },
-  { re: /\b(?:sk|rk)_live_[0-9a-zA-Z]{20,}/, name: "Stripe live key" },
-  { re: /\bgh[pousr]_[A-Za-z0-9]{36,}\b/, name: "GitHub token" },
-  { re: /\bgithub_pat_[A-Za-z0-9_]{40,}/, name: "GitHub token" },
-  { re: /\bglpat-[A-Za-z0-9_-]{20,}/, name: "GitLab token" },
-  { re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/, name: "Slack token" },
-  { re: /\bAIza[0-9A-Za-z_-]{35}\b/, name: "Google API key" },
-  { re: /\bnpm_[A-Za-z0-9]{36}\b/, name: "npm token" }
-], QUOTED_LONG_VALUE = /["'`]([^"'`\s]{32,})["'`]/g, SECRET_NAME_BEFORE = /([A-Za-z_][\w.-]*?(?:key|secret|token|passw(?:or)?d|pwd|credential|auth)[\w-]*)["']?\s*(?::=|=>|[:=])\s*$/i, SECRET_NAME_WINDOW = 160;
+var QUOTED_LONG_VALUE = /["'`]([^"'`\s]{32,})["'`]/g, SECRET_NAME_BEFORE = /([A-Za-z_][\w.-]*?(?:key|secret|token|passw(?:or)?d|pwd|credential|auth)[\w-]*)["']?\s*(?::=|=>|[:=])\s*$/i, SECRET_NAME_WINDOW = 160;
 function secretAssignment(text2) {
   for (let m of text2.matchAll(QUOTED_LONG_VALUE)) {
     let before = text2.slice(Math.max(0, m.index - SECRET_NAME_WINDOW), m.index), n = SECRET_NAME_BEFORE.exec(before);
@@ -6386,8 +6426,7 @@ var opencodeAdapter = {
 };
 
 // src/classify/prompt.ts
-var VERDICTS = ["requested", "implied", "unrequested", "unclear"];
-var SYSTEM_PROMPT = `You audit changes made by an AI coding agent. For every diff hunk, decide whether the human actually asked for it.
+var VERDICTS = ["requested", "implied", "unrequested", "unclear"], MAX_HUNKS_PER_CALL = 25, MAX_DIFF_LINES = 60, MAX_LINE_CHARS = 240, MAX_LINKED_PROMPT_CHARS = 4e3, MAX_CONTEXT_PROMPT_CHARS = 600, MAX_RATIONALE_CHARS = 400, MAX_REASON_CHARS = 200, SYSTEM_PROMPT = `You audit changes made by an AI coding agent. For every diff hunk, decide whether the human actually asked for it.
 
 You receive:
 - PROMPTS: what the human typed in the agent session, as [[p0]], [[p1]], ... Prompts marked (linked) are the ones the agent was answering when it wrote a hunk; the others are context from the same session.
@@ -6408,7 +6447,7 @@ Examples (illustrative refs):
 
 Answer with ONLY a JSON object, no prose and no code fences, with one entry for every hunk ref:
 {"h1":{"verdict":"requested|implied|unrequested|unclear","reason":"<= 200 chars"}, ...}`;
-function planBatches(hunks, max = 25) {
+function planBatches(hunks, max = MAX_HUNKS_PER_CALL) {
   if (max < 1) throw new RangeError("batch size must be >= 1");
   let groups = /* @__PURE__ */ new Map();
   for (let h of hunks) {
@@ -6423,8 +6462,8 @@ function planBatches(hunks, max = 25) {
     }
   return current.length > 0 && batches.push(current), batches.filter((b) => b.length > 0);
 }
-function renderHunkDiff(hunk, maxLines = 60) {
-  let sign = { add: "+", del: "-", ctx: " " }, body = hunk.lines.map((l) => clip3(sign[l.type] + l.text, 240)), shown = body;
+function renderHunkDiff(hunk, maxLines = MAX_DIFF_LINES) {
+  let sign = { add: "+", del: "-", ctx: " " }, body = hunk.lines.map((l) => clip3(sign[l.type] + l.text, MAX_LINE_CHARS)), shown = body;
   if (body.length > maxLines) {
     let head = Math.ceil((maxLines - 1) * 0.7), tail = maxLines - 1 - head, elided = body.length - head - tail;
     shown = [...body.slice(0, head), `... [${elided} lines elided] ...`, ...tail > 0 ? body.slice(-tail) : []];
@@ -6453,7 +6492,7 @@ function buildClassificationPrompt(prompts, batch, opts = {}) {
   let linkedIds = new Set(batch.flatMap((h) => h.prompt ? [h.prompt.id] : [])), parts = ["PROMPTS"];
   shown.length === 0 && parts.push("(no prompts recorded)");
   for (let p of shown) {
-    let linked = linkedIds.has(p.id), text2 = clip3(p.text.trim(), linked ? 4e3 : 600);
+    let linked = linkedIds.has(p.id), text2 = clip3(redactSecrets(p.text.trim()), linked ? MAX_LINKED_PROMPT_CHARS : MAX_CONTEXT_PROMPT_CHARS);
     parts.push(`[[${promptRef.get(p.id)}]]${linked ? " (linked)" : ""} ${text2}`);
   }
   parts.push("", "HUNKS");
@@ -6465,7 +6504,7 @@ function buildClassificationPrompt(prompts, batch, opts = {}) {
     parts.push(
       `[[${ref}]] file: ${file} (${h.hunk.status})`,
       `linked prompt: ${pr ? `[[${pr}]]` : "none (no agent edit explains this hunk)"}`,
-      `agent rationale: ${rationale ? clip3(oneLine(rationale), 400) : "(none)"}`,
+      `agent rationale: ${rationale ? clip3(oneLine(redactSecrets(rationale)), MAX_RATIONALE_CHARS) : "(none)"}`,
       "```diff",
       renderHunkDiff(h.hunk, opts.maxDiffLines),
       "```",
@@ -6492,7 +6531,7 @@ function toVerdict(value) {
   if (typeof value == "string" ? verdict = value : isRecord3(value) && (verdict = value.verdict, reason = value.reason ?? ""), typeof verdict != "string") return;
   let v = verdict.trim().toLowerCase();
   if (VERDICTS.includes(v))
-    return { verdict: v, reason: clip3(oneLine(typeof reason == "string" ? reason : ""), 200) };
+    return { verdict: v, reason: clip3(oneLine(typeof reason == "string" ? reason : ""), MAX_REASON_CHARS) };
 }
 function extractJsonObject(text2) {
   let stripped = text2.replace(/```(?:json)?/gi, "");
@@ -6537,7 +6576,7 @@ var ClassifierUnavailableError = class extends Error {
   constructor(backend, opts = {}) {
     this.backend = backend;
     this.opts = opts;
-    this.name = `${backend.name}:${backend.model}`, this.batchSize = Math.min(Math.max(1, opts.batchSize ?? 25), 25), this.concurrency = Math.max(1, opts.concurrency ?? 2);
+    this.name = `${backend.name}:${backend.model}`, this.batchSize = Math.min(Math.max(1, opts.batchSize ?? MAX_HUNKS_PER_CALL), MAX_HUNKS_PER_CALL), this.concurrency = Math.max(1, opts.concurrency ?? 2);
   }
   backend;
   opts;
@@ -6964,7 +7003,7 @@ async function buildReport(opts = {}) {
   let summary = summarize(attributed, sessions);
   attributed.some((h) => h.intent) && (summary.intent = summarizeIntent(attributed));
   let usedPromptIds = new Set(attributed.map((h) => h.prompt?.id).filter(Boolean)), contributing = contributingSessionIds(attributed);
-  return {
+  return redactReport({
     version: await readVersion(),
     generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
     repo: { root, name: await repoName(root), branch: await currentBranch(root) },
@@ -6974,7 +7013,7 @@ async function buildReport(opts = {}) {
     edits: editTable(attributed, sessions),
     hunks: compactHunks(attributed),
     summary
-  };
+  }, "secrets");
 }
 function guessAdapter(file) {
   return file.includes(".codex") || /rollout-.*\.jsonl$/.test(file) ? codexAdapter : file.includes("opencode") ? opencodeAdapter : claudeCodeAdapter;
@@ -8341,7 +8380,7 @@ async function writeState(dir, file, state) {
 
 // src/cli.ts
 var HARNESSES = ["claude-code", "codex", "opencode"], VERSION = "0.1.0", program2 = new Command();
-program2.name("why-diff").version(VERSION, "-V, --version").description("Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it.").argument("[range]", "git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree").option("--base <ref>", "branch or ref to compare against (default: auto-detected, incl. CI pull request targets)").option("-w, --working-tree", "only uncommitted changes vs HEAD").addOption(new Option("-f, --format <format>", "output format").choices(["terminal", "md", "html", "json"])).option("--html", "shortcut for --format html (writes .why-diff/report.html and opens it)").option("-o, --out <file>", "write output to a file instead of stdout").option("--no-open", "do not open the HTML report in a browser").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo (sibling folders, workspace roots) that edited files in it; slower").option("-v, --verbose", "show rationale, commands and label details").option("--fail-on <what>", "exit 1 if: risk | unrequested | tests | unattributed (comma list) \u2014 for CI and hooks").option("-q, --quiet", "no progress output").action(async (range, o) => {
+program2.name("why-diff").version(VERSION, "-V, --version").description("Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it.").argument("[range]", "git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree").option("--base <ref>", "branch or ref to compare against (default: auto-detected, incl. CI pull request targets)").option("-w, --working-tree", "only uncommitted changes vs HEAD").addOption(new Option("-f, --format <format>", "output format").choices(["terminal", "md", "html", "json"])).option("--html", "shortcut for --format html (writes .why-diff/report.html and opens it)").option("-o, --out <file>", "write output to a file instead of stdout").option("--no-open", "do not open the HTML report in a browser").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo (sibling folders, workspace roots) that edited files in it; slower").option("-v, --verbose", "show rationale, commands and label details").option("--fail-on <what>", "exit 1 if: risk | unrequested | tests | unattributed (comma list) \u2014 for CI and hooks").option("--redact-prompts", "omit prompt text and agent rationales from the output (secrets are always masked)").option("-q, --quiet", "no progress output").action(async (range, o) => {
   let progress = (msg) => {
     o.quiet || process.stderr.write(import_picocolors2.default.dim(`\xB7 ${msg}
 `));
@@ -8349,7 +8388,7 @@ program2.name("why-diff").version(VERSION, "-V, --version").description("Trace e
   if (!isReportFormat(format)) throw new Error(`unknown format ${format}`);
   let harnesses = o.harness ? String(o.harness).split(",").map((s) => s.trim()).filter(Boolean) : void 0, unknownHarness = harnesses?.find((h) => !HARNESSES.includes(h));
   if (unknownHarness) throw new Error(`unknown harness "${unknownHarness}" (use ${HARNESSES.join(", ")})`);
-  let classify = o.classify === !1 || o.classify === void 0 ? "none" : o.classify === !0 ? "auto" : o.classify, report = await buildReport({
+  let classify = o.classify === !1 || o.classify === void 0 ? "none" : o.classify === !0 ? "auto" : o.classify, built = await buildReport({
     range,
     base: o.base,
     workingTree: !!o.workingTree,
@@ -8360,7 +8399,7 @@ program2.name("why-diff").version(VERSION, "-V, --version").description("Trace e
     classify,
     model: o.model,
     onProgress: progress
-  }), out = renderReport(report, format, { verbose: !!o.verbose }), outFile = o.out;
+  }), report = o.redactPrompts ? redactReport(built, "prompts") : built, out = renderReport(report, format, { verbose: !!o.verbose }), outFile = o.out;
   if (format === "html" && !outFile && (outFile = path11.join(report.repo.root, ".why-diff", "report.html")), outFile) {
     await mkdir3(path11.dirname(path11.resolve(outFile)), { recursive: !0 }), await writeFile3(outFile, out);
     let outDir = path11.dirname(path11.resolve(outFile));

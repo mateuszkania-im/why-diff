@@ -1,0 +1,93 @@
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { describe, expect, it } from 'vitest';
+import type { AttributedHunk, Report } from '../src/types.js';
+import { redactReport, redactSecrets } from '../src/redact.js';
+import { renderReport } from '../src/report/index.js';
+import { buildClassificationPrompt } from '../src/classify/prompt.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const sample: Report = JSON.parse(readFileSync(join(here, 'fixtures', 'sample-report.json'), 'utf8'));
+const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
+
+describe('redactSecrets', () => {
+  it('keeps the public prefix of an API key and masks the rest', () => {
+    const out = redactSecrets('use key sk-ant-api03-abcdefghijklmnopqrstuvwxyz now');
+    expect(out).toContain('sk-ant-');
+    expect(out).not.toContain('abcdefghij');
+    expect(out).toContain('•');
+    expect(out.endsWith(' now')).toBe(true);
+  });
+  it('masks password assignments and URL credentials', () => {
+    expect(redactSecrets('password=hunter2xyz')).not.toContain('hunter2xyz');
+    const url = redactSecrets('DATABASE_URL=postgres://admin:Hunter2Secret@db.internal.acme.com/prod');
+    expect(url).not.toContain('Hunter2Secret');
+    expect(url).not.toContain('admin');
+    expect(url).toContain('db.internal.acme.com/prod');
+    expect(redactSecrets('DATABASE_URL=postgres://u:p@h/db')).not.toContain('u:p');
+  });
+  it('masks email addresses', () => {
+    const out = redactSecrets('customer jan.kowalski@client.pl called');
+    expect(out).not.toContain('kowalski');
+    expect(out).toContain('called');
+  });
+  it('masks private key blocks', () => {
+    const out = redactSecrets('k:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEabc\n-----END RSA PRIVATE KEY-----\nok');
+    expect(out).not.toContain('MIIEabc');
+    expect(out.endsWith('ok')).toBe(true);
+  });
+  it('leaves ordinary text alone and is idempotent', () => {
+    const t = 'Fix the token refresh in auth.ts, then add a password field to the form. See https://example.com/a?b=c';
+    expect(redactSecrets(t)).toBe(t);
+    const once = redactSecrets('password=hunter2xyz and sk-ant-api03-abcdefghijklmnopqrstuvwxyz');
+    expect(redactSecrets(once)).toBe(once);
+  });
+});
+
+function leaky(): Report {
+  const r = clone(sample);
+  const secret = 'sk-ant-api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXX';
+  r.prompts[0]!.text = `fix login, key ${secret}`;
+  const h = r.hunks[0] as AttributedHunk;
+  h.prompt = { ...r.prompts[0]! };
+  if (h.edits[0]) h.edits[0].rationale = `used ${secret}`;
+  const id = Object.keys(r.edits)[0]!;
+  r.edits[id] = { ...r.edits[id]!, newText: `k = "${secret}"`, command: `curl -H "x: ${secret}"`, rationale: `used ${secret}` };
+  return r;
+}
+
+describe('redactReport', () => {
+  it.each(['md', 'json', 'html'] as const)('secrets mode removes the key from %s output', (fmt) => {
+    const out = renderReport(redactReport(leaky(), 'secrets'), fmt, { verbose: true });
+    expect(out).not.toContain('XXXX');
+    expect(out).toContain('sk-ant-');
+  });
+  it('does not mutate the input', () => {
+    const r = leaky();
+    redactReport(r, 'secrets');
+    expect(r.prompts[0]!.text).toContain('XXXX');
+  });
+  it('prompts mode drops all prompt text and rationales', () => {
+    const r = leaky();
+    const red = redactReport(r, 'prompts');
+    expect(red.prompts[0]!.text).toMatch(/^\[prompt \d+ redacted\]$/);
+    const json = renderReport(red, 'json');
+    expect(json).not.toContain('fix login');
+    expect(json).not.toContain('XXXX');
+    expect(JSON.stringify(red.hunks.flatMap((h) => h.edits.map((e) => e.rationale)).filter(Boolean))).toBe('[]');
+    expect(Object.values(red.edits).every((e) => e.rationale === undefined)).toBe(true);
+    for (const fmt of ['md', 'html', 'terminal'] as const) {
+      expect(renderReport(red, fmt, { verbose: true })).not.toContain('fix login');
+    }
+  });
+});
+
+describe('classifier input', () => {
+  it('does not send secrets from prompts or rationales to the model', () => {
+    const r = leaky();
+    const h = r.hunks[0] as AttributedHunk;
+    const built = buildClassificationPrompt([r.prompts[0]!], [h]);
+    expect(built.user).not.toContain('XXXX');
+  });
+});

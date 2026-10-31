@@ -8,6 +8,7 @@
  * real hunk ids by the caller, so ids never leak into (or get mangled by) the
  * model's output.
  */
+import { redactSecrets } from '../redact.js';
 import type { AttributedHunk, Hunk, IntentVerdict, Prompt } from '../types.js';
 
 export type Verdict = IntentVerdict['verdict'];
@@ -158,7 +159,7 @@ export function buildClassificationPrompt(
   if (shown.length === 0) parts.push('(no prompts recorded)');
   for (const p of shown) {
     const linked = linkedIds.has(p.id);
-    const text = clip(p.text.trim(), linked ? MAX_LINKED_PROMPT_CHARS : MAX_CONTEXT_PROMPT_CHARS);
+    const text = clip(redactSecrets(p.text.trim()), linked ? MAX_LINKED_PROMPT_CHARS : MAX_CONTEXT_PROMPT_CHARS);
     parts.push(`[[${promptRef.get(p.id)}]]${linked ? ' (linked)' : ''} ${text}`);
   }
 
@@ -173,7 +174,7 @@ export function buildClassificationPrompt(
     parts.push(
       `[[${ref}]] file: ${file} (${h.hunk.status})`,
       `linked prompt: ${pr ? `[[${pr}]]` : 'none (no agent edit explains this hunk)'}`,
-      `agent rationale: ${rationale ? clip(oneLine(rationale), MAX_RATIONALE_CHARS) : '(none)'}`,
+      `agent rationale: ${rationale ? clip(oneLine(redactSecrets(rationale)), MAX_RATIONALE_CHARS) : '(none)'}`,
       '```diff',
       renderHunkDiff(h.hunk, opts.maxDiffLines),
       '```',

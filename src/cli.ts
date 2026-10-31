@@ -12,6 +12,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import pc from 'picocolors';
 import { buildReport } from './pipeline.js';
+import { redactReport } from './redact.js';
 import { renderReport, isReportFormat, type ReportFormat } from './report/index.js';
 import type { Harness, LabelKind } from './types.js';
 import { runGuard, type GuardPayload } from './guard.js';
@@ -44,6 +45,7 @@ program
   .option('--scan-all', 'also scan transcripts started outside the repo (sibling folders, workspace roots) that edited files in it; slower')
   .option('-v, --verbose', 'show rationale, commands and label details')
   .option('--fail-on <what>', 'exit 1 if: risk | unrequested | tests | unattributed (comma list) — for CI and hooks')
+  .option('--redact-prompts', 'omit prompt text and agent rationales from the output (secrets are always masked)')
   .option('-q, --quiet', 'no progress output')
   .action(async (range: string | undefined, o: Record<string, unknown>) => {
     const progress = (msg: string) => { if (!o.quiet) process.stderr.write(pc.dim(`· ${msg}\n`)); };
@@ -55,7 +57,7 @@ program
     if (unknownHarness) throw new Error(`unknown harness "${unknownHarness}" (use ${HARNESSES.join(', ')})`);
 
     const classify: ClassifierKind = o.classify === false || o.classify === undefined ? 'none' : o.classify === true ? 'auto' : (o.classify as ClassifierKind);
-    const report = await buildReport({
+    const built = await buildReport({
       range,
       base: o.base as string | undefined,
       workingTree: Boolean(o.workingTree),
@@ -68,6 +70,7 @@ program
       onProgress: progress,
     });
 
+    const report = o.redactPrompts ? redactReport(built, 'prompts') : built;
     const out = renderReport(report, format, { verbose: Boolean(o.verbose) });
     let outFile = o.out as string | undefined;
     if (format === 'html' && !outFile) outFile = path.join(report.repo.root, '.why-diff', 'report.html');

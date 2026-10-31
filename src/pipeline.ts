@@ -13,6 +13,7 @@ import { compactHunks, editTable } from './compact.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
 import { codexAdapter } from './adapters/codex.js';
 import { opencodeAdapter } from './adapters/opencode.js';
+import { redactReport } from './redact.js';
 import { createClassifier, classifyHunks, summarizeIntent, type ClassifierKind } from './classify/index.js';
 
 export const ADAPTERS: Record<Harness, SessionAdapter> = {
@@ -149,7 +150,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
 
   const usedPromptIds = new Set(attributed.map((h) => h.prompt?.id).filter(Boolean));
   const contributing = contributingSessionIds(attributed);
-  return {
+  return redactReport({
     version: await readVersion(),
     generatedAt: new Date().toISOString(),
     repo: { root, name: await repoName(root), branch: await currentBranch(root) },
@@ -161,7 +162,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
     edits: editTable(attributed, sessions),
     hunks: compactHunks(attributed),
     summary,
-  };
+  }, 'secrets');
 }
 
 function guessAdapter(file: string): SessionAdapter {
