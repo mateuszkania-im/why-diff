@@ -53,6 +53,11 @@ export function needsFileText(path: string): boolean {
   return RUNNER_CONFIG.test(base) || PYTEST_CONFIG.test(base) || isCiFile(p);
 }
 
+/** True for JavaScript/TypeScript test files, whose full text lets the restructuring rules see whether a wrapper function is ever called. */
+export function needsSourceText(path: string): boolean {
+  return isTestFile(normalisePath(path)) && JS_EXT.has(extOf(path));
+}
+
 /**
  * Attach deterministic labels to every hunk.
  *
@@ -106,13 +111,14 @@ function computeLabels(h: AttributedHunk, path: string, scope: ScopeIndex, ctx: 
     );
   }
 
-  const skips = detectTestSkips(path, lines);
+  const restructured = detectRestructure(path, lines, scope.fileText);
+  const skips = [...detectTestSkips(path, lines), ...restructured.skips];
   if (skips.length > 0) push('test-skip-added', 'risk', `Adds ${listOf(skips)}`);
 
   const disabled = detectTestsDisabled(path, h.hunk, lines, scope);
   if (disabled.length > 0) push('tests-disabled', 'risk', disabled.join('; '));
 
-  const assertions = detectAssertionChanges(path, lines);
+  const assertions = [...detectAssertionChanges(path, lines), ...restructured.weakenings];
   if (assertions.length > 0) push('assertion-removed', 'risk', assertions.join('; '));
 
   if (isSnapshotFile(path)) push('snapshot-updated', 'warn', 'Snapshot file changed');
@@ -1188,6 +1194,280 @@ function detectAssertionChanges(path: string, lines: DiffLine[]): string[] {
     findings.unshift(unpaired.length === 1 ? `removed: ${first}` : `${unpaired.length} assertions removed, e.g. ${first}`);
   }
   return findings;
+}
+
+// ---------------------------------------------------------------------------
+// Restructured tests: dead guards, swallowing try/catch, shadowed globals, uncalled wrappers
+// ---------------------------------------------------------------------------
+
+const JS_EXT: ReadonlySet<string> = new Set(['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts']);
+/** `if (false)`, `if (0)`, `if (!true)`, `if (!1)`, `if (null)`, `if (undefined)`, `if (void 0)`. */
+const FALSY_IF = /\bif\s*\(\s*(?:false|0|!\s*true|!\s*1|null|undefined|void\s+0)\s*\)/;
+const TRY_OPEN = /\btry\s*\{/g;
+/** Test-framework globals a local binding can shadow (common words such as `context` or `before` are left out). */
+const TEST_GLOBALS: ReadonlySet<string> = new Set(['it', 'test', 'describe', 'expect', 'assert', 'beforeEach', 'afterEach', 'beforeAll', 'afterAll', 'suite', 'specify', 'xit', 'fit', 'xtest', 'xdescribe', 'fdescribe']);
+/** Modules those names may come from. */
+const TEST_MODULES = /^(?:vitest(?:\/.+)?|@vitest\/.+|@jest\/globals|jest-circus(?:\/.+)?|node:test|mocha|chai|bun:test|ava|tape|uvu(?:\/.+)?|tap|node-tap|@playwright\/.+|(?:node:)?assert(?:\/strict)?|expect)$/;
+const DECLARED_NAME = /^\s*(?:export\s+)?(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?:[=;:]|$)(.*)|(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\()/;
+const DESTRUCTURE = /^\s*(?:export\s+)?(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(.+)$/;
+const IMPORT_FROM = /^\s*import\s+(?!type\b)(.+?)\s+from\s+["'`]([^"'`]+)["'`]/;
+/** `require('<test module>')`, `require('<test module>').x`, `chai.x`, or `<x>.extend(` (Playwright / Vitest fixtures). */
+const FRAMEWORK_SOURCE = /^(?:require\s*\(\s*["'`]([^"'`]+)["'`]\s*\)(?:\s*\.\s*[\w$]+)*|chai(?:\s*\.\s*[\w$]+)*|[\w$]+\s*\.\s*extend\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*\()/;
+/** `.extend(` with optional (one level nested) generic arguments: a fixtures module. */
+const EXTEND_CALL = /\.\s*extend\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*\(/;
+/** Module specifiers a text imports, requires or re-exports from. */
+const SPECIFIER = /(?:\bfrom\s*|\brequire\s*\(\s*|\bimport\s*\(\s*|^\s*import\s+)["'`]([^"'`]+)["'`]/gm;
+/** Specifiers a text re-exports from (`export * from`, `export { x } from`). */
+const RE_EXPORT = /\bexport\s+(?:\*(?:\s+as\s+[\w$]+)?|(?:type\s+)?\{[^}]*\})\s*from\s*["'`]([^"'`]+)["'`]/g;
+const MODULE_EXTS = ['.ts', '.tsx', '.js', '.mjs', '.cjs', '.mts', '.cts', '.jsx'];
+/** A function literal that starts the line: an arrow (assigned or not) or a function expression / declaration. */
+const ARROW_START = /^\s*(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)?(?:async\s*)?(?:\([^()]*\)|[A-Za-z_$][\w$]*)\s*=>\s*(.*)$/;
+const FUNCTION_START = /^\s*(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\([^()]*\)\s*\{\s*$/;
+const ASSERTION_CALL = /(?<![\w$.])(?:expect\s*[({]|assert\w*\s*[.(])/;
+
+interface CodeLine {
+  line: DiffLine;
+  /** Strings and comments removed, same length semantics as {@link codeOf} */
+  code: string;
+}
+
+/**
+ * Tests turned off by restructuring rather than by a marker, in JavaScript/TypeScript test files.
+ * Lexical: braces are matched on code with strings and comments removed, across the hunk's
+ * context and added lines, so a construct is seen only as far as the hunk reaches.
+ *
+ * - skip: an added constant-false `if` around (or right before) existing assertions;
+ * - weakening: an added `try` around existing assertions whose `catch` neither rethrows nor asserts
+ *   (a try that checks `.toThrow` / `rejects` is fine);
+ * - skip: an added binding that shadows a test global (`const it = ...`, `function expect()`, an
+ *   import of `it` from anything but a test framework): at the top level, or indented when the
+ *   hunk then calls it;
+ * - skip: existing assertions moved into an added function literal that is never called.
+ *
+ * "Existing" assertions are context lines, or added lines that contain a deleted assertion line
+ * (whitespace ignored), so moving or re-indenting old checks counts and writing new ones does not.
+ */
+function detectRestructure(path: string, lines: DiffLine[], fileText?: (p: string) => string | undefined): { skips: string[]; weakenings: string[] } {
+  const skips: string[] = [];
+  const weakenings: string[] = [];
+  if (!isTestFile(path) || !JS_EXT.has(extOf(path))) return { skips, weakenings };
+  const style = commentStyle(path);
+  const delKeys = lines.filter((l) => l.type === 'del' && parseAssertion(l.text, path)).map((l) => normaliseLine(l.text)).filter((k) => k.length > 0);
+  const seq: CodeLine[] = lines.filter((l) => l.type !== 'del').map((line) => ({ line, code: codeOf(line.text, style) }));
+  const existing = (i: number): boolean => {
+    const l = seq[i]?.line;
+    if (!l) return false;
+    if (l.type === 'ctx') return parseAssertion(l.text, path) !== null;
+    const k = normaliseLine(l.text);
+    return delKeys.some((d) => k.includes(d));
+  };
+  const anyExisting = (from: number, to: number): boolean => {
+    for (let i = from; i <= to; i++) if (existing(i)) return true;
+    return false;
+  };
+
+  // `{` at (line, col): the position of the matching `}`, or the end of the hunk.
+  const close = (li: number, col: number): { li: number; col: number } => {
+    let depth = 0;
+    for (let i = li; i < seq.length; i++) {
+      const code = seq[i]!.code;
+      for (let c = i === li ? col : 0; c < code.length; c++) {
+        if (code[c] === '{') depth++;
+        else if (code[c] === '}' && --depth === 0) return { li: i, col: c };
+      }
+    }
+    return { li: seq.length - 1, col: Infinity };
+  };
+  const between = (a: { li: number; col: number }, b: { li: number; col: number }): string => {
+    let out = '';
+    for (let i = a.li; i <= b.li && i < seq.length; i++) {
+      const code = seq[i]!.code;
+      out += `${code.slice(i === a.li ? a.col + 1 : 0, i === b.li ? b.col : code.length)}\n`;
+    }
+    return out;
+  };
+  // The next non-blank code position after (li, col).
+  const next = (li: number, col: number): { li: number; col: number } | null => {
+    for (let i = li; i < seq.length; i++) {
+      const code = seq[i]!.code;
+      for (let c = i === li ? col : 0; c < code.length; c++) if (!/\s/.test(code[c]!)) return { li: i, col: c };
+    }
+    return null;
+  };
+
+  for (let i = 0; i < seq.length; i++) {
+    const { line, code } = seq[i]!;
+    if (line.type !== 'add') continue;
+
+    // (a) constant-false guard
+    const f = FALSY_IF.exec(code);
+    if (f) {
+      const at = next(i, f.index + f[0].length);
+      if (at) {
+        const guarded = seq[at.li]!.code[at.col] === '{' ? anyExisting(at.li, close(at.li, at.col).li) : existing(at.li);
+        if (guarded) skips.push(`assertions behind ${f[0].replace(/\s+/g, ' ')}`);
+      }
+    }
+
+    // (b) try/catch swallowing assertions
+    for (const t of code.matchAll(TRY_OPEN)) {
+      const open = { li: i, col: t.index! + t[0].length - 1 };
+      const end = close(open.li, open.col);
+      if (end.col === Infinity) continue;
+      const after = next(end.li, end.col + 1);
+      if (!after) continue;
+      const rest = seq[after.li]!.code.slice(after.col);
+      const c = /^catch\s*(?:\([^)]*\)\s*)?\{/.exec(rest);
+      if (!c) continue;
+      const catchOpen = { li: after.li, col: after.col + c[0].length - 1 };
+      const catchEnd = close(catchOpen.li, catchOpen.col);
+      const body = between(open, end);
+      const handler = between(catchOpen, catchEnd);
+      if (/\bthrow\b/.test(handler) || ASSERTION_CALL.test(handler) || /\.\s*(?:toThrow\w*|rejects|throws)\b/.test(body)) continue;
+      if (anyExisting(open.li, end.li)) weakenings.push('existing assertions wrapped in a try/catch that swallows their failures');
+    }
+
+    // (c) a binding that shadows a test global
+    // A top-level binding shadows the global for the whole file; an indented one (a local such as
+    // `const test = makeHunk()`) only counts when the hunk then calls it (`it("a", ...)`).
+    const shadow = shadowedGlobal(code, line.text, path, fileText);
+    const calledAfter = (name: string): boolean => seq.slice(i + 1).some((x) => new RegExp(`(?<![\\w$.])${name}\\s*\\(`).test(x.code));
+    if (shadow && (!/^\s/.test(line.text) || /^\s*import\b/.test(code) || calledAfter(shadow))) skips.push(`a binding that shadows the test global ${shadow}`);
+
+    // (d) existing assertions moved into a function literal that is never called. Approximation:
+    // the function starts the added line (an arrow, assigned or not, or a function expression or
+    // declaration, never an argument such as `it("x", () => {`), its body runs to the matching
+    // brace within the hunk, and "called" means its name appears anywhere else in the file after
+    // the change (or, without the file, in the hunk): a call, or a reference passed elsewhere.
+    const arrow = ARROW_START.exec(code);
+    const fn = arrow ? null : FUNCTION_START.exec(code);
+    // A literal continuing an expression from the line before (`items.forEach(` / `onDone,`) is an argument or a value, not a statement.
+    let prev = '';
+    for (let j = i - 1; j >= 0 && !prev; j--) prev = seq[j]!.code.trim();
+    const continues = /(?:[(,=:?[]|&&|\|\||\breturn)$/.test(prev);
+    if ((arrow || fn) && !continues) {
+      const name = arrow ? arrow[1] : fn![1] ?? fn![2];
+      let moved = false;
+      if (arrow && arrow[2] && !arrow[2].trim().startsWith('{')) {
+        moved = existing(i); // expression body on the same line
+      } else {
+        const col = code.lastIndexOf('{');
+        if (col >= 0) moved = anyExisting(i + 1, close(i, col).li);
+      }
+      if (moved && !usedElsewhere(name, fileText?.(path), seq.map((x) => x.code))) {
+        skips.push(`existing assertions moved into ${name ? `${name}()` : 'a function'} that is never called`);
+      }
+    }
+  }
+  return { skips: uniq(skips), weakenings: uniq(weakenings) };
+}
+
+/** The test global an added line binds locally (or imports from outside a test framework), if any. */
+function shadowedGlobal(code: string, raw: string, from: string, fileText?: (p: string) => string | undefined): string | null {
+  // A relative module (`./fixtures`) shadows only if it resolves, can be read, and has no test
+  // framework behind it (see {@link relativeModuleBacked}).
+  const plainRelative = (source: string): boolean => {
+    const m = /require\s*\(\s*["'`](\.{1,2}\/[^"'`]*)["'`]/.exec(source);
+    return m ? relativeModuleBacked(from, m[1]!, fileText) === 'plain' : true;
+  };
+  const d = DECLARED_NAME.exec(code);
+  if (d) {
+    const name = d[1] ?? d[3];
+    if (name && TEST_GLOBALS.has(name)) {
+      const rhs = (d[2] ?? '').trim().replace(/^=\s*/, '');
+      const source = rawRhs(raw);
+      if (!(d[1] && rhs && FRAMEWORK_SOURCE.test(source) && frameworkModule(source)) && plainRelative(source)) return name;
+    }
+  }
+  const ds = DESTRUCTURE.exec(code);
+  if (ds) {
+    const names = ds[1]!.split(',').map((b) => b.split(':').pop()!.split('=')[0]!.trim().replace(/^\.\.\./, ''));
+    const hit = names.find((n) => TEST_GLOBALS.has(n));
+    const source = rawRhs(raw);
+    if (hit && !(FRAMEWORK_SOURCE.test(source) && frameworkModule(source)) && plainRelative(source)) return hit;
+  }
+  const im = IMPORT_FROM.exec(raw);
+  if (im && !TEST_MODULES.test(im[2]!) && (!/^\.{1,2}\//.test(im[2]!) || relativeModuleBacked(from, im[2]!, fileText) === 'plain')) {
+    const clause = im[1]!;
+    const bindings: string[] = [];
+    const braces = /\{([^}]*)\}/.exec(clause);
+    if (braces) for (const b of braces[1]!.split(',')) bindings.push(b.trim().replace(/^type\s+/, '').split(/\s+as\s+/).pop()!.trim());
+    const def = /^([A-Za-z_$][\w$]*)/.exec(clause.trim());
+    if (def && def[1] !== 'type') bindings.push(def[1]!);
+    const hit = bindings.find((n) => TEST_GLOBALS.has(n));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * Repo paths a relative specifier can name from the file `from`: the path itself, with each
+ * JavaScript/TypeScript extension, a `.js` spelled for a `.ts` source, and `<dir>/index.*`.
+ */
+export function relativeModuleCandidates(from: string, spec: string): string[] {
+  const target = posix.normalize(posix.join(posix.dirname(normalisePath(from)), spec));
+  if (target.startsWith('../') || target === '..') return [];
+  const out = [target, ...MODULE_EXTS.map((e) => target + e), ...MODULE_EXTS.map((e) => `${target}/index${e}`)];
+  const js = /\.(m|c)?jsx?$/.exec(target);
+  if (js) out.push(...['.ts', '.tsx', '.mts', '.cts'].map((e) => target.slice(0, -js[0].length) + e));
+  return [...new Set(out)];
+}
+
+/** Relative specifiers a text imports, requires or re-exports from. */
+export function relativeSpecifiers(text: string): string[] {
+  return [...new Set([...text.matchAll(SPECIFIER)].map((m) => m[1]!).filter((x) => /^\.{1,2}\//.test(x)))];
+}
+
+/** Relative specifiers a text re-exports from. */
+export function relativeReExports(text: string): string[] {
+  return [...new Set([...text.matchAll(RE_EXPORT)].map((m) => m[1]!).filter((x) => /^\.{1,2}\//.test(x)))];
+}
+
+/** The first readable candidate of a relative specifier: its repo path and text. */
+function resolveModule(from: string, spec: string, fileText?: (p: string) => string | undefined): { path: string; text: string } | null {
+  if (!fileText) return null;
+  for (const c of relativeModuleCandidates(from, spec)) {
+    const text = fileText(c);
+    if (text !== undefined) return { path: c, text };
+  }
+  return null;
+}
+
+/**
+ * What stands behind a relative import: `missing` (it does not resolve, or cannot be read: not
+ * flagged), `framework` (it imports, requires or re-exports a test framework module, or calls
+ * `.extend(`, directly or through one level of re-export: a fixtures module), or `plain`.
+ */
+function relativeModuleBacked(from: string, spec: string, fileText?: (p: string) => string | undefined): 'missing' | 'framework' | 'plain' {
+  const mod = resolveModule(from, spec, fileText);
+  if (!mod) return 'missing';
+  const backed = (text: string): boolean => EXTEND_CALL.test(text) || [...text.matchAll(SPECIFIER)].some((m) => TEST_MODULES.test(m[1]!));
+  if (backed(mod.text)) return 'framework';
+  for (const re of relativeReExports(mod.text)) {
+    const next = resolveModule(mod.path, re, fileText);
+    if (next && backed(next.text)) return 'framework';
+  }
+  return 'plain';
+}
+
+/** The right-hand side of an assignment on the raw line (strings kept, for module names). */
+function rawRhs(raw: string): string {
+  const m = /=\s*(.+?)\s*;?\s*$/.exec(raw);
+  return m ? m[1]! : '';
+}
+
+/** A {@link FRAMEWORK_SOURCE} that names a module names a test framework one; `chai.x` and `x.extend(` need none. */
+function frameworkModule(source: string): boolean {
+  const m = /require\s*\(\s*["'`]([^"'`]+)["'`]/.exec(source);
+  return m ? TEST_MODULES.test(m[1]!) : true;
+}
+
+/** Does `name` appear anywhere besides its own declaration (in the file after the change, else in the hunk)? Anonymous: never. */
+function usedElsewhere(name: string | undefined, fileText: string | undefined, hunkCode: string[]): boolean {
+  if (!name) return false;
+  const re = new RegExp(`(?<![\\w$.])${name.replace(/\$/g, '\\$')}(?![\\w$])`, 'g');
+  const text = fileText !== undefined ? fileText : hunkCode.join('\n');
+  return (text.match(re)?.length ?? 0) > 1;
 }
 
 // ---------------------------------------------------------------------------

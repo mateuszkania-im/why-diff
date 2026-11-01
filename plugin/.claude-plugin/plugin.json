@@ -1,6 +1,6 @@
 {
   "name": "why-diff",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Review agent-written code by intent: every hunk traced to the prompt and tool call that wrote it, with unrequested changes and test tampering flagged.",
   "author": { "name": "Mateusz Kania", "url": "https://github.com/mateuszkania-im" },
   "homepage": "https://github.com/mateuszkania-im/why-diff",
