@@ -7,7 +7,7 @@
  */
 
 import { execFile, spawn } from 'node:child_process';
-import { copyFile, lstat, mkdtemp, open, readFile, readlink, realpath, rm, stat } from 'node:fs/promises';
+import { lstat, mkdtemp, open, readFile, readlink, realpath, rm, stat } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -56,10 +56,26 @@ export interface DiffOptions {
   /** Git pathspecs limiting both the tracked diff and the untracked files (e.g. `:(literal)src/a.ts`). */
   paths?: string[];
   /**
-   * In a sparse checkout, leave out skip-worktree files missing from the working tree (default true).
-   * The guard passes false when the sparse checkout setup changed during the session.
+   * In a sparse checkout, leave out skip-worktree files missing from the working tree that the
+   * sparse patterns leave out (default true).
    */
   honourSparseCheckout?: boolean;
+  /** Trust the sparse checkout only as far as {@link SparseTrust} allows (the guard). */
+  sparseTrust?: SparseTrust;
+  /**
+   * Working tree targets with `paths`: diff every matching file through a temporary index rebuilt
+   * from the real one's blob ids alone (no stat data, no flags), so git hashes the working tree
+   * content of each instead of trusting the index (the guard). Fails closed.
+   */
+  contentIndex?: boolean;
+}
+
+/** How far the guard trusts a sparse checkout (see {@link sparseExcluded}). */
+export interface SparseTrust {
+  /** Included config files and the sparse patterns file must have changed before this time (ms) */
+  before: number;
+  /** Change time of a path in ms */
+  timeOf: (absPath: string) => Promise<number>;
 }
 
 /** Output of `resolveDefaultTarget`. */
@@ -195,7 +211,7 @@ export async function git(cwd: string, args: string[], opts: { trim?: boolean; m
       if (!err) return resolve(out);
       const e = err as NodeJS.ErrnoException & { code?: number | string };
       if (e.code === 'ENOENT') return reject(new Error('git executable not found on PATH'));
-      reject(new GitError(args, String(stderr || e.message), typeof e.code === 'number' ? e.code : null));
+      reject(new GitError(args, typeof e.code === 'number' ? String(stderr ?? '') : String(stderr || e.message), typeof e.code === 'number' ? e.code : null));
     });
     child.stdin?.on('error', () => {});
     child.stdin?.end(opts.input ?? '');
@@ -360,19 +376,30 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
   } else {
     baseRev = await emptyTree(cwd); // unborn branch: everything tracked is "added"
   }
-  const revealed = await revealTextMarkedBinary(cwd, [...common, baseRev], await gitPaths(cwd, [...common, baseRev], opts.paths));
-  let diff = revealed.diff;
-  const unreviewed = [...revealed.unreviewed];
-  // Files flagged assume-unchanged or skip-worktree: git diff takes their index entry for the
-  // working tree file, so a change to them would not show. Diff them again through a copy of the
-  // index with the flags cleared (the real index is never touched).
-  const hidden = await indexFlagged(cwd, opts.paths, opts.honourSparseCheckout ?? true).catch(() => null);
-  if (hidden === null) throw new FailClosedError('cannot list index entries flagged assume-unchanged or skip-worktree');
-  if (hidden.length) {
-    const own = await diffWithoutIndexFlags(cwd, [...common, baseRev], hidden).catch(() => null);
-    if (own === null) {
-      unreviewed.push(...hidden);
-    } else {
+  const root = await repoRoot(cwd);
+  const excluded = (opts.honourSparseCheckout ?? true) ? await sparseExcluded(root, opts.sparseTrust) : null;
+  let diff: string;
+  const unreviewed: string[] = [];
+  // A pathspec list too long for one command line is matched here instead (see pathspecMatcher).
+  const match = opts.contentIndex && opts.paths?.length && chunkPaths(opts.paths).length > 1
+    ? await pathspecMatcher(root, opts.paths, baseRev).catch((err: Error) => { throw new FailClosedError(`cannot list the files the session's paths name (${err.message})`); })
+    : undefined;
+  if (opts.contentIndex && opts.paths?.length) {
+    const own = await diffThroughContentIndex(root, [...common, baseRev], opts.paths, excluded, match);
+    diff = own.diff;
+    unreviewed.push(...own.unreviewed);
+  } else {
+    const revealed = await revealTextMarkedBinary(cwd, [...common, baseRev], await gitPaths(cwd, [...common, baseRev], opts.paths));
+    diff = revealed.diff;
+    unreviewed.push(...revealed.unreviewed);
+    // Files flagged assume-unchanged or skip-worktree: git diff takes their index entry for the
+    // working tree file, so a change to them would not show. Diff them again through a temporary
+    // index without flags (the real index is never touched).
+    const hidden = await indexFlagged(root, opts.paths, excluded).catch((err: Error) => {
+      throw new FailClosedError(`cannot list index entries flagged assume-unchanged or skip-worktree (${err.message})`);
+    });
+    if (hidden.length) {
+      const own = await diffThroughContentIndex(root, [...common, baseRev], hidden.map((f) => `:(literal)${f}`), excluded);
       const names = new Set(hidden);
       const kept = splitSections(diff).filter((section) => {
         const h = parseUnifiedDiff(section)[0];
@@ -384,8 +411,7 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
   }
 
   if (target.includeUntracked !== false) {
-    const root = await repoRoot(cwd);
-    const untracked = await listUntracked(cwd, opts.paths);
+    const untracked = match ? (await listUntracked(cwd)).filter(match) : await listUntracked(cwd, opts.paths);
     for (const rel of untracked) {
       const synthetic = await syntheticAddedFileDiff(root, rel);
       if (synthetic) diff += synthetic;
@@ -394,47 +420,272 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
   return { diff, unreviewed };
 }
 
-/**
- * Index entries flagged assume-unchanged (lowercase tag in `git ls-files -v`) or skip-worktree
- * (`S`). In a sparse checkout (`core.sparseCheckout`), a skip-worktree file missing from the working
- * tree is expected and left out, unless `honourSparse` is false.
- */
-export async function indexFlagged(cwd: string, paths?: string[], honourSparse = true): Promise<string[]> {
-  const root = await repoRoot(cwd);
-  const out = await gitPaths(root, ['ls-files', '-v', '-z'], paths);
-  const sparse = honourSparse && (await git(root, ['config', '--bool', 'core.sparseCheckout']).catch(() => '')) === 'true';
-  const flagged: string[] = [];
-  for (const entry of out.split('\0')) {
-    if (entry.length < 3 || entry[1] !== ' ') continue;
-    const tag = entry[0]!;
-    const file = entry.slice(2);
-    const skipWorktree = tag === 'S' || tag === 's';
-    if (!(skipWorktree || (tag >= 'a' && tag <= 'z'))) continue;
-    if (skipWorktree && sparse && !(await lstat(path.join(root, file)).then(() => true, () => false))) continue;
-    flagged.push(file);
-  }
-  return [...new Set(flagged)];
+/** One `git ls-files -s -v` entry. */
+export interface IndexEntry {
+  /** `H` cached, `S` skip-worktree, lowercase when assume-unchanged, ... */
+  tag: string;
+  mode: string;
+  oid: string;
+  stage: string;
+  path: string;
 }
 
-/** `args` (a `git diff` up to its base revision) for `files`, against a temporary copy of the index without their flags. */
-async function diffWithoutIndexFlags(cwd: string, args: string[], files: string[]): Promise<DetailedDiff> {
-  const root = await repoRoot(cwd);
-  const index = path.resolve(root, await git(root, ['rev-parse', '--git-path', 'index']));
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'why-diff-index-'));
-  try {
-    const copy = path.join(dir, 'index');
-    await copyFile(index, copy);
-    const env = { GIT_INDEX_FILE: copy };
-    const literal = files.map((f) => `:(literal)${f}`);
-    // One flag per call: git applies only the first of the two to the paths when both are given.
-    const list = files.map((f) => `${f}\0`).join('');
-    await git(root, ['update-index', '--no-skip-worktree', '-z', '--stdin'], { env, input: list });
-    await git(root, ['update-index', '--no-assume-unchanged', '-z', '--stdin'], { env, input: list });
-    const raw = await gitPaths(root, args, literal, { env });
-    return await revealTextMarkedBinary(root, args, raw);
-  } finally {
-    await rm(dir, { recursive: true, force: true }).catch(() => {});
+/** Index entries matching `paths` (all of them without paths), with their flags. */
+export async function indexEntries(root: string, paths?: readonly string[]): Promise<IndexEntry[]> {
+  const out = await gitPaths(root, ['ls-files', '-s', '-v', '-z'], paths);
+  const seen = new Set<string>();
+  const entries: IndexEntry[] = [];
+  for (const raw of out.split('\0')) {
+    const m = /^(\S) (\d+) ([0-9a-f]+) (\d)\t([\s\S]+)$/.exec(raw);
+    if (!m) {
+      if (raw) throw new Error(`unexpected git ls-files output: ${JSON.stringify(raw.slice(0, 200))}`);
+      continue;
+    }
+    const key = `${m[4]}\0${m[5]}`;
+    if (seen.has(key)) continue; // a path matched by pathspecs in two chunks
+    seen.add(key);
+    entries.push({ tag: m[1]!, mode: m[2]!, oid: m[3]!, stage: m[4]!, path: m[5]! });
   }
+  return entries;
+}
+
+const isSkipWorktree = (tag: string): boolean => tag === 'S' || tag === 's';
+const isAssumeUnchanged = (tag: string): boolean => tag >= 'a' && tag <= 'z';
+
+/**
+ * Of `files`, those missing from the working tree: one lstat per directory first (a missing
+ * directory means all its files are missing), then the files of existing directories, in parallel
+ * batches. Errors other than "not there" propagate.
+ */
+export async function missingFiles(root: string, files: readonly string[]): Promise<Set<string>> {
+  const top = path.resolve(root);
+  const dirState = new Map<string, Promise<boolean>>();
+  const exists = (abs: string): Promise<boolean> => lstat(abs).then(() => true, (err: NodeJS.ErrnoException) => {
+    if (GONE.has(err.code ?? '')) return false;
+    throw err;
+  });
+  const dirExists = (rel: string): Promise<boolean> => {
+    if (!rel || rel === '.') return Promise.resolve(true);
+    let p = dirState.get(rel);
+    if (!p) {
+      const parent = path.posix.dirname(rel);
+      p = dirExists(parent).then((up) => (up ? exists(path.join(top, ...rel.split('/'))) : false));
+      dirState.set(rel, p);
+    }
+    return p;
+  };
+  const missing = new Set<string>();
+  for (let i = 0; i < files.length; i += STAT_BATCH) {
+    await Promise.all(files.slice(i, i + STAT_BATCH).map(async (f) => {
+      if (!(await dirExists(path.posix.dirname(f))) || !(await exists(path.join(top, ...f.split('/'))))) missing.add(f);
+    }));
+  }
+  return missing;
+}
+const STAT_BATCH = 256;
+/** lstat errors meaning "this path is not there" (as opposed to unreadable). */
+const GONE: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR', 'ELOOP']);
+
+/**
+ * Index entries flagged assume-unchanged (lowercase tag in `git ls-files -v`) or skip-worktree
+ * (`S`). A skip-worktree file missing from the working tree that the sparse checkout leaves out
+ * (`excluded`, from {@link sparseExcluded}) is expected and left out.
+ */
+export async function indexFlagged(cwd: string, paths?: readonly string[], excluded: ((file: string) => boolean) | null = null): Promise<string[]> {
+  const root = await repoRoot(cwd);
+  const entries = (await indexEntries(root, paths)).filter((e) => isSkipWorktree(e.tag) || isAssumeUnchanged(e.tag));
+  const sparse = await sparseMissing(root, entries, excluded);
+  return [...new Set(entries.filter((e) => !sparse.has(e.path)).map((e) => e.path))];
+}
+
+/** Skip-worktree entries the sparse patterns leave out and that are missing from the working tree: no deletion. */
+export async function sparseMissing(root: string, entries: readonly IndexEntry[], excluded: ((file: string) => boolean) | null): Promise<Set<string>> {
+  if (!excluded) return new Set();
+  const candidates = [...new Set(entries.filter((e) => isSkipWorktree(e.tag) && excluded(e.path)).map((e) => e.path))];
+  return candidates.length ? missingFiles(root, candidates) : new Set();
+}
+
+/**
+ * `args` (a `git diff` up to its base revision) for `pathspecs`, through a temporary index rebuilt
+ * from the real one's entries (mode, blob id, stage) alone: no stat data, so git hashes every
+ * working tree file instead of trusting a stat-clean entry (an index entry forged to the old blob
+ * with the new file's stat data hides a change from a plain `git diff`), and no assume-unchanged or
+ * skip-worktree flags. Only skip-worktree files the sparse checkout leaves out and that are missing
+ * keep their flag. Any failure throws {@link FailClosedError}: the files' content is unknown.
+ *
+ * With `match` (a long pathspec list, see {@link pathspecMatcher}) git runs once over the whole
+ * tree instead: every entry goes into the temporary index, the ones `match` rejects marked
+ * assume-unchanged so git does not look at them, and the output is cut down to the matching files.
+ */
+async function diffThroughContentIndex(root: string, args: string[], pathspecs: readonly string[], excluded: ((file: string) => boolean) | null, match?: (file: string) => boolean): Promise<DetailedDiff> {
+  let dir: string | undefined;
+  try {
+    const all = await indexEntries(root, match ? undefined : pathspecs);
+    const entries = match ? all.filter((e) => match(e.path)) : all;
+    const sparse = await sparseMissing(root, entries, excluded);
+    dir = await mkdtemp(path.join(os.tmpdir(), 'why-diff-index-'));
+    const env = { GIT_INDEX_FILE: path.join(dir, 'index') };
+    // A plain index file: with core.splitIndex git would write a shared index into the repository.
+    const plain = ['-c', 'core.splitIndex=false', '-c', 'index.sparse=false'];
+    const list = (names: Iterable<string>): string => [...names].map((f) => `${f}\0`).join('');
+    await git(root, [...plain, 'update-index', '-z', '--index-info'], { env, input: all.map((e) => `${e.mode} ${e.oid} ${e.stage}\t${e.path}\0`).join('') });
+    if (match) {
+      const others = new Set(all.filter((e) => !match(e.path)).map((e) => e.path));
+      if (others.size) await git(root, [...plain, 'update-index', '-z', '--assume-unchanged', '--stdin'], { env, input: list(others) });
+    }
+    if (sparse.size) await git(root, [...plain, 'update-index', '-z', '--skip-worktree', '--stdin'], { env, input: list(sparse) });
+    let raw: string;
+    if (match) {
+      raw = splitSections(await git(root, args, { env, trim: false })).filter((section) => {
+        const h = parseUnifiedDiff(section)[0];
+        return !h || match(h.file) || (h.oldFile !== undefined && match(h.oldFile));
+      }).join('');
+    } else {
+      raw = await gitPaths(root, args, pathspecs, { env });
+    }
+    return await revealTextMarkedBinary(root, args, raw, env);
+  } catch (err) {
+    throw err instanceof FailClosedError ? err : new FailClosedError(`cannot diff the working tree through a temporary index (${(err as Error).message})`);
+  } finally {
+    if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
+ * A long pathspec list as a name predicate, so git can run once over the whole tree: matching every
+ * file against thousands of pathspecs (in several calls, see {@link chunkPaths}) is quadratic.
+ * `:(literal)` and `:(literal,icase)` pathspecs (a file, or a directory and everything under it) are
+ * compared here; any other (globs) are few and resolved to file names by git: tracked, untracked,
+ * and changed against `rev` (deleted files).
+ */
+async function pathspecMatcher(root: string, pathspecs: readonly string[], rev: string): Promise<(file: string) => boolean> {
+  const exact = new Set<string>();
+  const lower = new Set<string>();
+  const magic: string[] = [];
+  let everything = false;
+  for (const p of pathspecs) {
+    const m = /^:\(([^)]*)\)([\s\S]*)$/.exec(p);
+    const words = m ? m[1]!.split(',') : [];
+    if (!m || !words.includes('literal') || !words.every((w) => w === 'literal' || w === 'icase')) {
+      magic.push(p);
+      continue;
+    }
+    const name = m[2]!.replace(/\/+$/, '');
+    if (!name || name === '.') everything = true;
+    if (words.includes('icase')) lower.add(name.toLowerCase());
+    else exact.add(name);
+  }
+  const named = new Set<string>();
+  if (magic.length) {
+    for (const out of [
+      await gitPaths(root, ['ls-files', '-z'], magic),
+      await gitPaths(root, ['ls-files', '--others', '--exclude-standard', '-z'], magic),
+      await gitPaths(root, ['diff', '--name-only', '--no-renames', '-z', rev], magic),
+    ]) for (const f of out.split('\0')) if (f) named.add(f);
+  }
+  return (file) => {
+    if (everything || named.has(file)) return true;
+    // The file itself or any directory above it.
+    for (let i = file.length; i > 0; i = file.lastIndexOf('/', i - 1)) {
+      const prefix = file.slice(0, i);
+      if (exact.has(prefix) || (lower.size && lower.has(prefix.toLowerCase()))) return true;
+    }
+    return false;
+  };
+}
+
+/**
+ * The repository's sparse checkout as a predicate "the patterns leave this file out", or null
+ * when there is none to honour: `core.sparseCheckout` is not true, or no patterns file. Cone mode
+ * (`core.sparseCheckoutCone`) reads the cone directories from the patterns file; otherwise the
+ * patterns are matched by `git ls-files -i -X` (gitignore rules, which take in at least every file
+ * git's sparse matcher does, and no per-directory `.gitignore`).
+ *
+ * With `trust` (the guard), only the repository's own config counts: `core.sparseCheckout` and
+ * `core.sparseCheckoutCone` from the local or worktree scope, where a file included into that config
+ * must have changed before `trust.before`; and the patterns file too. The repository's own config
+ * file is exempt from the time check: every `git config`, `git remote`, `git branch -u` rewrites it,
+ * and what it can switch on is limited to files the earlier patterns leave out.
+ */
+export async function sparseExcluded(root: string, trust?: SparseTrust): Promise<((file: string) => boolean) | null> {
+  const own = trust ? await Promise.all(['config', 'config.worktree'].map(async (n) => samePathKey(path.resolve(root, await git(root, ['rev-parse', '--git-path', n]))))) : [];
+  const setting = async (key: string): Promise<{ value: boolean; trusted: boolean } | undefined> => {
+    let out: string;
+    try {
+      out = await git(root, ['config', '--show-origin', '--show-scope', '-z', '--bool', key], { trim: false });
+    } catch (err) {
+      if (err instanceof GitError && err.exitCode === 1 && !err.stderr.trim()) return undefined; // not set
+      throw err;
+    }
+    const [scope = '', origin = '', value = ''] = out.split('\0');
+    if (!trust) return { value: value === 'true', trusted: true };
+    if ((scope !== 'local' && scope !== 'worktree') || !origin.startsWith('file:')) return { value: value === 'true', trusted: false };
+    const file = path.resolve(root, origin.slice('file:'.length));
+    if (own.includes(samePathKey(file))) return { value: value === 'true', trusted: true };
+    const t = await trust.timeOf(file).catch(() => Infinity);
+    return { value: value === 'true', trusted: t < trust.before };
+  };
+  const enabled = await setting('core.sparseCheckout');
+  if (!enabled?.value || !enabled.trusted) return null;
+  const cone = await setting('core.sparseCheckoutCone');
+  if (cone && !cone.trusted) return null;
+
+  const file = path.resolve(root, await git(root, ['rev-parse', '--git-path', 'info/sparse-checkout']));
+  if (trust) {
+    const t = await trust.timeOf(file).catch((err: NodeJS.ErrnoException) => (err.code === 'ENOENT' ? undefined : Infinity));
+    if (t === undefined || !(t < trust.before)) return null;
+  }
+  let text: string;
+  try {
+    text = await readFile(file, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+  const icase = await isCaseInsensitive(root);
+  const conePredicate = cone?.value ? coneExcluded(text, icase) : null;
+  if (conePredicate) return conePredicate;
+  // Every tracked file the patterns match (are checked out); the rest are left out.
+  const included = new Set((await git(root, ['-c', `core.ignoreCase=${icase}`, 'ls-files', '-z', '--cached', '--ignored', '--exclude-from', file], { trim: false })).split('\0').filter(Boolean));
+  return (f) => !included.has(f);
+}
+
+/** Path comparison key: case-insensitive and slash-agnostic on Windows. */
+function samePathKey(p: string): string {
+  const r = path.resolve(p);
+  return process.platform === 'win32' ? r.toLowerCase() : r;
+}
+
+/**
+ * Cone mode patterns (`/*`, `!/*\/`, `/dir/`, `!/dir/*\/`) as a predicate "left out": a file is in
+ * when it sits at the top level, directly in a parent of a cone directory, or anywhere under a cone
+ * directory. Null when the file holds anything else (git then falls back to full patterns too).
+ */
+function coneExcluded(text: string, icase: boolean): ((file: string) => boolean) | null {
+  const norm = (p: string): string => (icase ? p.toLowerCase() : p);
+  const positive = new Set<string>();
+  const negated = new Set<string>();
+  let top = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/[ \t]+$/, '');
+    if (!line || line.startsWith('#')) continue;
+    if (line === '/*') { top = true; continue; }
+    if (line === '!/*/') continue;
+    const neg = /^!\/(.+)\/\*\/$/.exec(line);
+    if (neg && !/[*?[\]\\]/.test(neg[1]!)) { negated.add(norm(neg[1]!)); continue; }
+    const pos = /^\/(.+)\/$/.exec(line);
+    if (pos && !/[*?[\]\\]/.test(pos[1]!)) { positive.add(norm(pos[1]!)); continue; }
+    return null;
+  }
+  if (!top) return null;
+  const recursive = [...positive].filter((d) => !negated.has(d));
+  const parents = new Set([...positive].filter((d) => negated.has(d)));
+  return (file) => {
+    const f = norm(file);
+    const dir = path.posix.dirname(f);
+    if (dir === '.' || parents.has(dir)) return false;
+    return !recursive.some((d) => f.startsWith(`${d}/`));
+  };
 }
 
 /** Git's binary sniff: a NUL byte within the first this many bytes of either side. */
@@ -448,7 +699,7 @@ const BINARY_SNIFF = 8000;
  * replaces the binary stub. NUL bytes later in such a file are shown as U+2400. There is no file or
  * size cap: if the content cannot be checked, the file is re-diffed as text (fail closed).
  */
-async function revealTextMarkedBinary(cwd: string, args: string[], diff: string): Promise<DetailedDiff> {
+async function revealTextMarkedBinary(cwd: string, args: string[], diff: string, env?: Record<string, string>): Promise<DetailedDiff> {
   if (!diff.includes('Binary files ') && !diff.includes('GIT binary patch')) return { diff, unreviewed: [] };
   const sections = splitSections(diff);
   const binary = new Map<number, string[]>();
@@ -457,7 +708,7 @@ async function revealTextMarkedBinary(cwd: string, args: string[], diff: string)
     if (h?.header === BINARY_HUNK_HEADER) binary.set(i, [...new Set([h.file, ...(h.oldFile ? [h.oldFile] : [])])]);
   }
   if (!binary.size) return { diff, unreviewed: [] };
-  const realBinary = await binaryByContent(cwd, args, [...new Set([...binary.values()].flat())]).catch(() => new Set<string>());
+  const realBinary = await binaryByContent(cwd, args, [...new Set([...binary.values()].flat())], env).catch(() => new Set<string>());
   // One re-diff per file group (a rename re-diffs both of its names together), in small batches; a
   // batch that fails (too big, git error) is retried file by file, and a file that still fails is
   // reported as unreviewed rather than passed off as binary.
@@ -466,7 +717,7 @@ async function revealTextMarkedBinary(cwd: string, args: string[], diff: string)
   const byFile = new Map<string, string>();
   const unreviewed = new Set<string>();
   const rediff = (names: string[]): Promise<string> =>
-    gitPaths(cwd, [...args, '--text'], names.map((f) => `:(literal)${f}`), { maxBuffer });
+    gitPaths(cwd, [...args, '--text'], names.map((f) => `:(literal)${f}`), { maxBuffer, env });
   const take = (out: string): void => {
     for (const section of splitSections(out)) {
       const h = parseUnifiedDiff(section)[0];
@@ -504,8 +755,8 @@ const REDIFF_MAX_BYTES = 64 * 1024 * 1024;
  * Of `files` (paths on either side of the diff `args` describes), those whose content is binary by
  * git's own rule, ignoring attributes: a NUL byte in the first 8000 bytes of the old or the new side.
  */
-async function binaryByContent(cwd: string, args: string[], files: string[]): Promise<Set<string>> {
-  const raw = (await gitPaths(cwd, [...args.filter((a) => !a.startsWith('--unified')), '--raw', '-z', '--no-abbrev'], files.map((f) => `:(literal)${f}`))).split('\0');
+async function binaryByContent(cwd: string, args: string[], files: string[], env?: Record<string, string>): Promise<Set<string>> {
+  const raw = (await gitPaths(cwd, [...args.filter((a) => !a.startsWith('--unified')), '--raw', '-z', '--no-abbrev'], files.map((f) => `:(literal)${f}`), { env })).split('\0');
   const root = await repoRoot(cwd);
   const entries: Array<{ shas: string[]; paths: string[] }> = [];
   for (let i = 0; i < raw.length; ) {

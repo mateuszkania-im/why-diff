@@ -585,6 +585,8 @@ describe('sec030: index flags (assume-unchanged, skip-worktree) cannot hide a ch
       bash(callAt, 'git config core.sparseCheckout true && git update-index --skip-worktree test/f.test.js && rm test/f.test.js'),
     ] }]);
     sh(repo, ['config', 'core.sparseCheckout', 'true']);
+    // Patterns that leave test/ out: only then may a skip-worktree file there be missing.
+    writeFileSync(path.join(repo, '.git', 'info', 'sparse-checkout'), '/fix.js\n');
     sh(repo, ['update-index', '--skip-worktree', 'test/f.test.js']);
     rmSync(tp(repo));
     return (await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sparse' }, { blocking: BL, home, objectTime })).block;

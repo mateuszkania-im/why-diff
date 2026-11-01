@@ -4,7 +4,7 @@
  * inherited GIT_* environment variables.
  */
 import { execFileSync } from 'node:child_process';
-import { closeSync, ftruncateSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { closeSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { lstat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
@@ -102,6 +102,210 @@ describe('sec031 #2: no unbounded path list on a git command line', () => {
     const { diff } = await getDiffDetailed(repo, { workingTree: true }, { paths, contentIndex: true });
     const files = new Set(parseUnifiedDiff(diff).map((h) => h.file));
     expect(files.size).toBe(100);
+  });
+});
+
+describe('sec031 #2/#8: a long pathspec list is matched once over the whole tree', () => {
+  it('directory and glob pathspecs, deletions, flagged and untracked files all show; unnamed files do not', async () => {
+    process.env.WHY_DIFF_ARGV_BUDGET = '300';
+    const { repo, tp } = makeRepo((r) => {
+      mkdirSync(path.join(r, 'lib', 'deep'), { recursive: true });
+      writeFileSync(path.join(r, 'lib', 'deep', 'a.js'), 'export const a = 1;\n');
+      writeFileSync(path.join(r, 'lib', 'gone.js'), 'export const g = 1;\n');
+      writeFileSync(path.join(r, 'other.js'), 'export const o = 1;\n');
+      sh(r, ['add', '-A']);
+      sh(r, ['commit', '-qm', 'lib']);
+    });
+    skipT5(tp);
+    sh(repo, ['update-index', '--skip-worktree', TEST]);
+    writeFileSync(path.join(repo, 'lib', 'deep', 'a.js'), 'export const a = 2;\n');
+    rmSync(path.join(repo, 'lib', 'gone.js'));
+    writeFileSync(path.join(repo, 'src', 'new.js'), 'export const n = 1;\n');
+    writeFileSync(path.join(repo, 'other.js'), 'export const o = 2;\n');
+    const filler = Array.from({ length: 50 }, (_, i) => `:(literal)nothing/here-${i}.js`);
+    const paths = [...filler, ':(literal)lib', ':(glob)test/*.test.js', ':(literal)src/new.js'];
+    const { diff } = await getDiffDetailed(repo, { workingTree: true }, { paths, contentIndex: true });
+    const hunks = parseUnifiedDiff(diff);
+    expect(new Set(hunks.map((h) => h.file))).toEqual(new Set(['lib/deep/a.js', 'lib/gone.js', TEST, 'src/new.js']));
+    expect(hunks.find((h) => h.file === 'lib/gone.js')?.status).toBe('deleted');
+    expect(sh(repo, ['ls-files', '-v', TEST]).trim()).toBe(`S ${TEST}`);
+  });
+});
+
+describe('sec031 #3: a forged stat-clean index entry cannot hide a change', () => {
+  /** Index entry carries the old blob id but the stat data of the modified file: git diff sees nothing. */
+  function forge(repo: string): void {
+    const head = sh(repo, ['rev-parse', `HEAD:${TEST}`]).trim();
+    // An mtime well before the index write, so git does not treat the entry as racily clean.
+    const past = new Date(Date.now() - 120_000);
+    utimesSync(path.join(repo, TEST), past, past);
+    sh(repo, ['update-index', TEST]);
+    const idx = path.join(repo, '.git', 'index');
+    const buf = Buffer.from(readFileSync(idx));
+    const at = buf.indexOf(Buffer.from(sh(repo, ['rev-parse', `:${TEST}`]).trim(), 'hex'));
+    Buffer.from(head, 'hex').copy(buf, at);
+    const body = buf.subarray(0, buf.length - 20);
+    writeFileSync(idx, Buffer.concat([body, createHash('sha1').update(body).digest()]));
+  }
+  it('blocks on an it.skip edit whose index entry was forged back to the committed blob', async () => {
+    const { repo, home, tp } = makeRepo();
+    skipT5(tp);
+    forge(repo);
+    expect(sh(repo, ['diff', '--stat', 'HEAD'])).toBe('');
+    const r = await guardRun(repo, home, (t) => [editCall(t, tp), bash(t + 5000, 'python3 tools/reindex.py')]);
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('test-skip-added');
+  });
+
+  it('the temporary index leaves nothing behind in the repository, even with core.splitIndex', async () => {
+    const { repo, tp } = makeRepo((r) => {
+      sh(r, ['config', 'core.splitIndex', 'true']);
+      sh(r, ['update-index', '--split-index']);
+    });
+    skipT5(tp);
+    sh(repo, ['update-index', '--skip-worktree', TEST]);
+    const listing = (): string[] => readdirSync(path.join(repo, '.git')).sort();
+    const before = listing();
+    const { diff } = await getDiffDetailed(repo, { workingTree: true }, { paths: [`:(literal)${TEST}`], contentIndex: true });
+    expect(diff).toContain('+it.skip("t5"');
+    expect(listing()).toEqual(before);
+    expect(sh(repo, ['ls-files', '-v', TEST]).trim()).toBe(`S ${TEST}`);
+  });
+
+  it('getDiffDetailed throws FailClosedError, not an unreviewed list, when the temporary index fails', async () => {
+    const { repo, tp } = makeRepo();
+    skipT5(tp);
+    sh(repo, ['update-index', '--assume-unchanged', TEST]);
+    for (const k of ['TMPDIR', 'TMP', 'TEMP']) process.env[k] = path.join(repo, 'no-such-dir', 'tmp');
+    await expect(getDiffDetailed(repo, { workingTree: true })).rejects.toBeInstanceOf(FailClosedError);
+  });
+});
+
+describe('sec031 #4: sparse checkout is trusted only from the repository\'s own config', () => {
+  /** Sparse patterns (from before the session) that leave test/ out; the agent flags and deletes the test file. */
+  function sparseRepo(): { repo: string; home: string; tp: string } {
+    const made = makeRepo((r) => writeFileSync(path.join(r, '.git', 'info', 'sparse-checkout'), '/src/\n'));
+    return made;
+  }
+  const flagAndDelete = (repo: string, tp: string): void => {
+    sh(repo, ['update-index', '--skip-worktree', TEST]);
+    rmSync(tp);
+  };
+  const cmd = (t: number): SyntheticCall[] => [bash(t, `git update-index --skip-worktree ${TEST} && rm ${TEST}`)];
+
+  it('core.sparseCheckout from ~/.gitconfig does not excuse a deletion', async () => {
+    const { repo, home, tp } = sparseRepo();
+    const fakeHome = temp('wd-s31-gh-');
+    writeFileSync(path.join(fakeHome, '.gitconfig'), '[core]\n\tsparseCheckout = true\n\tautocrlf = false\n');
+    process.env.HOME = fakeHome;
+    process.env.USERPROFILE = fakeHome;
+    flagAndDelete(repo, tp);
+    expect((await guardRun(repo, home, cmd)).block).toBe(true);
+  });
+
+  it('core.sparseCheckout from $XDG_CONFIG_HOME/git/config does not excuse a deletion', async () => {
+    const { repo, home, tp } = sparseRepo();
+    const xdg = temp('wd-s31-xdg-');
+    mkdirSync(path.join(xdg, 'git'));
+    writeFileSync(path.join(xdg, 'git', 'config'), '[core]\n\tsparseCheckout = true\n');
+    process.env.XDG_CONFIG_HOME = xdg;
+    flagAndDelete(repo, tp);
+    expect((await guardRun(repo, home, cmd)).block).toBe(true);
+  });
+
+  it('core.sparseCheckout from a file included into the local config during the session does not excuse a deletion', async () => {
+    const { repo, home, tp } = sparseRepo();
+    const inc = path.join(temp('wd-s31-inc-'), 'sparse.cfg');
+    writeFileSync(inc, '[core]\n\tsparseCheckout = true\n');
+    sh(repo, ['config', 'include.path', inc]);
+    flagAndDelete(repo, tp);
+    const objectTime = async (p: string): Promise<number> => (path.resolve(p) === path.resolve(inc) ? (await lstat(p)).ctimeMs : oldObjects(p));
+    expect((await guardRun(repo, home, cmd, { objectTime })).block).toBe(true);
+  });
+
+  it('core.sparseCheckout from GIT_CONFIG_COUNT in the environment does not excuse a deletion', async () => {
+    const { repo, home, tp } = sparseRepo();
+    const n = Number(process.env.GIT_CONFIG_COUNT ?? 0);
+    process.env[`GIT_CONFIG_KEY_${n}`] = 'core.sparseCheckout';
+    process.env[`GIT_CONFIG_VALUE_${n}`] = 'true';
+    process.env.GIT_CONFIG_COUNT = String(n + 1);
+    flagAndDelete(repo, tp);
+    expect((await guardRun(repo, home, cmd)).block).toBe(true);
+  });
+
+  it('control: the same sparse checkout in the local config, set up before the session, excuses the missing file', async () => {
+    const { repo, home, tp } = sparseRepo();
+    sh(repo, ['config', 'core.sparseCheckout', 'true']);
+    flagAndDelete(repo, tp);
+    expect((await guardRun(repo, home, cmd)).block).toBe(false);
+  });
+});
+
+describe('sec031 #5/#6: only files the sparse patterns leave out may be missing', () => {
+  it('a sparse checkout that includes everything does not excuse deleting a flagged test file', async () => {
+    const { repo, home, tp } = makeRepo((r) => {
+      sh(r, ['config', 'core.sparseCheckout', 'true']);
+      writeFileSync(path.join(r, '.git', 'info', 'sparse-checkout'), '/*\n');
+    });
+    sh(repo, ['update-index', '--skip-worktree', TEST]);
+    rmSync(tp);
+    expect((await guardRun(repo, home, (t) => [bash(t, `git update-index --skip-worktree ${TEST} && rm ${TEST}`)])).block).toBe(true);
+  });
+
+  function coneRepo(): { repo: string; home: string; tp: string } {
+    return makeRepo((r) => {
+      writeFileSync(path.join(r, 'src', 'f.test.js'), testFile());
+      sh(r, ['add', '-A']);
+      sh(r, ['commit', '-qm', 'src test']);
+      sh(r, ['sparse-checkout', 'set', '--cone', 'src']);
+    });
+  }
+  it('cone mode: deleting a flagged in-cone test file blocks', async () => {
+    const { repo, home } = coneRepo();
+    const inCone = path.join(repo, 'src', 'f.test.js');
+    sh(repo, ['update-index', '--skip-worktree', 'src/f.test.js']);
+    rmSync(inCone);
+    expect((await guardRun(repo, home, (t) => [bash(t, 'git update-index --skip-worktree src/f.test.js && rm src/f.test.js')])).block).toBe(true);
+  });
+  it('cone mode: an out-of-cone file missing from the working tree is no deletion', async () => {
+    const { repo, home, tp } = coneRepo();
+    expect(() => readFileSync(tp)).toThrow();
+    expect((await guardRun(repo, home, (t) => [bash(t, `rm -f ${TEST}`)])).block).toBe(false);
+  });
+  it('cone mode: patterns changed during the session are not trusted', async () => {
+    const { repo, home } = makeRepo();
+    sh(repo, ['sparse-checkout', 'set', '--cone', 'src']);
+    const objectTime = async (p: string): Promise<number> => (/sparse-checkout$/.test(p) ? (await lstat(p)).ctimeMs : oldObjects(p));
+    let callAt = 0;
+    const statTime = async (p: string): Promise<number> => { await lstat(p); return callAt + 1000; };
+    const r = await guardRun(repo, home, (t) => {
+      callAt = t;
+      return [bash(t, 'git sparse-checkout set --cone src')];
+    }, { objectTime, statTime });
+    expect(r.block).toBe(true);
+  });
+
+  it('touching the config and the repo root during the session does not turn out-of-cone files into deletions', async () => {
+    const { repo, home } = makeRepo((r) => {
+      mkdirSync(path.join(r, 'vendor', 'pkg'), { recursive: true });
+      writeFileSync(path.join(r, 'vendor', 'pkg', 'x.test.js'), testFile());
+      sh(r, ['add', '-A']);
+      sh(r, ['commit', '-qm', 'vendor']);
+      sh(r, ['sparse-checkout', 'set', '--cone', 'src', 'test']);
+    });
+    expect(() => readFileSync(path.join(repo, 'vendor', 'pkg', 'x.test.js'))).toThrow();
+    sh(repo, ['config', 'core.editor', 'vi']);
+    let callAt = 0;
+    // The config file and the repo root (where notes.md was written) changed during the call.
+    const objectTime = async (p: string): Promise<number> => (/[\\/]config(\.worktree)?$/.test(p) ? callAt + 1000 : oldObjects(p));
+    const statTime = async (p: string): Promise<number> => (path.resolve(p) === path.resolve(repo) ? callAt + 1000 : (await lstat(p)).ctimeMs);
+    writeFileSync(path.join(repo, 'notes.md'), 'x\n');
+    const r = await guardRun(repo, home, (t) => {
+      callAt = t;
+      return [bash(t, 'git config core.editor vi && touch notes.md')];
+    }, { objectTime, statTime });
+    expect(r.hits).toEqual([]);
+    expect(r.block).toBe(false);
   });
 });
 

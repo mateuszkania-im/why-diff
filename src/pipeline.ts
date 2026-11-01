@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { lstat, readFile, stat } from 'node:fs/promises';
 import type { Harness, Hunk, Prompt, Report, Session, SessionAdapter } from './types.js';
-import { getDiffDetailed, git, isCaseInsensitive, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
+import { getDiffDetailed, git, isCaseInsensitive, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget, type SparseTrust } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
 import { attribute, repoRelativePath, rootVariants } from './attribute.js';
 import { labelHunks, needsFileText } from './labels.js';
@@ -43,6 +43,10 @@ export interface BuildOptions {
   paths?: string[];
   /** See {@link DiffOptions.honourSparseCheckout} */
   honourSparseCheckout?: boolean;
+  /** See {@link DiffOptions.sparseTrust} */
+  sparseTrust?: SparseTrust;
+  /** See {@link DiffOptions.contentIndex} */
+  contentIndex?: boolean;
   /** Harnesses to read; default all */
   harnesses?: Harness[];
   /** Explicit transcript files (skips discovery) */
@@ -120,7 +124,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   const ignoredGlob = compileGlobs(config.ignore);
 
   log(`diffing ${rangeLabel}`);
-  const detailed = await getDiffDetailed(root, target, { paths: opts.paths, honourSparseCheckout: opts.honourSparseCheckout });
+  const detailed = await getDiffDetailed(root, target, { paths: opts.paths, honourSparseCheckout: opts.honourSparseCheckout, sparseTrust: opts.sparseTrust, contentIndex: opts.contentIndex });
   const allHunks = parseUnifiedDiff(detailed.diff);
   const unreviewed = new Set(detailed.unreviewed);
 

@@ -13,7 +13,7 @@ import readline from 'node:readline';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
-import { emptyTree, FailClosedError, git, hasHead, indexFlagged, isCaseInsensitive, listUntracked, repoRoot, worktreeRoots } from './git.js';
+import { emptyTree, FailClosedError, git, hasHead, indexEntries, isCaseInsensitive, listUntracked, repoRoot, sparseExcluded, sparseMissing, worktreeRoots, type SparseTrust } from './git.js';
 import { globToRegExp, repoRelativePath, rootVariants } from './attribute.js';
 import { compileGlobs, loadConfig, type WhyDiffConfig } from './config.js';
 import type { Hunk, LabelKind, Session } from './types.js';
@@ -91,9 +91,11 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   // Files a shell command changed without naming them (a script computing the path, `rsync --delete`,
   // a path from the environment, a background process): credited when the file (or, once deleted,
   // the nearest path above it) last changed (ctime) while one of this session's tool calls ran.
-  // A sparse checkout set up (or changed) during the session cannot excuse a missing file.
-  const honourSparse = await sparseSetupBefore(root, Date.parse(session.startedAt), opts.objectTime ?? changeTime);
-  const byWindow = await toolWindowFiles(root, headed ? baseRev : undefined, session, opts.statTime ?? changeTime, honourSparse);
+  // A skip-worktree file missing from the working tree is excused only when the sparse checkout,
+  // as the repository's own config and patterns from before the session define it, leaves it out.
+  const sparseTrust: SparseTrust = { before: Date.parse(session.startedAt) - WINDOW_SLACK_MS, timeOf: opts.objectTime ?? changeTime };
+  const excluded = await sparseExcluded(root, sparseTrust);
+  const byWindow = await toolWindowFiles(root, headed ? baseRev : undefined, session, opts.statTime ?? changeTime, excluded);
   for (const f of [...byWindow.written, ...byWindow.removed]) paths.push(`:(literal)${f}`);
   if (!paths.length) return NO_BLOCK;
 
@@ -113,7 +115,9 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
     home: opts.home,
     config,
     keepAgentIgnored: true,
-    honourSparseCheckout: honourSparse,
+    sparseTrust,
+    // Every path through a temporary index without stat data or flags: git hashes the content.
+    contentIndex: true,
   });
 
   // Paths the session's own shell commands targeted literally (or by a glob), by kind of operation:
@@ -207,7 +211,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
 const SHELL_GLOB = /[*?[]/;
 /** Clock slack on each side of a tool call window (transcript stamps vs file system times). */
 const WINDOW_SLACK_MS = 2000;
-const LSTAT_BATCH = 64;
+const LSTAT_BATCH = 256;
 /** lstat errors meaning "this path is not there any more" (as opposed to unreadable). */
 const GONE: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR', 'ELOOP']);
 
@@ -221,13 +225,15 @@ async function changeTime(p: string): Promise<number> {
 }
 
 /**
- * Changed files (against `rev`, working tree and untracked) whose change time lies inside one of the
- * session's tool call windows (`written`), and deleted ones whose nearest existing ancestor's time
- * does (`removed`). A human edit after the call moves the time out of every window, so it is never
- * credited; a human edit while an agent tool call is running is (the one edge; long calls, subagents
- * and background processes widen it).
+ * Changed files (against `rev`, working tree and untracked) and every tracked file, whose change
+ * time lies inside one of the session's tool call windows (`written`), and deleted ones whose
+ * nearest existing ancestor's time does (`removed`). Every tracked file is checked, not only those
+ * `git diff` lists: an index entry (flagged, or forged with the new file's stat data) can hide a
+ * change from git, not from the file's ctime. A human edit after the call moves the time out of
+ * every window, so it is never credited; a human edit while an agent tool call is running is (the
+ * one edge; long calls, subagents and background processes widen it).
  */
-async function toolWindowFiles(root: string, rev: string | undefined, session: Session, timeOf: (p: string) => Promise<number>, honourSparse: boolean): Promise<{ written: Set<string>; removed: Set<string> }> {
+async function toolWindowFiles(root: string, rev: string | undefined, session: Session, timeOf: (p: string) => Promise<number>, excluded: ((file: string) => boolean) | null): Promise<{ written: Set<string>; removed: Set<string> }> {
   const written = new Set<string>();
   const removed = new Set<string>();
   const now = Date.now();
@@ -240,33 +246,48 @@ async function toolWindowFiles(root: string, rev: string | undefined, session: S
   if (!windows.length) return { written, removed };
   const inWindow = (ms: number): boolean => windows.some((w) => ms >= w.start && ms <= w.end);
 
-  const changed = await git(root, ['diff', '--name-only', '--no-renames', '-z', rev ?? (await emptyTree(root)), '--'], { trim: false }).catch(() => '');
-  // Files flagged assume-unchanged or skip-worktree are missing from `git diff --name-only`.
-  const flagged = await indexFlagged(root, undefined, honourSparse).catch(() => []);
-  const files = [...new Set([...changed.split('\0').filter(Boolean), ...(await listUntracked(root).catch(() => [])), ...flagged])]
-    .filter((f) => !f.startsWith('.why-diff/'));
+  const changed = await git(root, ['diff', '--name-only', '--no-renames', '-z', rev ?? (await emptyTree(root)), '--'], { trim: false });
+  const entries = await indexEntries(root);
+  // Skip-worktree files the sparse checkout leaves out are expected to be missing.
+  const sparse = await sparseMissing(root, entries, excluded);
+  const files = [...new Set([...changed.split('\0').filter(Boolean), ...entries.map((e) => e.path), ...(await listUntracked(root))])]
+    .filter((f) => !f.startsWith('.why-diff/') && !sparse.has(f));
   // `git rev-parse --show-toplevel` prints `C:/x` on Windows: resolve it so the walk below compares like with like.
   const top = path.resolve(root);
+  const gone = (err: unknown): boolean => {
+    if (GONE.has((err as NodeJS.ErrnoException).code ?? '')) return true;
+    throw err;
+  };
+  // Deleted: date it by the nearest path above it that still exists (up to the repo root). A parent
+  // replaced by a file (ENOTDIR) or a symlink loop (ELOOP) is gone as a directory too. One lookup per directory.
+  const dirTimes = new Map<string, Promise<number | undefined>>();
+  const dirTime = (dir: string): Promise<number | undefined> => {
+    let t = dirTimes.get(dir);
+    if (!t) {
+      t = timeOf(dir).catch((err) => {
+        gone(err);
+        if (dir === top || path.dirname(dir) === dir || !dir.startsWith(top)) return undefined;
+        return dirTime(path.dirname(dir));
+      });
+      dirTimes.set(dir, t);
+    }
+    return t;
+  };
   for (let i = 0; i < files.length; i += LSTAT_BATCH) {
     await Promise.all(files.slice(i, i + LSTAT_BATCH).map(async (f) => {
       const abs = path.join(top, ...f.split('/'));
+      let t: number | undefined;
       try {
-        if (inWindow(await timeOf(abs))) written.add(f);
-        return;
+        t = await timeOf(abs);
       } catch (err) {
-        if (!GONE.has((err as NodeJS.ErrnoException).code ?? '')) return;
+        gone(err);
       }
-      // Deleted: date it by the nearest path above it that still exists (up to the repo root). A
-      // parent replaced by a file (ENOTDIR) or a symlink loop (ELOOP) is gone as a directory too.
-      for (let dir = path.dirname(abs); ; dir = path.dirname(dir)) {
-        try {
-          if (inWindow(await timeOf(dir))) removed.add(f);
-          return;
-        } catch (err) {
-          if (!GONE.has((err as NodeJS.ErrnoException).code ?? '')) return;
-        }
-        if (dir === top || path.dirname(dir) === dir || !dir.startsWith(top)) return;
+      if (t !== undefined) {
+        if (inWindow(t)) written.add(f);
+        return;
       }
+      const d = await dirTime(path.dirname(abs));
+      if (d !== undefined && inWindow(d)) removed.add(f);
     }));
   }
   return { written, removed };
@@ -345,22 +366,6 @@ async function sessionBase(root: string, startedAt: number, timeOf: (p: string) 
   const ancestor = await git(root, ['merge-base', '--is-ancestor', base, 'HEAD']).then(() => true, () => false);
   if (!ancestor) base = await git(root, ['merge-base', base, 'HEAD']).catch(() => base!);
   return base;
-}
-
-/**
- * Was the sparse checkout setup (the config, `config.worktree`, `info/sparse-checkout`) last changed
- * before the session started? Only then may a skip-worktree file missing from the working tree be
- * taken as sparse rather than deleted.
- */
-async function sparseSetupBefore(root: string, startedAt: number, timeOf: (p: string) => Promise<number>): Promise<boolean> {
-  if (!Number.isFinite(startedAt)) return false;
-  const cutoff = startedAt - WINDOW_SLACK_MS;
-  for (const name of ['config', 'config.worktree', 'info/sparse-checkout']) {
-    const file = path.resolve(root, await git(root, ['rev-parse', '--git-path', name]).catch(() => name));
-    const t = await timeOf(file).catch((err: NodeJS.ErrnoException) => (err.code === 'ENOENT' ? -Infinity : Infinity));
-    if (t >= cutoff) return false;
-  }
-  return true;
 }
 
 /** Is `sha` listed in this pack index (version 2: magic, version, 256-entry fan-out, sorted names)? */
