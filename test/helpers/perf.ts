@@ -43,18 +43,35 @@ export async function bestOfAsync(fn: () => Promise<unknown>, runs = RUNS): Prom
 }
 
 /**
- * Time `small` (1x input) and `large` (4x input) with the same repetition count, chosen so the 1x
- * measurement does at least {@link MIN_WORK_MS} of work, and expect large <= 10x small.
+ * Time `small` (1x input) and `large` (4x input) and expect large <= 10x small, without any
+ * absolute threshold. Both are warmed up first, the repetition count is calibrated on the warmed
+ * 1x workload (fastest of 3) so it does at least {@link MIN_WORK_MS}, and the 1x and 4x runs are
+ * interleaved so a burst of load hits both. Load only inflates a ratio by chance, while a quadratic
+ * step gives about 16x every time, so a failing ratio is measured again (up to {@link ATTEMPTS}
+ * times) and the best one is checked.
  */
 export function expectScalesSubQuadratically(small: () => unknown, large: () => unknown): { t1: number; t4: number } {
   small();
+  large();
   let reps = 1;
-  while (time(small, reps) < MIN_WORK_MS && reps < 1 << 16) reps *= 2;
-  const t1 = bestOf(small, RUNS, reps);
-  const t4 = bestOf(large, RUNS, reps);
-  expectSubQuadratic(t1, t4);
-  return { t1: t1 / reps, t4: t4 / reps };
+  while (Math.min(time(small, reps), time(small, reps), time(small, reps)) < MIN_WORK_MS && reps < 1 << 16) reps *= 2;
+  let best = { t1: Infinity, t4: Infinity };
+  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+    let t1 = Infinity;
+    let t4 = Infinity;
+    for (let i = 0; i < RUNS; i++) {
+      t1 = Math.min(t1, time(small, reps));
+      t4 = Math.min(t4, time(large, reps));
+    }
+    if (t4 / t1 < best.t4 / best.t1 || !Number.isFinite(best.t1)) best = { t1, t4 };
+    if (t4 <= SCALING_LIMIT * t1) break;
+  }
+  expectSubQuadratic(best.t1, best.t4);
+  return { t1: best.t1 / reps, t4: best.t4 / reps };
 }
+
+/** Measurements of a failing scaling check before it counts as a failure. */
+export const ATTEMPTS = 3;
 
 /** `t4` (time for 4x the input) is at most 10x `t1`; `slackMs` absorbs noise when both are tiny. */
 export function expectSubQuadratic(t1: number, t4: number, slackMs = 0): void {

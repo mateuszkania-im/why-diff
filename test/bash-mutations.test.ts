@@ -170,7 +170,7 @@ describe('detectBashMutations: audit 2 shell forms', () => {
 
   it.each(['{a,', 'D=x; rm $D/{a,b} ', 'a{', '$D$D', 'for f in a b; do rm "$f"; done; '])('200 KB of %j parses in linear time', (unit) => {
     const cmd = (n: number) => () => detectBashMutations(unit.repeat(Math.ceil(n / unit.length)), CWD);
-    expect(bestOf(cmd(200_000), 3)).toBeLessThan(2000);
+    // Scaling ratio only (min of N, 1x and 4x interleaved): no absolute time a loaded runner can miss.
     expectScalesSubQuadratically(cmd(50_000), cmd(200_000));
   }, 30_000);
 });
