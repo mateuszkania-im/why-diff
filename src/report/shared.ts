@@ -286,9 +286,20 @@ export function terminalSafe(s: string): string {
   });
 }
 
-/** Text for Markdown and JSON: C0/C1 controls removed, except tab, newline and carriage return. */
+/** OSC (`ESC ]` ... BEL or ST, with its payload such as a hyperlink target), CSI and other escape sequences. */
+const OSC = /(?:\u001b\]|\u009d)[^\u0007\u001b\u009c]*(?:\u0007|\u001b\\|\u009c)?/g;
+const CSI = /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]?/g;
+const ESCAPE = /\u001b[@-Z\\-_]?/g;
+/** Zero-width characters, bidi embeddings/overrides/isolates and the BOM: invisible text that changes what a reader sees. */
+const INVISIBLE = /[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+
+/**
+ * Text for Markdown and JSON: escape sequences removed with their payload (an OSC 8 hyperlink
+ * target, a window title), then C0/C1 controls (except tab, newline and carriage return),
+ * zero-width and bidi control characters.
+ */
 export function stripControls(s: string): string {
-  return s.replace(DOCUMENT_UNSAFE, '');
+  return s.replace(OSC, '').replace(CSI, '').replace(ESCAPE, '').replace(DOCUMENT_UNSAFE, '').replace(INVISIBLE, '');
 }
 
 /** A deep copy of `value` with `fn` applied to every string in it (object keys included). */

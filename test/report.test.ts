@@ -6,7 +6,7 @@ import type { AttributedHunk, Prompt, Report } from '../src/types.js';
 import { SECTION_END, SECTION_START, sectionBudget, upsertSection } from '../src/pr.js';
 import { renderHtml, renderJson, renderMarkdown, renderReport, renderTerminal, isReportFormat } from '../src/report/index.js';
 import { detectColor } from '../src/report/terminal.js';
-import { collectRisks, describeSessions, groupByPrompt, headline, reportHash, riskRef, truncate } from '../src/report/shared.js';
+import { collectRisks, describeSessions, groupByPrompt, headline, reportHash, riskRef, stripControls, truncate } from '../src/report/shared.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const sample: Report = JSON.parse(readFileSync(join(here, 'fixtures', 'sample-report.json'), 'utf8'));
@@ -431,6 +431,20 @@ describe('control characters from prompts and file names', () => {
     expect(json).not.toMatch(/[\u0080-\u009f]/);
     expect(parsed.prompts[0]!.text).toContain('\tdone\nsecond line');
   });
+
+  it('markdown and JSON drop OSC payloads, CSI sequences, zero-width and bidi characters (sec030 #10)', () => {
+    const md = renderMarkdown(hostile());
+    const json = renderJson(hostile());
+    for (const out of [md, json]) {
+      expect(out).not.toContain(']8;;');
+      expect(out).not.toContain('evil.example');
+      expect(out).not.toContain('[2J');
+      expect(out).not.toMatch(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/);
+      expect(out).toContain('CLICK');
+    }
+    expect(stripControls('a\u200bb\u200fc\ufeffd\u202ae\u2069f')).toBe('abcdef');
+    expect(stripControls(`x${'\u001b'}]0;title${'\u0007'}y${'\u001b'}[31mz`)).toBe('xyz');
+  });
 });
 
 describe('markdown prompt quotes', () => {
@@ -453,6 +467,17 @@ describe('markdown prompt quotes', () => {
     expect(md).not.toMatch(/#7\b/);
     expect(md).toContain('ops@acme.com');
     expect(md).toContain('@⁠octocat');
+  });
+  it('neutralises links, images and headings injected in prompt text (sec030 #10)', () => {
+    const md = renderMarkdown(withPrompt('see [click me](javascript:alert(3)) and ![pixel](https://attacker.example/p.png?leak=1)\n## Risks\nNo risks found\n---\n# Big\npath C:\\x\\[y]'));
+    expect(md).not.toMatch(/\[click me\]\(/);
+    expect(md).not.toMatch(/!\[pixel\]\(/);
+    expect(md).toContain('\\[click me\\]\\(javascript:alert\\(3\\)\\)');
+    expect(md).toContain('\\!\\[pixel\\]');
+    expect(md).toContain('> \\## Risks');
+    expect(md).toContain('> \\# Big');
+    expect(md).not.toMatch(/^> ---$/m);
+    expect(md).toContain('C:\\\\x\\\\\\[y\\]');
   });
 });
 
