@@ -10,7 +10,7 @@
  * the guard reads (a truncated index, an unreadable file), and that must not let it finish unchecked.
  */
 import { createReadStream } from 'node:fs';
-import { lstat, readdir, readFile } from 'node:fs/promises';
+import { lstat, readdir, readFile, realpath } from 'node:fs/promises';
 import readline from 'node:readline';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
@@ -19,7 +19,7 @@ import { emptyTree, FailClosedError, git, hasHead, indexEntries, isCaseInsensiti
 import { globToRegExp, repoRelativePath, rootVariants } from './attribute.js';
 import { compileGlobs, loadConfig, type WhyDiffConfig } from './config.js';
 import type { Hunk, LabelKind, Session } from './types.js';
-import { recordPath, type BaseRecord } from './session-start.js';
+import { recordMarker, recordPath, type BaseRecord } from './session-start.js';
 
 export const DEFAULT_BLOCK_ON: readonly LabelKind[] = ['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path', 'unreviewed'];
 
@@ -47,6 +47,8 @@ export interface GuardResult {
   hits: string[];
   /** The check ran past its internal deadline (and blocks): the caller should exit now */
   timedOut?: boolean;
+  /** Debug notes (shown with `WHY_DIFF_DEBUG=1`): how the base was chosen */
+  notes?: string[];
 }
 
 const NO_BLOCK: GuardResult = { block: false, hits: [] };
@@ -84,9 +86,15 @@ export async function runGuard(payload: GuardPayload, opts: GuardOptions): Promi
 }
 
 async function checkSession(payload: GuardPayload, opts: GuardOptions): Promise<GuardResult> {
+  const notes: string[] = [];
+  const result = await checkSessionInner(payload, opts, notes);
+  return notes.length ? { ...result, notes } : result;
+}
+
+async function checkSessionInner(payload: GuardPayload, opts: GuardOptions, notes: string[]): Promise<GuardResult> {
   const state = { relevant: false };
   try {
-    return await guard(payload, opts, state);
+    return await guard(payload, opts, state, notes);
   } catch (err) {
     // Fail closed: git could be made to hide the agent's changes (a filter driver that cannot be
     // switched off, an index that cannot be read), or anything else went wrong while checking a
@@ -107,7 +115,7 @@ async function checkSession(payload: GuardPayload, opts: GuardOptions): Promise<
 
 const MAX_REASON = 400;
 
-async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevant: boolean }): Promise<GuardResult> {
+async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevant: boolean }, notes: string[]): Promise<GuardResult> {
   if (payload.stop_hook_active) return NO_BLOCK; // already blocked once this turn: let the agent explain and stop
   if (!payload.transcript_path) return NO_BLOCK;
 
@@ -150,12 +158,26 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
 
   const windows = windowCheck(session);
   // The base record from SessionStart: trusted only if its file last changed before the session's
-  // first tool call (the agent cannot write it earlier, and rewriting it moves its ctime).
+  // first tool call (the agent cannot write it earlier, and rewriting it moves its ctime). A record
+  // the transcript says was written (the hook's marker) must still be there.
   let recordedHead: string | undefined;
   if (record) {
-    if (windows && record.ctime >= windows.firstStart) throw new FailClosedError(`base record modified during session (${record.file})`);
-    if (!record.data) throw new FailClosedError(`the session's base record cannot be read (${record.file})`);
-    if (record.data.root === root && record.data.head) recordedHead = record.data.head;
+    if (!windows) throw new FailClosedError(`the session's base record cannot be dated: no tool call of this session has a readable time (${record.file})`);
+    if (record.ctime >= windows.firstStart) throw new FailClosedError(`base record modified during session (${record.file})`);
+    if (!record.data) throw new FailClosedError(`base record missing or unreadable (${record.file})`);
+    const real = (p: string): Promise<string> => realpath(p).catch(() => path.resolve(p));
+    if ((await real(record.data.root)) !== (await real(root))) {
+      notes.push(`base record is for another repository (${record.data.root}); this session now works in ${root}, so the base comes from the reflogs`);
+    } else if (record.data.head) {
+      recordedHead = record.data.head;
+      notes.push(`base from the SessionStart record: ${record.data.head}`);
+    } else {
+      notes.push('base record names no commit (unborn branch at session start); the base comes from the reflogs');
+    }
+  } else if (sessionId && (await transcriptHasMarker(payload.transcript_path, recordMarker(sessionId)).catch(() => true))) {
+    throw new FailClosedError(`base record missing: the SessionStart hook recorded one for this session, and it is gone (${recordPath(sessionId)})`);
+  } else {
+    notes.push('no SessionStart base record; the base comes from the reflogs');
   }
 
   let baseRev = 'HEAD';
@@ -398,6 +420,32 @@ async function gitMetaTimes(gitEntry: string, timeOf: (p: string) => Promise<num
   return (await Promise.all(files)).filter((t): t is number => t !== undefined);
 }
 
+/**
+ * Does the transcript hold the SessionStart hook's marker for this session (a hook attachment line
+ * whose output carries it)? Proof that the base record was written, so it must still exist.
+ */
+async function transcriptHasMarker(transcript: string | undefined, marker: string): Promise<boolean> {
+  if (!transcript) return false;
+  const stream = createReadStream(transcript, { encoding: 'utf8' });
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const raw of lines) {
+      if (!raw.includes(marker)) continue;
+      let line: { type?: unknown; attachment?: unknown };
+      try {
+        line = JSON.parse(raw) as typeof line;
+      } catch {
+        continue;
+      }
+      if (line.type === 'attachment' && strings(line.attachment).some((t) => t.includes(marker))) return true;
+    }
+  } finally {
+    lines.close();
+    stream.destroy();
+  }
+  return false;
+}
+
 /** The session's base record (see `why-diff session-start`) with its file's change time, if there is one. */
 async function readBaseRecord(sessionId: string, timeOf: (p: string) => Promise<number>): Promise<{ file: string; ctime: number; data?: BaseRecord } | undefined> {
   const file = recordPath(sessionId);
@@ -406,7 +454,7 @@ async function readBaseRecord(sessionId: string, timeOf: (p: string) => Promise<
     ctime = await timeOf(file);
   } catch (err) {
     if (GONE.has((err as NodeJS.ErrnoException).code ?? '')) return undefined;
-    throw new FailClosedError(`the session's base record cannot be read (${file})`);
+    throw new FailClosedError(`base record missing or unreadable (${file})`);
   }
   try {
     const data = JSON.parse(await readFile(file, 'utf8')) as BaseRecord;

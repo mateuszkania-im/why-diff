@@ -274,6 +274,7 @@ program
     try { payload = raw.trim() ? JSON.parse(raw) : {}; } catch { /* not a hook payload */ }
     const blocking = o.on === undefined ? undefined : (new Set(o.on.split(',').map((s) => s.trim()).filter(Boolean)) as Set<LabelKind>);
     const result = await runGuard(payload, { blocking });
+    if (process.env.WHY_DIFF_DEBUG === '1') for (const n of result.notes ?? []) process.stderr.write(`why-diff guard (debug): ${terminalSafe(n)}\n`);
     if (!result.block) return;
     process.exitCode = 2;
     // Past the internal deadline the check is still running: exit now, before the hook times out.
@@ -283,7 +284,8 @@ program
 
 /**
  * `why-diff session-start` — Claude Code SessionStart hook. Records HEAD's commit for the guard
- * (see src/session-start.ts). Never blocks or fails the session: always exits 0, prints nothing.
+ * (see src/session-start.ts). Never blocks or fails the session: always exits 0, and prints nothing
+ * but the SessionStart hook JSON that marks the record in the transcript.
  */
 program
   .command('session-start')
@@ -293,7 +295,9 @@ program
       const raw = await readStdin();
       let payload: Record<string, unknown> = {};
       try { payload = raw.trim() ? (JSON.parse(raw) as Record<string, unknown>) : {}; } catch { /* not a hook payload */ }
-      if (payload && typeof payload === 'object') await recordSessionStart(payload);
+      // Only valid SessionStart hook JSON ever reaches stdout (the transcript marker), or nothing.
+      const out = payload && typeof payload === 'object' ? await recordSessionStart(payload) : undefined;
+      if (out) process.stdout.write(`${out}\n`);
     } catch { /* never fail the session */ }
     process.exitCode = 0;
   });

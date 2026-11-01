@@ -5,7 +5,7 @@
  * file last changed before the session's first tool call: rewriting it changes its ctime.
  */
 import { createHash } from 'node:crypto';
-import { mkdir, open } from 'node:fs/promises';
+import { mkdir, open, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { git, repoRoot } from './git.js';
@@ -31,17 +31,38 @@ export function recordPath(sessionId: string): string {
   return path.join(dataDir(), 'sessions', `${createHash('sha256').update(sessionId).digest('hex')}.json`);
 }
 
+/** The text the SessionStart hook adds to the transcript once a session has a record. */
+export function recordMarker(sessionId: string): string {
+  return `why-diff:base-record ${createHash('sha256').update(sessionId).digest('hex')}`;
+}
+
 /**
  * Write the base record for a SessionStart payload (`{session_id, cwd, source}`). Never throws: a
  * session must start whatever happens here. Only the first SessionStart of a session writes (a
  * resume or compaction keeps the record of the real start), and a resumed session that has none
  * gets none (it would be dated after the session's earlier tool calls).
+ *
+ * Returns the hook's stdout when the session has a record: SessionStart JSON whose
+ * `additionalContext` carries {@link recordMarker}, so the transcript proves the record existed and
+ * the guard can block when it later goes missing. Otherwise undefined (print nothing).
  */
-export async function recordSessionStart(payload: { session_id?: unknown; cwd?: unknown; source?: unknown }): Promise<void> {
+export async function recordSessionStart(payload: { session_id?: unknown; cwd?: unknown; source?: unknown }): Promise<string | undefined> {
+  const id = payload.session_id;
+  if (typeof id !== 'string' || !id) return undefined;
+  await writeRecord(id, payload);
   try {
-    const id = payload.session_id;
+    const data = JSON.parse(await readFile(recordPath(id), 'utf8')) as BaseRecord;
+    if (data.session_id !== id) return undefined;
+  } catch {
+    return undefined;
+  }
+  return JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `${recordMarker(id)} (why-diff recorded the commit this session starts from)` } });
+}
+
+async function writeRecord(id: string, payload: { cwd?: unknown; source?: unknown }): Promise<void> {
+  try {
     const cwd = payload.cwd;
-    if (typeof id !== 'string' || !id || typeof cwd !== 'string' || !cwd) return;
+    if (typeof cwd !== 'string' || !cwd) return;
     if (payload.source === 'resume' || payload.source === 'compact') return;
     const root = await repoRoot(cwd);
     const head = (await git(root, ['rev-parse', '--verify', '-q', 'HEAD^{commit}']).catch(() => '')) || null;

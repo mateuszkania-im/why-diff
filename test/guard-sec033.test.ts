@@ -5,7 +5,7 @@
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { lstat } from 'node:fs/promises';
 import path from 'node:path';
@@ -508,14 +508,16 @@ describe('sec033 #9: the session-start command and its hook', () => {
   const run = (cwd: string, input: string, data: string) =>
     spawnSync(process.execPath, ['--import', tsxLoader, path.join(root, 'src', 'cli.ts'), 'session-start'], { cwd, input, encoding: 'utf8', env: { ...process.env, CLAUDE_PLUGIN_DATA: data } });
 
-  it('writes the record, prints nothing and exits 0; garbage input and a plain directory exit 0 too', () => {
+  it('writes the record, prints only the SessionStart marker JSON and exits 0; garbage input and a plain directory exit 0 silently', () => {
     const data = temp('wd-s33-data-');
     const x = repo();
     writeFileSync(x.tp, testFile());
     const head = commit(x.repo, 'A');
     const ok = run(x.repo, JSON.stringify({ session_id: 'cli-1', cwd: x.repo, source: 'startup' }), data);
     expect(ok.status).toBe(0);
-    expect(ok.stdout).toBe('');
+    const out = JSON.parse(ok.stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
+    expect(out.hookSpecificOutput.hookEventName).toBe('SessionStart');
+    expect(out.hookSpecificOutput.additionalContext).toContain(`why-diff:base-record ${createHash('sha256').update('cli-1').digest('hex')}`);
     const file = path.join(data, 'sessions', `${createHash('sha256').update('cli-1').digest('hex')}.json`);
     expect(JSON.parse(readFileSync(file, 'utf8')).head).toBe(head);
     for (const input of ['not json', '', JSON.stringify({ session_id: 'cli-2', cwd: temp('wd-s33-plain-') })]) {
@@ -529,5 +531,116 @@ describe('sec033 #9: the session-start command and its hook', () => {
     const hooks = JSON.parse(readFileSync(path.join(root, 'plugin', 'hooks', 'hooks.json'), 'utf8')) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };
     expect(hooks.hooks.Stop?.[0]?.hooks[0]?.command).toContain('why-diff.mjs" guard');
     expect(hooks.hooks.SessionStart?.[0]?.hooks[0]?.command).toContain('why-diff.mjs" session-start');
+  });
+});
+
+describe('sec033 #10: the base record cannot be deleted or sidestepped', () => {
+  const hash = (id: string): string => createHash('sha256').update(id).digest('hex');
+  /** Claude Code's transcript line for a SessionStart hook's output (shape taken from a real 2.1.x transcript). */
+  const markerLine = (id: string, sessionId = 's33'): string => JSON.stringify({
+    parentUuid: null, isSidechain: false, type: 'attachment', timestamp: iso(Date.now() - 61_000), sessionId,
+    attachment: { type: 'hook_success', hookName: 'SessionStart:startup', hookEvent: 'SessionStart', content: '', exitCode: 0, command: 'node "${CLAUDE_PLUGIN_ROOT}/bin/why-diff.mjs" session-start',
+      stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `why-diff:base-record ${hash(id)}` } }) },
+  });
+  /** guardRun with the SessionStart attachment line put first in the transcript. */
+  async function guardWithMarker(r: string, home: string, id: string, calls: (t: number) => SyntheticCall[], opts: Partial<GuardOptions> = {}) {
+    const start = Date.now() - 60_000;
+    const transcript = writeSyntheticTranscript(home, r, 's33', [{ prompt: 'make the suite green', at: iso(start), calls: calls(start + 10_000) }]);
+    writeFileSync(transcript, `${markerLine(id)}\n${readFileSync(transcript, 'utf8')}`);
+    return runGuard({ transcript_path: transcript, cwd: r, session_id: 's33' }, { blocking: BL, home, objectTime: async (p) => { await lstat(p); return 0; }, ...opts });
+  }
+
+  it('a deleted record blocks when the transcript shows the SessionStart marker', async () => {
+    process.env.CLAUDE_PLUGIN_DATA = temp('wd-s33-data-');
+    const x = repo();
+    writeFileSync(x.tp, testFile());
+    commit(x.repo, 'A');
+    const res = await guardWithMarker(x.repo, x.home, 's33', (t) => [bash(t, 'rm -rf ~/.cache/why-diff')]);
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('base record missing');
+  });
+
+  it('a record that no longer parses blocks as missing', async () => {
+    const data = temp('wd-s33-data-');
+    process.env.CLAUDE_PLUGIN_DATA = data;
+    const x = repo();
+    writeFileSync(x.tp, testFile());
+    commit(x.repo, 'A');
+    await recordSessionStart({ session_id: 's33', cwd: x.repo });
+    const file = path.join(data, 'sessions', `${hash('s33')}.json`);
+    writeFileSync(file, '{not json');
+    let callAt = 0;
+    const res = await guardWithMarker(x.repo, x.home, 's33', (t) => {
+      callAt = t;
+      return [bash(t, 'echo hi')];
+    }, { statTime: async (p) => (path.resolve(p) === path.resolve(file) ? callAt - 5000 : (await lstat(p)).ctimeMs) });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('base record missing');
+  });
+
+  it("another session's marker does not count", async () => {
+    process.env.CLAUDE_PLUGIN_DATA = temp('wd-s33-data-');
+    const x = repo();
+    writeFileSync(x.tp, testFile());
+    commit(x.repo, 'A');
+    const res = await guardWithMarker(x.repo, x.home, 'other-session', (t) => [bash(t, 'echo hi')], { statTime: async (p) => { await lstat(p); return Date.now() - 59_000; } });
+    expect(res.block).toBe(false);
+  });
+
+  it.skipIf(!posix)('the record root is compared by realpath (a symlinked spelling still names this repository)', async () => {
+    const data = temp('wd-s33-data-');
+    process.env.CLAUDE_PLUGIN_DATA = data;
+    const x = twoCommits();
+    const link = path.join(temp('wd-s33-link-'), 'repo');
+    symlinkSync(x.repo, link);
+    const file = path.join(data, 'sessions', `${hash('s33')}.json`);
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ session_id: 's33', root: link, head: x.b, at: iso(Date.now() - 60_000) }));
+    for (const log of [path.join(x.repo, '.git', 'logs', 'HEAD'), path.join(x.repo, '.git', 'logs', 'refs', 'heads', 'main')]) {
+      writeFileSync(log, readFileSync(log, 'utf8').split('\n')[0] + '\n');
+    }
+    git(x.repo, ['reset', '-q', '--hard', x.a]);
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => {
+      callAt = t;
+      return [bash(t, 'git reset --hard A')];
+    }, {
+      objectTime: objectTimes(x.repo, { [x.a]: 1000, [x.b]: 2000 }),
+      statTime: async (p) => {
+        const st = await lstat(p);
+        if (path.resolve(p) === path.resolve(file)) return callAt - 5000;
+        if (path.resolve(p) === path.resolve(x.tp)) return callAt + 1000;
+        return st.ctimeMs;
+      },
+    });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('test-skip-added');
+  });
+
+  it('a record for a different repository falls back to the reflogs and says so in the debug notes', async () => {
+    process.env.CLAUDE_PLUGIN_DATA = temp('wd-s33-data-');
+    const other = repo();
+    writeFileSync(other.tp, testFile());
+    commit(other.repo, 'other');
+    await recordSessionStart({ session_id: 's33', cwd: other.repo });
+    const x = repo();
+    writeFileSync(x.tp, testFile());
+    commit(x.repo, 'A');
+    const res = await guardRun(x.repo, x.home, (t) => [bash(t, 'echo hi')], { statTime: async (p) => { await lstat(p); return Date.now() - 59_000; } });
+    expect(res.block).toBe(false);
+    expect((res as { notes?: string[] }).notes?.join('\n')).toContain('another repository');
+  });
+
+  it('a record with no datable tool call fails closed', async () => {
+    process.env.CLAUDE_PLUGIN_DATA = temp('wd-s33-data-');
+    const x = repo();
+    writeFileSync(x.tp, testFile());
+    commit(x.repo, 'A');
+    await recordSessionStart({ session_id: 's33', cwd: x.repo });
+    replaceIn(x.tp, 'it("t5"', 'it.skip("t5"');
+    // A call whose timestamp cannot be read: an edit, but no window to date the record against.
+    const res = await guardRun(x.repo, x.home, () => [{ ...edit(0, x.tp, 'it("t5"', 'it.skip("t5"'), at: 'not a date', resultAt: 'not a date' }]);
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('base record cannot be dated');
   });
 });

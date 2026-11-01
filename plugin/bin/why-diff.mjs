@@ -4829,6 +4829,16 @@ function subjectToExpected(d, a, aliases) {
   let expected = d.operands.slice(1);
   return !LITERAL.test(a.subject) && !STRING_ONLY.test(a.subject) && !expected.includes(a.subject) ? null : `subject changed from ${clip(d.subject, 40)} to ${clip(a.subject, 40)} (${a.display} now compares a fixed value)`;
 }
+var EQUALITY = /* @__PURE__ */ new Set(["equal", "strictequal"]);
+function selfCompare(d, a) {
+  let same = (x) => x.subject !== void 0 && !x.negated && EQUALITY.has(x.matcher) && x.operands.length === 2 && x.operands[1] === x.subject;
+  return same(a) && !same(d) ? `${a.display} now compares the value with itself (${clip(a.subject ?? "", 40)})` : null;
+}
+function notAdded(d, a, aliases) {
+  if (d.negated || !a.negated || !EQUALITY.has(d.matcher) || !EQUALITY.has(a.matcher) || d.subject === void 0 || a.subject === void 0) return null;
+  let resolve = (o) => aliases.get(o) ?? o;
+  return resolve(d.subject) === resolve(a.subject) ? `.not added: ${d.display} turned into .not.${a.display}` : null;
+}
 var STRING_ONLY = /^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\$]|\\.)*`)$/;
 function detectAssertionChanges(path14, lines) {
   if (!assertionsApply(path14)) return [];
@@ -4849,9 +4859,9 @@ function detectAssertionChanges(path14, lines) {
   }
   unpaired.length === 1 && unusedAdds.length === 1 && pairs.push([unpaired.pop(), unusedAdds.pop()]);
   for (let [d, a] of pairs) {
-    let tautology = subjectToExpected(d, a, aliases);
-    if (tautology) {
-      findings.push(tautology);
+    let fixed = subjectToExpected(d, a, aliases) ?? selfCompare(d, a) ?? notAdded(d, a, aliases);
+    if (fixed) {
+      findings.push(fixed);
       continue;
     }
     let rd = rankOf(d), ra = rankOf(a);
@@ -10163,13 +10173,13 @@ function renderReport(report, format, opts = {}) {
 
 // src/guard.ts
 import { createReadStream as createReadStream4 } from "node:fs";
-import { lstat as lstat3, readdir as readdir4, readFile as readFile7 } from "node:fs/promises";
+import { lstat as lstat3, readdir as readdir4, readFile as readFile8, realpath as realpath5 } from "node:fs/promises";
 import readline2 from "node:readline";
 import path12 from "node:path";
 
 // src/session-start.ts
 import { createHash as createHash2 } from "node:crypto";
-import { mkdir as mkdir2, open as open2 } from "node:fs/promises";
+import { mkdir as mkdir2, open as open2, readFile as readFile7 } from "node:fs/promises";
 import os8 from "node:os";
 import path11 from "node:path";
 function dataDir() {
@@ -10178,10 +10188,25 @@ function dataDir() {
 function recordPath(sessionId) {
   return path11.join(dataDir(), "sessions", `${createHash2("sha256").update(sessionId).digest("hex")}.json`);
 }
+function recordMarker(sessionId) {
+  return `why-diff:base-record ${createHash2("sha256").update(sessionId).digest("hex")}`;
+}
 async function recordSessionStart(payload) {
+  let id = payload.session_id;
+  if (!(typeof id != "string" || !id)) {
+    await writeRecord(id, payload);
+    try {
+      if (JSON.parse(await readFile7(recordPath(id), "utf8")).session_id !== id) return;
+    } catch {
+      return;
+    }
+    return JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: `${recordMarker(id)} (why-diff recorded the commit this session starts from)` } });
+  }
+}
+async function writeRecord(id, payload) {
   try {
-    let id = payload.session_id, cwd = payload.cwd;
-    if (typeof id != "string" || !id || typeof cwd != "string" || !cwd || payload.source === "resume" || payload.source === "compact") return;
+    let cwd = payload.cwd;
+    if (typeof cwd != "string" || !cwd || payload.source === "resume" || payload.source === "compact") return;
     let root = await repoRoot(cwd), head = await git(root, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]).catch(() => "") || null, record = { session_id: id, root, head, at: (/* @__PURE__ */ new Date()).toISOString() }, file = recordPath(id);
     await mkdir2(path11.dirname(file), { recursive: !0, mode: 448 });
     let fh = await open2(file, "wx", 384);
@@ -10221,9 +10246,13 @@ Tell the user that why-diff could not check the changes you made in this session
   }
 }
 async function checkSession(payload, opts) {
+  let notes = [], result = await checkSessionInner(payload, opts, notes);
+  return notes.length ? { ...result, notes } : result;
+}
+async function checkSessionInner(payload, opts, notes) {
   let state = { relevant: !1 };
   try {
-    return await guard(payload, opts, state);
+    return await guard(payload, opts, state, notes);
   } catch (err) {
     if (err instanceof FailClosedError || state.relevant) {
       let reason = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
@@ -10242,7 +10271,7 @@ Tell the user that why-diff could not check the changes you made in this session
   }
 }
 var MAX_REASON = 400;
-async function guard(payload, opts, state) {
+async function guard(payload, opts, state, notes) {
   if (payload.stop_hook_active || !payload.transcript_path) return NO_BLOCK;
   let cwd = payload.cwd ?? process.cwd(), gitEntry = await findGitEntry(cwd);
   if (!gitEntry) return NO_BLOCK;
@@ -10256,9 +10285,15 @@ async function guard(payload, opts, state) {
     return [.../* @__PURE__ */ new Set([p, p.normalize("NFD")])].map((v) => `${magic}${v}`);
   }).flatMap((p) => p ?? []))], windows = windowCheck(session), recordedHead;
   if (record) {
-    if (windows && record.ctime >= windows.firstStart) throw new FailClosedError(`base record modified during session (${record.file})`);
-    if (!record.data) throw new FailClosedError(`the session's base record cannot be read (${record.file})`);
-    record.data.root === root && record.data.head && (recordedHead = record.data.head);
+    if (!windows) throw new FailClosedError(`the session's base record cannot be dated: no tool call of this session has a readable time (${record.file})`);
+    if (record.ctime >= windows.firstStart) throw new FailClosedError(`base record modified during session (${record.file})`);
+    if (!record.data) throw new FailClosedError(`base record missing or unreadable (${record.file})`);
+    let real = (p) => realpath5(p).catch(() => path12.resolve(p));
+    await real(record.data.root) !== await real(root) ? notes.push(`base record is for another repository (${record.data.root}); this session now works in ${root}, so the base comes from the reflogs`) : record.data.head ? (recordedHead = record.data.head, notes.push(`base from the SessionStart record: ${record.data.head}`)) : notes.push("base record names no commit (unborn branch at session start); the base comes from the reflogs");
+  } else {
+    if (sessionId && await transcriptHasMarker(payload.transcript_path, recordMarker(sessionId)).catch(() => !0))
+      throw new FailClosedError(`base record missing: the SessionStart hook recorded one for this session, and it is gone (${recordPath(sessionId)})`);
+    notes.push("no SessionStart base record; the base comes from the reflogs");
   }
   let baseRev = "HEAD", headed = await hasHead(root);
   headed && (baseRev = await sessionBase(root, Date.parse(session.startedAt), opts.objectTime ?? changeTime, recordedHead));
@@ -10369,20 +10404,39 @@ async function gitMetaTimes(gitEntry, timeOf) {
   let gitDir = gitEntry;
   try {
     if (!(await lstat3(gitEntry)).isDirectory()) {
-      let m = /^gitdir:\s*(.+?)\s*$/m.exec(await readFile7(gitEntry, "utf8"));
+      let m = /^gitdir:\s*(.+?)\s*$/m.exec(await readFile8(gitEntry, "utf8"));
       if (!m) return [];
       gitDir = path12.resolve(path12.dirname(gitEntry), m[1]);
     }
   } catch {
     return [];
   }
-  let common = await readFile7(path12.join(gitDir, "commondir"), "utf8").then((c) => path12.resolve(gitDir, c.trim()), () => gitDir), time = (p) => timeOf(p).then((t) => t, () => {
+  let common = await readFile8(path12.join(gitDir, "commondir"), "utf8").then((c) => path12.resolve(gitDir, c.trim()), () => gitDir), time = (p) => timeOf(p).then((t) => t, () => {
   }), files = [
     time(path12.join(gitDir, "index")).then((t) => t ?? time(gitDir)),
     time(path12.join(gitDir, "logs", "HEAD")),
     time(path12.join(common, "packed-refs"))
-  ], head = await readFile7(path12.join(gitDir, "HEAD"), "utf8").catch(() => ""), ref = /^ref:\s*(refs\/\S+)\s*$/.exec(head)?.[1];
+  ], head = await readFile8(path12.join(gitDir, "HEAD"), "utf8").catch(() => ""), ref = /^ref:\s*(refs\/\S+)\s*$/.exec(head)?.[1];
   return ref && !ref.split("/").includes("..") ? files.push(time(path12.join(common, ...ref.split("/")))) : files.push(time(path12.join(gitDir, "HEAD"))), (await Promise.all(files)).filter((t) => t !== void 0);
+}
+async function transcriptHasMarker(transcript, marker) {
+  if (!transcript) return !1;
+  let stream = createReadStream4(transcript, { encoding: "utf8" }), lines = readline2.createInterface({ input: stream, crlfDelay: 1 / 0 });
+  try {
+    for await (let raw of lines) {
+      if (!raw.includes(marker)) continue;
+      let line;
+      try {
+        line = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+      if (line.type === "attachment" && strings(line.attachment).some((t) => t.includes(marker))) return !0;
+    }
+  } finally {
+    lines.close(), stream.destroy();
+  }
+  return !1;
 }
 async function readBaseRecord(sessionId, timeOf) {
   let file = recordPath(sessionId), ctime;
@@ -10390,10 +10444,10 @@ async function readBaseRecord(sessionId, timeOf) {
     ctime = await timeOf(file);
   } catch (err) {
     if (GONE2.has(err.code ?? "")) return;
-    throw new FailClosedError(`the session's base record cannot be read (${file})`);
+    throw new FailClosedError(`base record missing or unreadable (${file})`);
   }
   try {
-    let data = JSON.parse(await readFile7(file, "utf8"));
+    let data = JSON.parse(await readFile8(file, "utf8"));
     return data && data.session_id === sessionId && typeof data.root == "string" && (data.head === null || typeof data.head == "string" && /^[0-9a-f]{40,64}$/.test(data.head)) ? { file, ctime, data } : { file, ctime };
   } catch {
     return { file, ctime };
@@ -10468,7 +10522,7 @@ async function sessionBase(root, startedAt, timeOf, recorded) {
       for (let f of files.filter((x) => x.endsWith(".idx")))
         if (await timeOf(path12.join(dir, f)).catch(() => 1 / 0) >= cutoff) throw new FailClosedError("a pack index (.git/objects/pack/*.idx) changed during the session");
       for (let f of files.filter((x) => x.endsWith(".pack"))) {
-        let idx = path12.join(dir, `${f.slice(0, -5)}.idx`), times = await Promise.all([timeOf(path12.join(dir, f)), timeOf(idx)].map((t) => t.catch(() => 1 / 0))), buf = times.every((t) => t < cutoff) ? await readFile7(idx).catch(() => {
+        let idx = path12.join(dir, `${f.slice(0, -5)}.idx`), times = await Promise.all([timeOf(path12.join(dir, f)), timeOf(idx)].map((t) => t.catch(() => 1 / 0))), buf = times.every((t) => t < cutoff) ? await readFile8(idx).catch(() => {
         }) : void 0;
         buf && oldPacks.push({ idx: buf, at: Math.max(...times) });
       }
@@ -10749,6 +10803,8 @@ program2.command("guard").description("Claude Code Stop hook: block the agent fr
   } catch {
   }
   let blocking = o.on === void 0 ? void 0 : new Set(o.on.split(",").map((s) => s.trim()).filter(Boolean)), result = await runGuard(payload, { blocking });
+  if (process.env.WHY_DIFF_DEBUG === "1") for (let n of result.notes ?? []) process.stderr.write(`why-diff guard (debug): ${terminalSafe(n)}
+`);
   result.block && (process.exitCode = 2, result.timedOut ? process.stderr.write(terminalSafe(result.message ?? ""), () => process.exit(2)) : process.stderr.write(terminalSafe(result.message ?? "")));
 });
 program2.command("session-start").description("Claude Code SessionStart hook: record the commit the session starts from, for the guard").action(async () => {
@@ -10758,7 +10814,9 @@ program2.command("session-start").description("Claude Code SessionStart hook: re
       payload = raw.trim() ? JSON.parse(raw) : {};
     } catch {
     }
-    payload && typeof payload == "object" && await recordSessionStart(payload);
+    let out = payload && typeof payload == "object" ? await recordSessionStart(payload) : void 0;
+    out && process.stdout.write(`${out}
+`);
   } catch {
   }
   process.exitCode = 0;
