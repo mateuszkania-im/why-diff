@@ -311,6 +311,27 @@ describe('sec030 #5: git attributes, textconv and diff config cannot hide hunks'
       delete process.env.WHY_DIFF_REDIFF_MAX_BYTES;
     }
   });
+  it('blocks (fail closed) on an unreviewed package.json the session edited', async () => {
+    const { repo, home } = makeRepo();
+    const pkg = path.join(repo, 'package.json');
+    writeFileSync(pkg, `${JSON.stringify({ name: 'x', scripts: { test: 'vitest run' }, pad: 'p'.repeat(400) }, null, 2)}\n`);
+    sh(repo, ['add', 'package.json']);
+    sh(repo, ['commit', '-qm', 'pkg'], LONG_AGO);
+    const callAt = Date.now() - 60_000;
+    const transcript = writeSyntheticTranscript(home, repo, 's-pkg', [{ prompt: 'speed up tests', at: iso(callAt - 60_000), calls: [
+      { tool: 'Edit', at: iso(callAt), input: { file_path: pkg, old_string: '"vitest run"', new_string: '"exit 0"' } },
+    ] }]);
+    writeFileSync(pkg, readFileSync(pkg, 'utf8').replace('"vitest run"', '"exit 0"'));
+    writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.json -diff\n');
+    process.env.WHY_DIFF_REDIFF_MAX_BYTES = '200';
+    try {
+      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-pkg' }, { blocking: BL, home, objectTime: oldObjects });
+      expect(r.block).toBe(true);
+      expect(r.message).toContain('package.json unreviewed');
+    } finally {
+      delete process.env.WHY_DIFF_REDIFF_MAX_BYTES;
+    }
+  });
   it('blocks (fail closed) when the filter listing cannot be read', async () => {
     expect(await editedRepo((repo) => appendFileSync(path.join(repo, '.git', 'config'), '[broken\n'))).toBe(true);
   });

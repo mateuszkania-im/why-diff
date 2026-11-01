@@ -14,12 +14,11 @@ import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
 import { emptyTree, FailClosedError, git, hasHead, isCaseInsensitive, listUntracked, repoRoot, worktreeRoots } from './git.js';
-import { isCiFile, isTestFile } from './labels.js';
 import { globToRegExp, repoRelativePath, rootVariants } from './attribute.js';
 import { compileGlobs, loadConfig, type WhyDiffConfig } from './config.js';
 import type { Hunk, LabelKind, Session } from './types.js';
 
-export const DEFAULT_BLOCK_ON: readonly LabelKind[] = ['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path'];
+export const DEFAULT_BLOCK_ON: readonly LabelKind[] = ['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path', 'unreviewed'];
 
 export interface GuardPayload {
   transcript_path?: string;
@@ -137,18 +136,14 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   };
 
   const hits: string[] = [];
-  const keys: string[] = [];
   for (const h of report.hunks) {
-    // Fail closed: a file the session touched that git attributes show as binary and whose text could
-    // not be produced blocks when it is a test, CI or protected file, whoever wrote it.
+    // Fail closed: git attributes show a file the session touched (the diff covers only files it
+    // edited, named in a command, or changed during one of its calls) as binary and its text could
+    // not be produced, so what changed in it is unknown. Blocks whatever the path.
     if (h.labels.some((l) => l.kind === 'unreviewed')) {
-      const names = [h.hunk.file, ...(h.hunk.oldFile ? [h.hunk.oldFile] : [])];
-      if (names.some((f) => isTestFile(f) || isCiFile(f) || protectedGlob(f))) {
-        const detail = `could not be diffed as text (git attributes mark it binary): ${h.hunk.file}`;
-        hits.push(`- ${h.hunk.file} unreviewed: ${detail}`);
-        keys.push(`${h.hunk.file}\tunreviewed\t${detail}`);
-        continue;
-      }
+      const detail = `could not be diffed as text (git attributes mark it binary): ${h.hunk.file}`;
+      hits.push(`- ${h.hunk.file} unreviewed: ${detail}`);
+      continue;
     }
     let timed = false;
     if (h.match !== 'exact' && h.match !== 'partial') {
@@ -181,7 +176,6 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
     for (const l of labels) {
       if (!blocking.has(l.kind)) continue;
       hits.push(`- ${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`);
-      keys.push(`${h.hunk.file}\t${l.kind}\t${l.detail}`);
     }
   }
 
