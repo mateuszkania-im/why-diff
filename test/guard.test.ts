@@ -93,9 +93,16 @@ describe('runGuard', () => {
   it('blocks on an agent edit that was committed during the session', async () => {
     const { repo, home } = makeRepo();
     const transcript = writeSyntheticTranscript(home, repo, 's-commit', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    const mark = Date.now();
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
     sh(repo, ['commit', '-qam', 'agent commit'], new Date().toISOString());
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-commit' }, { blocking: BLOCKING, home, objectTime: oldObjects });
+    // Objects written by the agent's commit carry their real (in-session) change time; the rest predate the session.
+    const objectTime = async (p: string): Promise<number> => {
+      const t = (await lstat(p)).ctimeMs;
+      return t >= mark ? t : 0;
+    };
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-commit' }, { blocking: BLOCKING, home, objectTime });
     expect(r.block).toBe(true);
     expect(r.message).toContain('test-skip-added');
   });

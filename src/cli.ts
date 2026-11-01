@@ -274,8 +274,10 @@ program
     const blocking = o.on === undefined ? undefined : (new Set(o.on.split(',').map((s) => s.trim()).filter(Boolean)) as Set<LabelKind>);
     const result = await runGuard(payload, { blocking });
     if (!result.block) return;
-    process.stderr.write(terminalSafe(result.message ?? ''));
     process.exitCode = 2;
+    // Past the internal deadline the check is still running: exit now, before the hook times out.
+    if (result.timedOut) process.stderr.write(terminalSafe(result.message ?? ''), () => process.exit(2));
+    else process.stderr.write(terminalSafe(result.message ?? ''));
   });
 
 /**

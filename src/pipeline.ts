@@ -4,7 +4,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { lstat, readFile, stat } from 'node:fs/promises';
-import type { Harness, Hunk, Prompt, Report, Session, SessionAdapter } from './types.js';
+import { BINARY_HUNK_HEADER, type Harness, type Hunk, type Prompt, type Report, type Session, type SessionAdapter } from './types.js';
 import { getDiffDetailed, git, isCaseInsensitive, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget, type SparseTrust } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
 import { attribute, repoRelativePath, rootVariants } from './attribute.js';
@@ -47,6 +47,8 @@ export interface BuildOptions {
   sparseTrust?: SparseTrust;
   /** See {@link DiffOptions.contentIndex} */
   contentIndex?: boolean;
+  /** See {@link DiffOptions.committedLayers} */
+  committedLayers?: boolean;
   /** Harnesses to read; default all */
   harnesses?: Harness[];
   /** Explicit transcript files (skips discovery) */
@@ -89,6 +91,33 @@ async function readVersion(): Promise<string> {
   return '0.0.0';
 }
 
+/**
+ * The working tree hunks plus, when given, the hunks of the base against HEAD and against the index,
+ * each marked with its layer. A hunk repeated in more than one (same file, start and lines) is kept
+ * once, marked with the first layer that shows it.
+ */
+function withLayers(diff: string, layers: { head: string; index: string } | undefined): Hunk[] {
+  if (!layers || (!layers.head && !layers.index)) return parseUnifiedDiff(diff);
+  // One parse, so hunk ids stay unique; each part's hunk count says where the next part starts.
+  const counts = [diff, layers.head].map((d) => parseUnifiedDiff(d).length);
+  const all = parseUnifiedDiff(diff + layers.head + layers.index);
+  const byKey = new Map<string, Hunk>();
+  const out: Hunk[] = [];
+  all.forEach((h, i) => {
+    const layer = i < counts[0]! ? undefined : i < counts[0]! + counts[1]! ? 'head' : 'index';
+    const key = JSON.stringify([h.file, h.oldFile ?? '', h.status, h.oldStart, h.header === BINARY_HUNK_HEADER ? h.header : '', h.lines.map((l) => `${l.type}${l.text}`)]);
+    const seen = byKey.get(key);
+    if (seen) {
+      if (!seen.layer && layer) seen.layer = layer;
+      return;
+    }
+    const hunk = layer ? { ...h, layer } as Hunk : h;
+    byKey.set(key, hunk);
+    out.push(hunk);
+  });
+  return out;
+}
+
 /** Build a full provenance report for the repository containing `opts.cwd`. */
 export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   const log = opts.onProgress ?? (() => {});
@@ -124,8 +153,8 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   const ignoredGlob = compileGlobs(config.ignore);
 
   log(`diffing ${rangeLabel}`);
-  const detailed = await getDiffDetailed(root, target, { paths: opts.paths, honourSparseCheckout: opts.honourSparseCheckout, sparseTrust: opts.sparseTrust, contentIndex: opts.contentIndex });
-  const allHunks = parseUnifiedDiff(detailed.diff);
+  const detailed = await getDiffDetailed(root, target, { paths: opts.paths, honourSparseCheckout: opts.honourSparseCheckout, sparseTrust: opts.sparseTrust, contentIndex: opts.contentIndex, committedLayers: opts.committedLayers });
+  const allHunks = withLayers(detailed.diff, detailed.layers);
   const unreviewed = new Set(detailed.unreviewed);
 
   // The team-rules files themselves: any change is a finding, and `ignore` can never hide it.

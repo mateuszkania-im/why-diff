@@ -2633,14 +2633,6 @@ import os7 from "node:os";
 import path10 from "node:path";
 import { lstat as lstat2, readFile as readFile6, stat as stat4 } from "node:fs/promises";
 
-// src/git.ts
-import { execFile, spawn } from "node:child_process";
-import { lstat, mkdtemp, open, readFile, readlink, realpath, rm, stat } from "node:fs/promises";
-import { randomBytes } from "node:crypto";
-import os from "node:os";
-import path2 from "node:path";
-import { promisify } from "node:util";
-
 // src/types.ts
 var BINARY_HUNK_HEADER = "Binary file changed", FILE_LEVEL_LABELS = /* @__PURE__ */ new Set([
   "test-modified",
@@ -2653,6 +2645,14 @@ var BINARY_HUNK_HEADER = "Binary file changed", FILE_LEVEL_LABELS = /* @__PURE__
   "protected-path",
   "unreviewed"
 ]);
+
+// src/git.ts
+import { execFile, spawn } from "node:child_process";
+import { lstat, mkdtemp, open, readFile, readlink, realpath, rm, stat } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import os from "node:os";
+import path2 from "node:path";
+import { promisify } from "node:util";
 
 // src/diff-parse.ts
 var HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/, DIFF_GIT = /^diff --git (.+)$/, RENAME_FROM = /^rename from (.+)$/, RENAME_TO = /^rename to (.+)$/, COPY_FROM = /^copy from (.+)$/, COPY_TO = /^copy to (.+)$/, OLD_MODE = /^old mode (\d+)$/, NEW_MODE = /^new mode (\d+)$/, NEW_FILE = /^new file mode (\d+)$/, DELETED_FILE = /^deleted file mode (\d+)$/, BINARY = /^Binary files .* differ$/, GIT_BINARY_PATCH = /^GIT binary patch$/;
@@ -3027,6 +3027,20 @@ async function getDiffUnwrapped(cwd, target, opts) {
       }).join("") + own.diff, unreviewed.push(...own.unreviewed);
     }
   }
+  let layers;
+  if (opts.committedLayers && target.baseRev && opts.paths?.length && await hasHead(cwd)) {
+    layers = { head: "", index: "" };
+    try {
+      for (let [layer, revs] of [["head", [baseRev, "HEAD"]], ["index", ["--cached", baseRev]]]) {
+        let nameArgs = ["diff", "--name-only", "--no-renames", "-z", ...revs], names = (match ? (await git(root, nameArgs, { trim: !1 })).split("\0").filter(match) : (await gitPaths(root, nameArgs, opts.paths)).split("\0")).filter((f) => f && !f.startsWith(".why-diff/"));
+        if (!names.length) continue;
+        let args = [...common, ...revs], shown = await revealTextMarkedBinary(root, args, await gitPaths(root, args, [...new Set(names)].map((f) => `:(literal)${f}`)));
+        layers[layer] = shown.diff, unreviewed.push(...shown.unreviewed);
+      }
+    } catch (err) {
+      throw err instanceof FailClosedError ? err : new FailClosedError(`cannot diff the session base against HEAD and the index (${err.message})`);
+    }
+  }
   if (target.includeUntracked !== !1) {
     let untracked = match ? (await listUntracked(cwd)).filter(match) : await listUntracked(cwd, opts.paths);
     for (let rel of untracked) {
@@ -3034,7 +3048,7 @@ async function getDiffUnwrapped(cwd, target, opts) {
       synthetic === UNREADABLE ? (diff += binaryAddedStub(rel), unreviewed.push(rel)) : synthetic && (diff += synthetic);
     }
   }
-  return { diff, unreviewed };
+  return { diff, unreviewed, ...layers ? { layers } : {} };
 }
 async function indexEntries(root, paths) {
   let out = await gitPaths(root, ["ls-files", "-s", "-v", "-z"], paths), seen = /* @__PURE__ */ new Set(), entries = [];
@@ -4452,7 +4466,9 @@ function splitTopLevel(s) {
   return cur.trim() && out.push(cur.trim()), out;
 }
 var SKIP_PATTERNS = [
-  { re: /\b(?:describe|it|test|context|suite|specify|bench)\s*\.\s*(skip|only|todo|fixme|fails)\b/, name: ".$1" },
+  { re: /\b(?:describe|it|test|context|suite|specify|bench)\s*\.\s*(skip|only|todo|fixme|fails|skipIf)\b/, name: ".$1" },
+  // Vitest `it.runIf(cond)(...)`: a skip whenever the condition is false.
+  { re: /\b(?:describe|it|test|context|suite|specify|bench)\s*\.\s*(runIf)\s*\(/, name: ".$1" },
   { re: /(?<![\w$.])(xit|xdescribe|xtest|xcontext|xspecify|fit|fdescribe|fcontext)\s*[(\s]/, name: "$1", testOnly: !0 },
   { re: /@pytest\.mark\.(skip|skipif|xfail)\b/, name: "@pytest.mark.$1" },
   { re: /\bpytest\.(skip|xfail)\s*\(/, name: "pytest.$1()" },
@@ -4478,13 +4494,22 @@ function matchPatterns(text2, patterns, path13, inTest, firstOnly = !1) {
   }
   return hits;
 }
+var BRACKET_MODIFIER = /\b(describe|it|test|context|suite|specify|bench)\s*\[\s*(["'`])(skip|only|todo|fixme|fails|skipIf|runIf)\2\s*\]/g, TEST_OPENER = /(?<![\w$.])(?:it|test|specify)(?:\s*\.\s*\w+)?\s*\(.*(?:=>|\bfunction\b\s*\w*\s*\([^)]*\))\s*\{\s*$/, BARE_RETURN = /^\s*return\s*;?\s*$/;
 function detectTestSkips(path13, lines) {
   let style = commentStyle(path13);
   if (PROSE_EXT.has(extOf(path13))) return [];
-  let inTest = isTestFile(path13), hits = [];
-  for (let l of netAdded(lines)) {
-    let text2 = extOf(path13) === "rb" ? l.text.replace(/#.*$/, "") : codeOf(l.text, style);
+  let inTest = isTestFile(path13), hits = [], added = netAdded(lines);
+  for (let l of added) {
+    let raw = extOf(path13) === "rb" ? l.text : l.text.replace(BRACKET_MODIFIER, "$1.$3"), text2 = extOf(path13) === "rb" ? raw.replace(/#.*$/, "") : codeOf(raw, style);
     hits.push(...matchPatterns(text2, SKIP_PATTERNS, path13, inTest, !0));
+  }
+  if (inTest && SLASH_COMMENT_EXT.has(extOf(path13))) {
+    let fresh = new Set(added), prev;
+    for (let l of lines) {
+      if (l.type === "del") continue;
+      let code2 = codeOf(l.text, style);
+      code2.trim() && (fresh.has(l) && BARE_RETURN.test(code2) && prev !== void 0 && TEST_OPENER.test(prev) && hits.push("early return"), prev = code2);
+    }
   }
   return uniq(hits);
 }
@@ -4730,7 +4755,7 @@ function parseAssertion(line, path13) {
       expected = m[2] ? balanced(after, 0).inner : after.replace(/[;)\s]+$/, "");
     }
     let operands = [norm(subject.inner), ...splitTopLevel(expected).map(norm)].filter((o) => o !== "");
-    return { ...base, matcher: canonicalMatcher(display), display, negated, operands };
+    return { ...base, matcher: canonicalMatcher(display), display, negated, operands, ...norm(subject.inner) ? { subject: norm(subject.inner) } : {} };
   }
   let ch = CHAINED_MATCHER.exec(code2);
   if (ch && ch[2]) {
@@ -4799,6 +4824,12 @@ function literalChange(d, a, aliases) {
   let [from, to] = [onlyD[0] ?? "", onlyA[0] ?? ""];
   return NUMERIC_OR_BOOL.test(from) && NUMERIC_OR_BOOL.test(to) ? { from, to } : null;
 }
+function subjectToExpected(d, a, aliases) {
+  if (d.subject === void 0 || a.subject === void 0 || d.subject === a.subject || LITERAL.test(d.subject) || aliases.get(a.subject) === d.subject) return null;
+  let expected = d.operands.slice(1);
+  return !LITERAL.test(a.subject) && !STRING_ONLY.test(a.subject) && !expected.includes(a.subject) ? null : `subject changed from ${clip(d.subject, 40)} to ${clip(a.subject, 40)} (${a.display} now compares a fixed value)`;
+}
+var STRING_ONLY = /^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\$]|\\.)*`)$/;
 function detectAssertionChanges(path13, lines) {
   if (!assertionsApply(path13)) return [];
   let aliases = collectAliases(lines, path13), dels = [], adds = [];
@@ -4818,6 +4849,11 @@ function detectAssertionChanges(path13, lines) {
   }
   unpaired.length === 1 && unusedAdds.length === 1 && pairs.push([unpaired.pop(), unusedAdds.pop()]);
   for (let [d, a] of pairs) {
+    let tautology = subjectToExpected(d, a, aliases);
+    if (tautology) {
+      findings.push(tautology);
+      continue;
+    }
     let rd = rankOf(d), ra = rankOf(a);
     if (rd !== null && ra !== null && ra < rd)
       findings.push(`weakened ${d.display} to ${a.display}`);
@@ -8723,6 +8759,19 @@ var ADAPTERS = {
 async function readVersion() {
   return "0.3.2";
 }
+function withLayers(diff, layers) {
+  if (!layers || !layers.head && !layers.index) return parseUnifiedDiff(diff);
+  let counts = [diff, layers.head].map((d) => parseUnifiedDiff(d).length), all = parseUnifiedDiff(diff + layers.head + layers.index), byKey = /* @__PURE__ */ new Map(), out = [];
+  return all.forEach((h, i) => {
+    let layer = i < counts[0] ? void 0 : i < counts[0] + counts[1] ? "head" : "index", key = JSON.stringify([h.file, h.oldFile ?? "", h.status, h.oldStart, h.header === BINARY_HUNK_HEADER ? h.header : "", h.lines.map((l) => `${l.type}${l.text}`)]), seen = byKey.get(key);
+    if (seen) {
+      !seen.layer && layer && (seen.layer = layer);
+      return;
+    }
+    let hunk = layer ? { ...h, layer } : h;
+    byKey.set(key, hunk), out.push(hunk);
+  }), out;
+}
 async function buildReport(opts = {}) {
   let log = opts.onProgress ?? (() => {
   }), root = await repoRoot(opts.cwd ?? process.cwd()), target, rangeLabel;
@@ -8740,7 +8789,7 @@ async function buildReport(opts = {}) {
   }
   let baseRev = await policyRev(root, target), config = opts.config ?? await loadConfig(root, baseRev, log), protectedGlob = compileGlobs(config.protected), ignoredGlob = compileGlobs(config.ignore);
   log(`diffing ${rangeLabel}`);
-  let detailed = await getDiffDetailed(root, target, { paths: opts.paths, honourSparseCheckout: opts.honourSparseCheckout, sparseTrust: opts.sparseTrust, contentIndex: opts.contentIndex }), allHunks = parseUnifiedDiff(detailed.diff), unreviewed = new Set(detailed.unreviewed), rulesFiles = /* @__PURE__ */ new Set();
+  let detailed = await getDiffDetailed(root, target, { paths: opts.paths, honourSparseCheckout: opts.honourSparseCheckout, sparseTrust: opts.sparseTrust, contentIndex: opts.contentIndex, committedLayers: opts.committedLayers }), allHunks = withLayers(detailed.diff, detailed.layers), unreviewed = new Set(detailed.unreviewed), rulesFiles = /* @__PURE__ */ new Set();
   for (let h of allHunks)
     (samePath(h.file, CONFIG_FILE2) || h.oldFile !== void 0 && samePath(h.oldFile, CONFIG_FILE2)) && rulesFiles.add(h.file);
   let pkgHunks = allHunks.filter((h) => samePath(h.file, "package.json"));
@@ -10117,8 +10166,31 @@ import { createReadStream as createReadStream4 } from "node:fs";
 import { lstat as lstat3, readdir as readdir4, readFile as readFile7 } from "node:fs/promises";
 import readline2 from "node:readline";
 import path11 from "node:path";
-var DEFAULT_BLOCK_ON = ["test-skip-added", "tests-disabled", "assertion-removed", "secret-like", "ci-changed", "protected-path", "unreviewed"], NO_BLOCK = { block: !1, hits: [] };
+var DEFAULT_BLOCK_ON = ["test-skip-added", "tests-disabled", "assertion-removed", "secret-like", "ci-changed", "protected-path", "unreviewed"], NO_BLOCK = { block: !1, hits: [] }, DEADLINE_MS = 2e4;
 async function runGuard(payload, opts) {
+  let env = Number(process.env.WHY_DIFF_GUARD_DEADLINE_MS), ms = Number.isFinite(env) && env > 0 ? env : DEADLINE_MS, timer, expired = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      let hit = `- why-diff could not check this session: it did not finish within ${ms / 1e3} s (the Stop hook's time limit is 30 s), so its changes were not reviewed`;
+      resolve({
+        block: !0,
+        timedOut: !0,
+        hits: [hit],
+        message: `why-diff guard: ${hit.slice(2)}
+
+Tell the user that why-diff could not check the changes you made in this session in time, and what you changed, so they can check it.
+`
+      });
+    }, ms);
+  }), work = checkSession(payload, opts);
+  work.catch(() => {
+  });
+  try {
+    return await Promise.race([work, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function checkSession(payload, opts) {
   let state = { relevant: !1 };
   try {
     return await guard(payload, opts, state);
@@ -10154,52 +10226,84 @@ async function guard(payload, opts, state) {
     return [.../* @__PURE__ */ new Set([p, p.normalize("NFD")])].map((v) => `${magic}${v}`);
   }).flatMap((p) => p ?? []))], baseRev = "HEAD", headed = await hasHead(root);
   headed && (baseRev = await sessionBase(root, Date.parse(session.startedAt), opts.objectTime ?? changeTime));
-  let sparseTrust = { before: Date.parse(session.startedAt) - WINDOW_SLACK_MS, timeOf: opts.objectTime ?? changeTime }, excluded = await sparseExcluded(root, sparseTrust), byWindow = await toolWindowFiles(root, headed ? baseRev : void 0, session, opts.statTime ?? changeTime, excluded);
-  for (let f of [...byWindow.written, ...byWindow.removed]) paths.push(`:(literal)${f}`);
-  if (!paths.length) return NO_BLOCK;
-  let config = await loadConfig(root, baseRev).catch(() => ({})), blocking = opts.blocking ?? /* @__PURE__ */ new Set([...DEFAULT_BLOCK_ON, ...config.blockOn ?? []]), protectedGlob = compileGlobs(config.protected), report = await buildReport({
-    cwd: root,
-    workingTree: !0,
-    baseRev,
-    paths,
-    sessionFiles: [payload.transcript_path],
-    harnesses: ["claude-code"],
-    home: opts.home,
-    config,
-    keepAgentIgnored: !0,
-    sparseTrust,
-    // Every path through a temporary index without stat data or flags: git hashes the content.
-    contentIndex: !0
-  }), shellTargets = (ops) => new Set(session.edits.filter((e) => !e.failed && e.kind === "bash" && ops.has(e.bashOp ?? "")).map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants)).filter((p) => !!p).map((p) => p.split(path11.sep).join("/").replace(/^(\.\/)+/, "").replace(/\/+$/, ""))), removedByShell = shellTargets(REMOVE_OPS), rewrittenByShell = shellTargets(REWRITE_OPS), targeted = (targets, file, dirs) => {
+  let config = await loadConfig(root, baseRev).catch(() => ({})), blocking = opts.blocking ?? /* @__PURE__ */ new Set([...DEFAULT_BLOCK_ON, ...config.blockOn ?? []]), protectedGlob = compileGlobs(config.protected), sparseTrust = { before: Date.parse(session.startedAt) - WINDOW_SLACK_MS, timeOf: opts.objectTime ?? changeTime }, shellTargets = (ops) => new Set(session.edits.filter((e) => !e.failed && e.kind === "bash" && ops.has(e.bashOp ?? "")).map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants)).filter((p) => !!p).map((p) => p.split(path11.sep).join("/").replace(/^(\.\/)+/, "").replace(/\/+$/, ""))), removedByShell = shellTargets(REMOVE_OPS), rewrittenByShell = shellTargets(REWRITE_OPS), targeted = (targets, file, dirs) => {
     let f = file.normalize("NFC").replace(/^(\.\/)+/, "");
     icase && (f = f.toLowerCase());
     for (let r of targets)
       if (r && (icase && (r = r.toLowerCase()), f === r || dirs && f.startsWith(`${r}/`) || SHELL_GLOB.test(r) && globToRegExp(r).test(f)))
         return !0;
     return !1;
-  }, hits = [];
-  for (let h of report.hunks) {
-    if (h.labels.some((l) => l.kind === "unreviewed")) {
-      let detail = `could not be diffed as text (git attributes mark it binary, or it is too big or unreadable): ${h.hunk.file}`;
-      hits.push(`- ${h.hunk.file} unreviewed: ${detail}`);
-      continue;
-    }
-    let timed = !1;
-    if (h.match !== "exact" && h.match !== "partial") {
-      let source = h.hunk.oldFile ?? h.hunk.file, removed = h.match === "file-only" && shellOnly(h.hunk) && targeted(removedByShell, source, !0), rewritten = h.match === "file-only" && h.hunk.status !== "renamed" && targeted(rewrittenByShell, h.hunk.file, !1);
-      if (!removed && !rewritten && (timed = h.hunk.status === "renamed" ? shellOnly(h.hunk) ? byWindow.removed.has(source) : byWindow.removed.has(source) && byWindow.written.has(h.hunk.file) : h.hunk.status === "deleted" ? shellOnly(h.hunk) && byWindow.removed.has(h.hunk.file) : byWindow.written.has(h.hunk.file), !timed))
+  }, check = async (pathspecs, credit2) => {
+    let report = await buildReport({
+      cwd: root,
+      workingTree: !0,
+      baseRev,
+      paths: pathspecs,
+      sessionFiles: [payload.transcript_path],
+      harnesses: ["claude-code"],
+      home: opts.home,
+      config,
+      keepAgentIgnored: !0,
+      sparseTrust,
+      // Every path through a temporary index without stat data or flags: git hashes the content.
+      contentIndex: !0,
+      // A change kept only in a commit or only staged (the working tree put back) shows too.
+      committedLayers: headed
+    }), hits2 = [];
+    for (let h of report.hunks) {
+      if (h.labels.some((l) => l.kind === "unreviewed")) {
+        let detail = `could not be diffed as text (git attributes mark it binary, or it is too big or unreadable): ${h.hunk.file}`;
+        hits2.push(`- ${h.hunk.file} unreviewed: ${detail}`);
         continue;
+      }
+      let timed = !1;
+      if (h.match !== "exact" && h.match !== "partial") {
+        let source = h.hunk.oldFile ?? h.hunk.file, removed = h.match === "file-only" && shellOnly(h.hunk) && targeted(removedByShell, source, !0), rewritten = h.match === "file-only" && h.hunk.status !== "renamed" && targeted(rewrittenByShell, h.hunk.file, !1);
+        if (!removed && !rewritten && (timed = h.hunk.status === "renamed" ? shellOnly(h.hunk) ? credit2.removed.has(source) : credit2.removed.has(source) && credit2.written.has(h.hunk.file) : h.hunk.status === "deleted" ? shellOnly(h.hunk) && credit2.removed.has(h.hunk.file) : credit2.written.has(h.hunk.file), !timed && h.hunk.status === "deleted" && credit2.detached.has(h.hunk.file) && (timed = !0), !timed && h.hunk.layer && (credit2.layered.has(h.hunk.file) || credit2.layered.has(source)) && (timed = !0), !timed))
+          continue;
+      }
+      if (!h.editIds.length && !timed || !h.editIds.every((id) => id.startsWith(`${session.id}:`))) continue;
+      let labels = [...h.labels];
+      if (timed && !labels.some((l) => l.kind === "protected-path")) {
+        let glob = protectedGlob(h.hunk.file) ?? (h.hunk.oldFile ? protectedGlob(h.hunk.oldFile) : void 0);
+        glob && labels.push({ kind: "protected-path", severity: "risk", detail: `Protected path (${glob}): ${h.hunk.file}` });
+      }
+      for (let l of labels) {
+        if (!blocking.has(l.kind)) continue;
+        let hit = `- ${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`;
+        hits2.includes(hit) || hits2.push(hit);
+      }
     }
-    if (!h.editIds.length && !timed || !h.editIds.every((id) => id.startsWith(`${session.id}:`))) continue;
-    let labels = [...h.labels];
-    if (timed && !labels.some((l) => l.kind === "protected-path")) {
-      let glob = protectedGlob(h.hunk.file) ?? (h.hunk.oldFile ? protectedGlob(h.hunk.oldFile) : void 0);
-      glob && labels.push({ kind: "protected-path", severity: "risk", detail: `Protected path (${glob}): ${h.hunk.file}` });
-    }
-    for (let l of labels)
-      blocking.has(l.kind) && hits.push(`- ${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`);
+    return hits2;
+  };
+  if (paths.length) {
+    let first = await check(paths, NO_CREDIT);
+    if (first.length) return blocked(payload.transcript_path, first);
   }
-  return hits.length ? await shownBefore(payload.transcript_path, hits).catch(() => !1) ? {
+  let excluded = await sparseExcluded(root, sparseTrust), statTime = opts.statTime ?? changeTime, inWindow = windowCheck(session), byWindow = await toolWindowFiles(root, headed ? baseRev : void 0, inWindow, statTime, excluded), hits = [], timedNew = [...byWindow.written].filter((f) => byWindow.untracked.has(f)).sort();
+  if (timedNew.length > MAX_TIMED_UNTRACKED) {
+    let over = timedNew.slice(MAX_TIMED_UNTRACKED);
+    for (let f of over) byWindow.written.delete(f);
+    hits.push(`- ${over[0]} unreviewed: ${over.length} more untracked files written during this session's tool calls were not reviewed (over the cap of ${MAX_TIMED_UNTRACKED}), e.g. ${over.slice(0, 3).join(", ")}`);
+  }
+  let credit = { written: byWindow.written, removed: byWindow.removed, detached: /* @__PURE__ */ new Set(), layered: /* @__PURE__ */ new Set() }, all = [...paths];
+  for (let f of [...byWindow.written, ...byWindow.removed]) all.push(`:(literal)${f}`);
+  if (headed && inWindow) {
+    let t = await refsChangeTime(root, statTime);
+    if (t !== void 0 && inWindow(t))
+      for (let [args, deletedOnly] of [[[baseRev, "HEAD"], !1], [["--cached", baseRev], !1], [["--diff-filter=D", baseRev, "HEAD"], !0], [["--diff-filter=D", "--cached", baseRev], !0]]) {
+        let out = await git(root, ["diff", "--name-only", "--no-renames", "-z", ...args, "--"], { trim: !1 });
+        for (let f of out.split("\0"))
+          !f || f.startsWith(".why-diff/") || (deletedOnly ? await lstat3(path11.join(root, ...f.split("/"))).then(() => !0, () => !1) && credit.detached.add(f) : (credit.layered.has(f) || all.push(`:(literal)${f}`), credit.layered.add(f)));
+      }
+  }
+  if (!all.length) return hits.length ? blocked(payload.transcript_path, hits) : NO_BLOCK;
+  for (let hit of await check(all, credit)) hits.includes(hit) || hits.push(hit);
+  return hits.length ? blocked(payload.transcript_path, hits) : NO_BLOCK;
+}
+var NO_CREDIT = { written: /* @__PURE__ */ new Set(), removed: /* @__PURE__ */ new Set(), detached: /* @__PURE__ */ new Set(), layered: /* @__PURE__ */ new Set() }, MAX_TIMED_UNTRACKED = 2e3;
+async function blocked(transcript, hits) {
+  return transcript && await shownBefore(transcript, hits).catch(() => !1) ? {
     block: !0,
     hits,
     message: `why-diff guard: still present from an earlier block:
@@ -10215,7 +10319,7 @@ Tell the user about these changes, or revert them.
 
 Before finishing: if you skipped, weakened or removed tests (or changed CI/secrets), either revert that change or tell the user explicitly what you changed and why, so they can decide. Do not hide it.
 `
-  } : NO_BLOCK;
+  };
 }
 async function hasGitEntry(dir) {
   for (let d = path11.resolve(dir); ; d = path11.dirname(d)) {
@@ -10231,10 +10335,12 @@ var SHELL_GLOB = /[*?[]/, WINDOW_SLACK_MS = 2e3, LSTAT_BATCH = 256, GONE2 = /* @
 async function changeTime(p) {
   return (await lstat3(p)).ctimeMs;
 }
-async function toolWindowFiles(root, rev, session, timeOf, excluded) {
-  let written = /* @__PURE__ */ new Set(), removed = /* @__PURE__ */ new Set(), now = Date.now(), windows = (session.toolWindows ?? []).map((w) => ({ start: Date.parse(w.start), end: w.open ? Math.max(now, Date.parse(w.end)) : Date.parse(w.end) })).filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end >= w.start).map((w) => ({ start: w.start - WINDOW_SLACK_MS, end: w.end + WINDOW_SLACK_MS }));
-  if (!windows.length) return { written, removed };
-  let inWindow = (ms) => windows.some((w) => ms >= w.start && ms <= w.end), changed = await git(root, ["diff", "--name-only", "--no-renames", "-z", rev ?? await emptyTree(root), "--"], { trim: !1 }), entries = await indexEntries(root), sparse = await sparseMissing(root, entries, excluded), files = [.../* @__PURE__ */ new Set([...changed.split("\0").filter(Boolean), ...entries.map((e) => e.path), ...await listUntracked(root)])].filter((f) => !f.startsWith(".why-diff/") && !sparse.has(f)), top = path11.resolve(root), gone = (err) => {
+async function toolWindowFiles(root, rev, inWindow, timeOf, excluded) {
+  let written = /* @__PURE__ */ new Set(), removed = /* @__PURE__ */ new Set(), untracked = /* @__PURE__ */ new Set();
+  if (!inWindow) return { written, removed, untracked };
+  let changed = await git(root, ["diff", "--name-only", "--no-renames", "-z", rev ?? await emptyTree(root), "--"], { trim: !1 }), entries = await indexEntries(root), sparse = await sparseMissing(root, entries, excluded);
+  for (let f of await listUntracked(root)) untracked.add(f);
+  let files = [.../* @__PURE__ */ new Set([...changed.split("\0").filter(Boolean), ...entries.map((e) => e.path), ...untracked])].filter((f) => !f.startsWith(".why-diff/") && !sparse.has(f)), top = path11.resolve(root), gone = (err) => {
     if (GONE2.has(err.code ?? "")) return !0;
     throw err;
   }, dirTimes = /* @__PURE__ */ new Map(), dirTime = (dir) => {
@@ -10259,7 +10365,34 @@ async function toolWindowFiles(root, rev, session, timeOf, excluded) {
       let d = await dirTime(path11.dirname(abs));
       d !== void 0 && inWindow(d) && removed.add(f);
     }));
-  return { written, removed };
+  return { written, removed, untracked };
+}
+function windowCheck(session) {
+  let now = Date.now(), windows = (session.toolWindows ?? []).map((w) => ({ start: Date.parse(w.start), end: w.open ? Math.max(now, Date.parse(w.end)) : Date.parse(w.end) })).filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end >= w.start).map((w) => ({ start: w.start - WINDOW_SLACK_MS, end: w.end + WINDOW_SLACK_MS }));
+  return windows.length ? (ms) => windows.some((w) => ms >= w.start && ms <= w.end) : null;
+}
+async function refsChangeTime(root, timeOf) {
+  let gitPath = async (name) => path11.resolve(root, await git(root, ["rev-parse", "--git-path", name])), files = [await gitPath("index"), await gitPath("logs/HEAD")], ref = await git(root, ["symbolic-ref", "-q", "HEAD"]).catch(() => "");
+  if (ref) {
+    let loose = await gitPath(ref);
+    files.push(loose), await lstat3(loose).then(() => !0, () => !1) || files.push(await gitPath("packed-refs"));
+  } else
+    files.push(await gitPath("HEAD"));
+  let top = path11.resolve(root), dated = async (p) => {
+    for (let d = p; ; d = path11.dirname(d)) {
+      try {
+        return await timeOf(d);
+      } catch (err) {
+        if (!GONE2.has(err.code ?? "")) throw err;
+      }
+      if (d === top || path11.dirname(d) === d) return;
+    }
+  }, latest;
+  for (let f of files) {
+    let t = await dated(f);
+    t !== void 0 && (latest === void 0 || t > latest) && (latest = t);
+  }
+  return latest;
 }
 async function sessionBase(root, startedAt, timeOf) {
   if (!Number.isFinite(startedAt)) throw new FailClosedError("the transcript has no session start time");
@@ -10269,10 +10402,10 @@ async function sessionBase(root, startedAt, timeOf) {
     return m ? { sha: m[1], at: Number(m[2]) * 1e3 } : null;
   }).filter((e) => e !== null), shallow = path11.resolve(root, await git(root, ["rev-parse", "--git-path", "shallow"])), shallowTime = await timeOf(shallow).catch((err) => err.code === "ENOENT" ? void 0 : 1 / 0);
   if (shallowTime !== void 0 && shallowTime >= cutoff) throw new FailClosedError("the shallow history boundary (.git/shallow) changed during the session");
-  let main = path11.resolve(root, await git(root, ["rev-parse", "--git-path", "objects"])), oldPacks, writtenBefore = async (sha) => {
+  let main = path11.resolve(root, await git(root, ["rev-parse", "--git-path", "objects"])), oldPacks, writtenAt = async (sha) => {
     let loose = await timeOf(path11.join(main, sha.slice(0, 2), sha.slice(2))).catch(() => {
     });
-    if (loose !== void 0) return loose < cutoff;
+    if (loose !== void 0) return loose < cutoff ? loose : void 0;
     if (!oldPacks) {
       oldPacks = [];
       let dir = path11.join(main, "pack"), files = await readdir4(dir).catch((err) => {
@@ -10282,32 +10415,43 @@ async function sessionBase(root, startedAt, timeOf) {
       for (let f of files.filter((x) => x.endsWith(".idx")))
         if (await timeOf(path11.join(dir, f)).catch(() => 1 / 0) >= cutoff) throw new FailClosedError("a pack index (.git/objects/pack/*.idx) changed during the session");
       for (let f of files.filter((x) => x.endsWith(".pack"))) {
-        let idx = path11.join(dir, `${f.slice(0, -5)}.idx`);
-        (await Promise.all([timeOf(path11.join(dir, f)), timeOf(idx)].map((t) => t.catch(() => 1 / 0)))).every((t) => t < cutoff) && oldPacks.push(idx);
+        let idx = path11.join(dir, `${f.slice(0, -5)}.idx`), times = await Promise.all([timeOf(path11.join(dir, f)), timeOf(idx)].map((t) => t.catch(() => 1 / 0))), buf = times.every((t) => t < cutoff) ? await readFile7(idx).catch(() => {
+        }) : void 0;
+        buf && oldPacks.push({ idx: buf, at: Math.max(...times) });
       }
     }
-    for (let idx of oldPacks) if (await packIndexHas(idx, sha)) return !0;
-    return !1;
-  }, isCommit = (sha) => git(root, ["cat-file", "-e", `${sha}^{commit}`]).then(() => !0, () => !1), base;
+    let at;
+    for (let p of oldPacks) packIndexHas(p.idx, sha) && (at === void 0 || p.at > at) && (at = p.at);
+    return at;
+  }, order = [], add = (sha) => {
+    !order.includes(sha) && order.length < MAX_BASE_CANDIDATES && order.push(sha);
+  };
   for (let e of parse(await git(root, ["reflog", "show", "--format=%H%x09%gd", "--date=unix", "HEAD", "--"]).catch(() => "")))
-    if (e.at <= startedAt && await isCommit(e.sha) && await writtenBefore(e.sha)) {
-      base = e.sha;
+    e.at <= startedAt && add(e.sha);
+  for (let e of parse(await git(root, ["log", "--first-parent", "-n", "5000", "--format=%H%x09%ct", "HEAD", "--"]).catch(() => "")))
+    if (await writtenAt(e.sha) !== void 0) {
+      add(e.sha);
       break;
     }
-  if (!base) {
-    for (let e of parse(await git(root, ["log", "--first-parent", "-n", "5000", "--format=%H%x09%ct", "HEAD", "--"]).catch(() => "")))
-      if (await writtenBefore(e.sha)) {
-        base = e.sha;
-        break;
-      }
+  let types = order.length ? await git(root, ["cat-file", "--batch-check=%(objectname) %(objecttype)"], { input: `${order.join(`
+`)}
+` }).catch(() => "") : "", commits = new Set(types.split(`
+`).map((l) => l.split(" ")).filter(([, t]) => t === "commit").map(([sha]) => sha)), dated = [];
+  for (let sha of order) {
+    if (!commits.has(sha)) continue;
+    let at = await writtenAt(sha);
+    at !== void 0 && dated.push({ sha, at });
   }
-  if (!base) throw new FailClosedError("no commit from before the session start was found to compare against (every candidate was written during the session)");
-  return await git(root, ["merge-base", "--is-ancestor", base, "HEAD"]).then(() => !0, () => !1) || (base = await git(root, ["merge-base", base, "HEAD"]).catch(() => base)), base;
+  if (!dated.length) throw new FailClosedError("no commit from before the session start was found to compare against (every candidate was written during the session)");
+  let latest = Math.max(...dated.map((d) => d.at)), tied = dated.filter((d) => d.at === latest).map((d) => d.sha);
+  if (tied.length === 1) return tied[0];
+  let tips = new Set((await git(root, ["merge-base", "--independent", ...tied]).catch(() => "")).split(`
+`).filter(Boolean));
+  return tied.find((sha) => tips.has(sha)) ?? tied[0];
 }
-async function packIndexHas(idxPath, sha) {
-  let buf = await readFile7(idxPath).catch(() => {
-  });
-  if (!buf || buf.length < 1032 || buf.readUInt32BE(0) !== 4285812579 || buf.readUInt32BE(4) !== 2) return !1;
+var MAX_BASE_CANDIDATES = 1e3;
+function packIndexHas(buf, sha) {
+  if (buf.length < 1032 || buf.readUInt32BE(0) !== 4285812579 || buf.readUInt32BE(4) !== 2) return !1;
   let want = Buffer.from(sha, "hex"), len = want.length, first = want[0], lo = first === 0 ? 0 : buf.readUInt32BE(8 + (first - 1) * 4), hi = buf.readUInt32BE(8 + first * 4), names = 1032;
   if (names + hi * len > buf.length) return !1;
   for (; lo < hi; ) {
@@ -10545,7 +10689,7 @@ program2.command("guard").description("Claude Code Stop hook: block the agent fr
   } catch {
   }
   let blocking = o.on === void 0 ? void 0 : new Set(o.on.split(",").map((s) => s.trim()).filter(Boolean)), result = await runGuard(payload, { blocking });
-  result.block && (process.stderr.write(terminalSafe(result.message ?? "")), process.exitCode = 2);
+  result.block && (process.exitCode = 2, result.timedOut ? process.stderr.write(terminalSafe(result.message ?? ""), () => process.exit(2)) : process.stderr.write(terminalSafe(result.message ?? "")));
 });
 function separatorIndex(args, cmd) {
   let byFlag = /* @__PURE__ */ new Map();
