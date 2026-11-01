@@ -15,7 +15,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // Guard runs over real repositories (submodules, CLI children) take seconds on Windows runners.
 vi.setConfig({ testTimeout: 30_000 });
-import { runGuard, windowsVolumeCommands, type GuardOptions } from '../src/guard.js';
+import { runGuard, windowsVolumeCommand, type GuardOptions } from '../src/guard.js';
 import * as gitModule from '../src/git.js';
 import { recordSessionStart } from '../src/session-start.js';
 import type { LabelKind } from '../src/types.js';
@@ -828,18 +828,22 @@ describe('sec035 fix round 1 (A, B, D): submodule file systems and index flags',
 });
 
 describe('sec035 fix round 1 (E, F): the Windows file system type', () => {
-  it('runs PowerShell and fsutil by absolute path, in the temporary directory, without a shell', () => {
-    const cmds = windowsVolumeCommands("C:\\work\\it's\\repo", 'C:\\');
-    expect(cmds.map((c) => path.basename(c.file).toLowerCase())).toEqual(['powershell.exe', 'fsutil.exe']);
-    for (const c of cmds) {
-      expect(path.isAbsolute(c.file) || /^[A-Za-z]:\\/.test(c.file)).toBe(true);
-      expect(c.file.toLowerCase()).toContain('system32');
-      expect(c.options.cwd).toBe(os.tmpdir());
-      expect(c.options.shell).toBe(false);
-      expect(c.options.windowsHide).toBe(true);
-    }
-    // The path is one single-quoted PowerShell string (quotes doubled).
-    expect(cmds[0]!.args.join(' ')).toContain("-FilePath 'C:\\work\\it''s\\repo'");
+  it('runs PowerShell by absolute path, in the temporary directory, without a shell, with the path as data only', () => {
+    const nasty = "C:\\work\\a'b\u2018c\u2019d\u201ae\u201bf$(calc)`g;h\\repo";
+    const c = windowsVolumeCommand(nasty);
+    const other = windowsVolumeCommand('C:\\plain');
+    expect(path.basename(c.file).toLowerCase()).toBe('powershell.exe');
+    expect(path.isAbsolute(c.file) || /^[A-Za-z]:\\/.test(c.file)).toBe(true);
+    expect(c.file.toLowerCase()).toContain('system32');
+    expect(c.options.cwd).toBe(os.tmpdir());
+    expect(c.options.shell).toBe(false);
+    expect(c.options.windowsHide).toBe(true);
+    expect(c.options.env.WD_PATH).toBe(nasty);
+    // The script is a constant: nothing of the path is in it.
+    expect(c.args).toEqual(other.args);
+    const script = c.args.join(' ');
+    for (const part of ['work', "a'b", '\u2018', '\u2019', '\u201a', '\u201b', '$(calc)', '`g', ';h']) expect(script).not.toContain(part);
+    expect(script).toContain('$env:WD_PATH');
   });
 
   it.skipIf(posix)('a test directory replaced by a junction is a deletion (junctions are never followed)', async () => {
