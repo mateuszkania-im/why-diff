@@ -1304,12 +1304,17 @@ describe('restructured tests: dead guards, swallowing try/catch, shadowed global
       ['let test = noop', '+let test = noop;'],
       ['function expect()', '+function expect() { return { toBe() {} }; }'],
       ['var describe', '+var describe = function () {};'],
-      ['import from a local helper', "+import { it, expect } from './my-helpers';"],
       ['import renamed into a global name', "+import { skipAll as it } from 'some-lib';"],
-      ['require from a local helper', "+const { it } = require('./fake');"],
       ['destructured from an object', '+const { expect } = fakes;'],
     ])('%s', (_name, line) => {
       expect(detail([line], 'test-skip-added')).toContain('shadows');
+    });
+
+    it.each([
+      ['import from a local helper', "+import { it, expect } from './my-helpers';"],
+      ['require from a local helper', "+const { it } = require('./fake');"],
+    ])('%s (the helper resolves, and no test framework stands behind it)', (_name, line) => {
+      expect(detail([line], 'test-skip-added', 'export const it = () => {};\nexport const expect = () => ({ toBe() {} });\n')).toContain('shadows');
     });
 
     it.each([
@@ -1370,5 +1375,55 @@ describe('restructured tests: local variables named like a test global', () => {
     const kinds = (lines: string[]) => labelHunks([hunk('test/a.test.js', lines)], ctx)[0]?.labels.map((l) => l.kind) ?? [];
     expect(kinds(['+    const test = renameHunk(p, "", "deleted", []);', '+    const [t] = labelHunks([test, src], ctx);'])).not.toContain('test-skip-added');
     expect(kinds(['+  const it = () => {};', '   it("t1", () => {', '     expect(f(1)).toBe(1);'])).toContain('test-skip-added');
+  });
+});
+
+describe('restructured tests (review of #6): framework modules, fixtures and relative imports', () => {
+  const T = 'test/a.test.ts';
+  const kinds = (line: string, files: Record<string, string> = {}): LabelKind[] => {
+    const [out] = labelHunks([hunk(T, [line])], { ...ctx, fileText: (p: string) => files[p] });
+    return out?.labels.map((l) => l.kind) ?? [];
+  };
+
+  it.each([
+    ["+import test from 'ava';"],
+    ["+import test from 'tape';"],
+    ["+import { test } from 'uvu';"],
+    ["+import * as assert from 'uvu/assert';"],
+    ["+import { test } from 'tap';"],
+    ["+import t from 'node-tap';"],
+    ["+import { test, expect } from '@playwright/experimental-ct-react';"],
+    ["+import { test, expect } from '@playwright/experimental-ct-vue';"],
+    ["+import { expect } from '@playwright/test/reporter';"],
+    ["+import { expect, it } from 'jest-circus';"],
+    ["+import { expect } from 'jest-circus/runner';"],
+    ["+const test = require('ava');"],
+    ['+export const test = base.extend<{ db: number }>({ db: async ({}, use) => use(1) });'],
+    ['+export const test = base.extend<{ db: Map<string, number> }>({ db: async ({}, use) => use(new Map()) });'],
+  ])('framework or fixture, not a shadow: %s', (line) => {
+    expect(kinds(line)).not.toContain('test-skip-added');
+  });
+
+  it('a relative module that builds on a test framework is not a shadow', () => {
+    const fixtures = "import { test as base } from '@playwright/test';\nexport const test = base.extend({});\nexport { expect } from '@playwright/test';\n";
+    expect(kinds("+import { test, expect } from './fixtures';", { 'test/fixtures.ts': fixtures })).not.toContain('test-skip-added');
+    expect(kinds("+import { test } from '../support/test';", { 'support/test/index.js': "const { test } = require('@playwright/test');\nmodule.exports = { test };\n" })).not.toContain('test-skip-added');
+  });
+
+  it('one level of re-export is followed', () => {
+    const files = { 'test/fixtures.ts': "export * from './base';\n", 'test/base.ts': "import { test as b } from 'vitest';\nexport const test = b.extend({});\n" };
+    expect(kinds("+import { test } from './fixtures';", files)).not.toContain('test-skip-added');
+  });
+
+  it('a relative module that cannot be resolved or read is not flagged', () => {
+    expect(kinds("+import { it } from './missing.js';")).not.toContain('test-skip-added');
+  });
+
+  it('a relative module with no framework behind it is a shadow', () => {
+    expect(kinds("+import { it } from './noop.js';", { 'test/noop.js': 'export const it = () => {};\n' })).toContain('test-skip-added');
+    expect(kinds("+import { test } from './helpers';", { 'test/helpers.ts': 'export function test() {}\n' })).toContain('test-skip-added');
+    // Two levels down is not followed: the framework is out of sight.
+    const deep = { 'test/a1.ts': "export * from './a2';\n", 'test/a2.ts': "export * from './a3';\n", 'test/a3.ts': "export { test } from 'vitest';\n" };
+    expect(kinds("+import { test } from './a1';", deep)).toContain('test-skip-added');
   });
 });

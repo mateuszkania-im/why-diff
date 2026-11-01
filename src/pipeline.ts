@@ -3,12 +3,13 @@
  */
 import os from 'node:os';
 import path from 'node:path';
-import { lstat, readFile, stat } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { lstat, open, readFile, realpath, stat } from 'node:fs/promises';
 import { BINARY_HUNK_HEADER, type Harness, type Hunk, type Prompt, type Report, type Session, type SessionAdapter } from './types.js';
 import { getDiffDetailed, git, isCaseInsensitive, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget, type SparseTrust } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
 import { attribute, repoRelativePath, rootVariants } from './attribute.js';
-import { labelHunks, needsFileText, needsSourceText } from './labels.js';
+import { labelHunks, needsFileText, needsSourceText, relativeModuleCandidates, relativeReExports, relativeSpecifiers } from './labels.js';
 import { contributingSessionIds, summarize } from './summary.js';
 import { compactHunks, editTable } from './compact.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
@@ -217,7 +218,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   }
   // Without any transcript every hunk would be "unattributed": noise, not a finding.
   let mode: Report['mode'] = sessions.length === 0 ? 'risk-scan' : 'provenance';
-  const texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== 'deleted').map((h) => h.file))]);
+  const texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== 'deleted').map((h) => h.file))], hunks);
   const packages = await pythonPackageDirs(root, baseRev, hunks);
   attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p), protectedGlob, riskScan: mode === 'risk-scan', rulesFiles, pythonPackage: (d) => packages.has(d) });
   if (mode === 'risk-scan') attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== 'unattributed') }));
@@ -384,7 +385,7 @@ const FILE_TEXT_CAP = 512 * 1024;
  * `a..b` / `a...b` ranges read `b` (default HEAD) from git. Best effort:
  * unreadable or oversized files are simply absent.
  */
-async function loadConfigTexts(root: string, target: DiffTarget, files: string[]): Promise<Map<string, string>> {
+async function loadConfigTexts(root: string, target: DiffTarget, files: string[], hunks: Hunk[] = []): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   let rev: string | null = null;
   if (typeof target === 'string') {
@@ -392,15 +393,73 @@ async function loadConfigTexts(root: string, target: DiffTarget, files: string[]
     if (m) rev = m[1] || 'HEAD';
     if (rev?.startsWith('-')) return out;
   }
+  const read = async (rel: string): Promise<string | undefined> => {
+    if (out.has(rel)) return out.get(rel);
+    let text: string | undefined;
+    if (rev === null) {
+      text = await readRepoText(root, rel, FILE_TEXT_CAP);
+    } else {
+      text = await git(root, ['show', '--no-textconv', `${rev}:${rel}`], { trim: false }).catch(() => undefined);
+      if (text !== undefined && text.length > FILE_TEXT_CAP) text = undefined;
+    }
+    if (text !== undefined) out.set(rel, text);
+    return text;
+  };
   for (const rel of files) {
-    if (!needsFileText(rel) && !needsSourceText(rel)) continue;
-    try {
-      // A symlink on disk is never followed (it may point outside the repo).
-      const text = rev === null
-        ? ((await lstat(path.join(root, rel))).isSymbolicLink() ? null : await readFile(path.join(root, rel), 'utf8'))
-        : await git(root, ['show', '--no-textconv', `${rev}:${rel}`], { trim: false });
-      if (text !== null && text.length <= FILE_TEXT_CAP) out.set(rel, text);
-    } catch { /* absent on that side */ }
+    if (needsFileText(rel) || needsSourceText(rel)) await read(rel);
+  }
+  // Relative modules the added lines of a test file import (and one level of their re-exports): the
+  // shadowed-global rule asks whether a test framework stands behind them.
+  const specs = new Map<string, Set<string>>();
+  for (const h of hunks) {
+    if (h.status === 'deleted' || !needsSourceText(h.file)) continue;
+    const added = h.lines.filter((l) => l.type === 'add').map((l) => l.text).join('\n');
+    for (const spec of relativeSpecifiers(added)) (specs.get(h.file) ?? specs.set(h.file, new Set()).get(h.file)!).add(spec);
+  }
+  let budget = MAX_MODULE_READS;
+  const resolve = async (from: string, spec: string): Promise<{ path: string; text: string } | null> => {
+    for (const c of relativeModuleCandidates(from, spec)) {
+      if (budget-- <= 0) return null;
+      const text = await read(c);
+      if (text !== undefined) return { path: c, text };
+    }
+    return null;
+  };
+  for (const [from, set] of specs) {
+    for (const spec of set) {
+      const mod = await resolve(from, spec);
+      if (mod) for (const re of relativeReExports(mod.text)) await resolve(mod.path, re);
+    }
   }
   return out;
+}
+
+/** Candidate paths read at most per report while resolving relative modules. */
+const MAX_MODULE_READS = 2000;
+
+/**
+ * A repository file's text, or undefined. It is read only when its real path lies inside the
+ * repository's real root (no symlinked file, no symlinked parent directory pointing out of the
+ * repository) and it is a regular file of at most `cap` bytes: checked on the opened descriptor
+ * (opened non-blocking and without following a final symlink), so a FIFO or a device is never read.
+ */
+export async function readRepoText(root: string, rel: string, cap: number): Promise<string | undefined> {
+  try {
+    const top = await realpath(root);
+    const abs = path.join(top, ...rel.split('/'));
+    if (!(await lstat(abs)).isFile()) return undefined;
+    const real = await realpath(abs);
+    if (!real.startsWith(top.endsWith(path.sep) ? top : `${top}${path.sep}`)) return undefined;
+    const fh = await open(real, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOFOLLOW ?? 0));
+    try {
+      const st = await fh.stat();
+      if (!st.isFile() || st.size > cap) return undefined;
+      const text = await fh.readFile('utf8');
+      return text.length <= cap ? text : undefined;
+    } finally {
+      await fh.close();
+    }
+  } catch {
+    return undefined;
+  }
 }

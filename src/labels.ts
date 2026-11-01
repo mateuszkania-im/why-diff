@@ -1207,12 +1207,19 @@ const TRY_OPEN = /\btry\s*\{/g;
 /** Test-framework globals a local binding can shadow (common words such as `context` or `before` are left out). */
 const TEST_GLOBALS: ReadonlySet<string> = new Set(['it', 'test', 'describe', 'expect', 'assert', 'beforeEach', 'afterEach', 'beforeAll', 'afterAll', 'suite', 'specify', 'xit', 'fit', 'xtest', 'xdescribe', 'fdescribe']);
 /** Modules those names may come from. */
-const TEST_MODULES = /^(?:vitest|@jest\/globals|node:test|mocha|chai|bun:test|@playwright\/test|(?:node:)?assert(?:\/strict)?|expect)$/;
+const TEST_MODULES = /^(?:vitest(?:\/.+)?|@vitest\/.+|@jest\/globals|jest-circus(?:\/.+)?|node:test|mocha|chai|bun:test|ava|tape|uvu(?:\/.+)?|tap|node-tap|@playwright\/.+|(?:node:)?assert(?:\/strict)?|expect)$/;
 const DECLARED_NAME = /^\s*(?:export\s+)?(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?:[=;:]|$)(.*)|(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\()/;
 const DESTRUCTURE = /^\s*(?:export\s+)?(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(.+)$/;
 const IMPORT_FROM = /^\s*import\s+(?!type\b)(.+?)\s+from\s+["'`]([^"'`]+)["'`]/;
 /** `require('<test module>')`, `require('<test module>').x`, `chai.x`, or `<x>.extend(` (Playwright / Vitest fixtures). */
-const FRAMEWORK_SOURCE = /^(?:require\s*\(\s*["'`]([^"'`]+)["'`]\s*\)(?:\s*\.\s*[\w$]+)*|chai(?:\s*\.\s*[\w$]+)*|[\w$]+\s*\.\s*extend\s*\()/;
+const FRAMEWORK_SOURCE = /^(?:require\s*\(\s*["'`]([^"'`]+)["'`]\s*\)(?:\s*\.\s*[\w$]+)*|chai(?:\s*\.\s*[\w$]+)*|[\w$]+\s*\.\s*extend\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*\()/;
+/** `.extend(` with optional (one level nested) generic arguments: a fixtures module. */
+const EXTEND_CALL = /\.\s*extend\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*\(/;
+/** Module specifiers a text imports, requires or re-exports from. */
+const SPECIFIER = /(?:\bfrom\s*|\brequire\s*\(\s*|\bimport\s*\(\s*|^\s*import\s+)["'`]([^"'`]+)["'`]/gm;
+/** Specifiers a text re-exports from (`export * from`, `export { x } from`). */
+const RE_EXPORT = /\bexport\s+(?:\*(?:\s+as\s+[\w$]+)?|(?:type\s+)?\{[^}]*\})\s*from\s*["'`]([^"'`]+)["'`]/g;
+const MODULE_EXTS = ['.ts', '.tsx', '.js', '.mjs', '.cjs', '.mts', '.cts', '.jsx'];
 /** A function literal that starts the line: an arrow (assigned or not) or a function expression / declaration. */
 const ARROW_START = /^\s*(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)?(?:async\s*)?(?:\([^()]*\)|[A-Za-z_$][\w$]*)\s*=>\s*(.*)$/;
 const FUNCTION_START = /^\s*(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\([^()]*\)\s*\{\s*$/;
@@ -1323,7 +1330,7 @@ function detectRestructure(path: string, lines: DiffLine[], fileText?: (p: strin
     // (c) a binding that shadows a test global
     // A top-level binding shadows the global for the whole file; an indented one (a local such as
     // `const test = makeHunk()`) only counts when the hunk then calls it (`it("a", ...)`).
-    const shadow = shadowedGlobal(code, line.text);
+    const shadow = shadowedGlobal(code, line.text, path, fileText);
     const calledAfter = (name: string): boolean => seq.slice(i + 1).some((x) => new RegExp(`(?<![\\w$.])${name}\\s*\\(`).test(x.code));
     if (shadow && (!/^\s/.test(line.text) || /^\s*import\b/.test(code) || calledAfter(shadow))) skips.push(`a binding that shadows the test global ${shadow}`);
 
@@ -1356,14 +1363,20 @@ function detectRestructure(path: string, lines: DiffLine[], fileText?: (p: strin
 }
 
 /** The test global an added line binds locally (or imports from outside a test framework), if any. */
-function shadowedGlobal(code: string, raw: string): string | null {
+function shadowedGlobal(code: string, raw: string, from: string, fileText?: (p: string) => string | undefined): string | null {
+  // A relative module (`./fixtures`) shadows only if it resolves, can be read, and has no test
+  // framework behind it (see {@link relativeModuleBacked}).
+  const plainRelative = (source: string): boolean => {
+    const m = /require\s*\(\s*["'`](\.{1,2}\/[^"'`]*)["'`]/.exec(source);
+    return m ? relativeModuleBacked(from, m[1]!, fileText) === 'plain' : true;
+  };
   const d = DECLARED_NAME.exec(code);
   if (d) {
     const name = d[1] ?? d[3];
     if (name && TEST_GLOBALS.has(name)) {
       const rhs = (d[2] ?? '').trim().replace(/^=\s*/, '');
       const source = rawRhs(raw);
-      if (!(d[1] && rhs && FRAMEWORK_SOURCE.test(source) && frameworkModule(source))) return name;
+      if (!(d[1] && rhs && FRAMEWORK_SOURCE.test(source) && frameworkModule(source)) && plainRelative(source)) return name;
     }
   }
   const ds = DESTRUCTURE.exec(code);
@@ -1371,10 +1384,10 @@ function shadowedGlobal(code: string, raw: string): string | null {
     const names = ds[1]!.split(',').map((b) => b.split(':').pop()!.split('=')[0]!.trim().replace(/^\.\.\./, ''));
     const hit = names.find((n) => TEST_GLOBALS.has(n));
     const source = rawRhs(raw);
-    if (hit && !(FRAMEWORK_SOURCE.test(source) && frameworkModule(source))) return hit;
+    if (hit && !(FRAMEWORK_SOURCE.test(source) && frameworkModule(source)) && plainRelative(source)) return hit;
   }
   const im = IMPORT_FROM.exec(raw);
-  if (im && !TEST_MODULES.test(im[2]!)) {
+  if (im && !TEST_MODULES.test(im[2]!) && (!/^\.{1,2}\//.test(im[2]!) || relativeModuleBacked(from, im[2]!, fileText) === 'plain')) {
     const clause = im[1]!;
     const bindings: string[] = [];
     const braces = /\{([^}]*)\}/.exec(clause);
@@ -1385,6 +1398,56 @@ function shadowedGlobal(code: string, raw: string): string | null {
     if (hit) return hit;
   }
   return null;
+}
+
+/**
+ * Repo paths a relative specifier can name from the file `from`: the path itself, with each
+ * JavaScript/TypeScript extension, a `.js` spelled for a `.ts` source, and `<dir>/index.*`.
+ */
+export function relativeModuleCandidates(from: string, spec: string): string[] {
+  const target = posix.normalize(posix.join(posix.dirname(normalisePath(from)), spec));
+  if (target.startsWith('../') || target === '..') return [];
+  const out = [target, ...MODULE_EXTS.map((e) => target + e), ...MODULE_EXTS.map((e) => `${target}/index${e}`)];
+  const js = /\.(m|c)?jsx?$/.exec(target);
+  if (js) out.push(...['.ts', '.tsx', '.mts', '.cts'].map((e) => target.slice(0, -js[0].length) + e));
+  return [...new Set(out)];
+}
+
+/** Relative specifiers a text imports, requires or re-exports from. */
+export function relativeSpecifiers(text: string): string[] {
+  return [...new Set([...text.matchAll(SPECIFIER)].map((m) => m[1]!).filter((x) => /^\.{1,2}\//.test(x)))];
+}
+
+/** Relative specifiers a text re-exports from. */
+export function relativeReExports(text: string): string[] {
+  return [...new Set([...text.matchAll(RE_EXPORT)].map((m) => m[1]!).filter((x) => /^\.{1,2}\//.test(x)))];
+}
+
+/** The first readable candidate of a relative specifier: its repo path and text. */
+function resolveModule(from: string, spec: string, fileText?: (p: string) => string | undefined): { path: string; text: string } | null {
+  if (!fileText) return null;
+  for (const c of relativeModuleCandidates(from, spec)) {
+    const text = fileText(c);
+    if (text !== undefined) return { path: c, text };
+  }
+  return null;
+}
+
+/**
+ * What stands behind a relative import: `missing` (it does not resolve, or cannot be read: not
+ * flagged), `framework` (it imports, requires or re-exports a test framework module, or calls
+ * `.extend(`, directly or through one level of re-export: a fixtures module), or `plain`.
+ */
+function relativeModuleBacked(from: string, spec: string, fileText?: (p: string) => string | undefined): 'missing' | 'framework' | 'plain' {
+  const mod = resolveModule(from, spec, fileText);
+  if (!mod) return 'missing';
+  const backed = (text: string): boolean => EXTEND_CALL.test(text) || [...text.matchAll(SPECIFIER)].some((m) => TEST_MODULES.test(m[1]!));
+  if (backed(mod.text)) return 'framework';
+  for (const re of relativeReExports(mod.text)) {
+    const next = resolveModule(mod.path, re, fileText);
+    if (next && backed(next.text)) return 'framework';
+  }
+  return 'plain';
 }
 
 /** The right-hand side of an assignment on the raw line (strings kept, for module names). */

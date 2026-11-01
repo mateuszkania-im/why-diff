@@ -28,9 +28,9 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 // node_modules/picocolors/picocolors.js
 var require_picocolors = __commonJS({
   "node_modules/picocolors/picocolors.js"(exports, module) {
-    var p = process || {}, argv = p.argv || [], env = p.env || {}, isColorSupported = !(env.NO_COLOR || argv.includes("--no-color")) && (!!env.FORCE_COLOR || argv.includes("--color") || p.platform === "win32" || (p.stdout || {}).isTTY && env.TERM !== "dumb" || !!env.CI), formatter = (open3, close, replace = open3) => (input) => {
-      let string = "" + input, index = string.indexOf(close, open3.length);
-      return ~index ? open3 + replaceClose(string, close, replace, index) + close : open3 + string + close;
+    var p = process || {}, argv = p.argv || [], env = p.env || {}, isColorSupported = !(env.NO_COLOR || argv.includes("--no-color")) && (!!env.FORCE_COLOR || argv.includes("--color") || p.platform === "win32" || (p.stdout || {}).isTTY && env.TERM !== "dumb" || !!env.CI), formatter = (open4, close, replace = open4) => (input) => {
+      let string = "" + input, index = string.indexOf(close, open4.length);
+      return ~index ? open4 + replaceClose(string, close, replace, index) + close : open4 + string + close;
     }, replaceClose = (string, close, replace, index) => {
       let result = "", cursor = 0;
       do
@@ -2632,7 +2632,8 @@ import { spawn as spawn4 } from "node:child_process";
 // src/pipeline.ts
 import os7 from "node:os";
 import path10 from "node:path";
-import { lstat as lstat2, readFile as readFile6, stat as stat4 } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { lstat as lstat2, open as open2, readFile as readFile6, realpath as realpath5, stat as stat4 } from "node:fs/promises";
 
 // src/types.ts
 var BINARY_HUNK_HEADER = "Binary file changed", FILE_LEVEL_LABELS = /* @__PURE__ */ new Set([
@@ -2661,20 +2662,20 @@ function parseUnifiedDiff(diff) {
   let hunks = [], lines = diff.split(`
 `);
   lines.length > 0 && lines[lines.length - 1] === "" && lines.pop();
-  let file = null, open3 = null, newFile = (oldPath, newPath) => ({
+  let file = null, open4 = null, newFile = (oldPath, newPath) => ({
     oldPath,
     newPath,
     status: "modified",
     binary: !1,
     emittedHunk: !1
   }), finishFile = () => {
-    file && file.binary && !file.emittedHunk ? hunks.push(binaryHunk(file, hunks.length + 1)) : file && !file.binary && !file.emittedHunk && isModeOnlyChange(file) ? hunks.push(modeChangeHunk(file, hunks.length + 1)) : file && !file.binary && !file.emittedHunk && isContentlessMove(file) && hunks.push(contentlessHunk(file, hunks.length + 1)), file = null, open3 = null;
+    file && file.binary && !file.emittedHunk ? hunks.push(binaryHunk(file, hunks.length + 1)) : file && !file.binary && !file.emittedHunk && isModeOnlyChange(file) ? hunks.push(modeChangeHunk(file, hunks.length + 1)) : file && !file.binary && !file.emittedHunk && isContentlessMove(file) && hunks.push(contentlessHunk(file, hunks.length + 1)), file = null, open4 = null;
   };
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i] ?? "";
-    if (open3 && (open3.remainingOld > 0 || open3.remainingNew > 0)) {
-      if (line.startsWith("\\") || consumeBodyLine(open3, line)) continue;
-      open3 = null;
+    if (open4 && (open4.remainingOld > 0 || open4.remainingNew > 0)) {
+      if (line.startsWith("\\") || consumeBodyLine(open4, line)) continue;
+      open4 = null;
     }
     if (line.startsWith("\\")) continue;
     let gitMatch = DIFF_GIT.exec(line);
@@ -2704,7 +2705,7 @@ function parseUnifiedDiff(diff) {
         header: line,
         lines: []
       };
-      open3 = {
+      open4 = {
         hunk,
         remainingOld: oldLines,
         remainingNew: newLines,
@@ -2740,14 +2741,14 @@ function parseUnifiedDiff(diff) {
   }
   return finishFile(), hunks;
 }
-function consumeBodyLine(open3, line) {
+function consumeBodyLine(open4, line) {
   let marker = line[0], text2 = line.slice(1);
-  return marker === "+" && open3.remainingNew > 0 ? (open3.hunk.lines.push({ type: "add", text: text2, newNo: open3.newNo++ }), open3.remainingNew--, !0) : marker === "-" && open3.remainingOld > 0 ? (open3.hunk.lines.push({ type: "del", text: text2, oldNo: open3.oldNo++ }), open3.remainingOld--, !0) : (marker === " " || line === "") && open3.remainingOld > 0 && open3.remainingNew > 0 ? (open3.hunk.lines.push({
+  return marker === "+" && open4.remainingNew > 0 ? (open4.hunk.lines.push({ type: "add", text: text2, newNo: open4.newNo++ }), open4.remainingNew--, !0) : marker === "-" && open4.remainingOld > 0 ? (open4.hunk.lines.push({ type: "del", text: text2, oldNo: open4.oldNo++ }), open4.remainingOld--, !0) : (marker === " " || line === "") && open4.remainingOld > 0 && open4.remainingNew > 0 ? (open4.hunk.lines.push({
     type: "ctx",
     text: line === "" ? "" : text2,
-    oldNo: open3.oldNo++,
-    newNo: open3.newNo++
-  }), open3.remainingOld--, open3.remainingNew--, !0) : !1;
+    oldNo: open4.oldNo++,
+    newNo: open4.newNo++
+  }), open4.remainingOld--, open4.remainingNew--, !0) : !1;
 }
 function isModeOnlyChange(file) {
   return file.oldMode !== void 0 && file.newMode !== void 0 && file.status === "modified";
@@ -4453,15 +4454,15 @@ function uniq(xs) {
 function listOf(items) {
   return uniq(items).join(", ");
 }
-function balanced(s, open3) {
+function balanced(s, open4) {
   let pairs = { "(": ")", "[": "]", "{": "}" }, stack = [];
-  for (let i = open3; i < s.length; i++) {
+  for (let i = open4; i < s.length; i++) {
     let c = s.charAt(i), close = pairs[c];
     if (close !== void 0) stack.push(close);
     else if (c === stack[stack.length - 1] && (stack.pop(), stack.length === 0))
-      return { inner: s.slice(open3 + 1, i), end: i + 1 };
+      return { inner: s.slice(open4 + 1, i), end: i + 1 };
   }
-  return { inner: s.slice(open3 + 1), end: s.length };
+  return { inner: s.slice(open4 + 1), end: s.length };
 }
 function splitTopLevel(s) {
   let out = [], depth = 0, cur = "";
@@ -4750,7 +4751,7 @@ function parseAssertion(line, path14) {
   if (!code2 || /^(?:def|function|func|fn|public|private|protected)\b/.test(code2)) return null;
   let literals = [...line.matchAll(STRING_LITERAL)].map((m) => m[0].slice(1, -1)).filter((x) => x.trim() !== ""), base = { raw: line.trim(), key: normaliseLine(line), literals }, norm = (s) => s.replace(/\s+/g, ""), ex = EXPECT_CALL.exec(code2);
   if (ex) {
-    let open3 = ex.index + ex[0].length - 1, subject = balanced(code2, open3), rest = code2.slice(subject.end), negated = !1;
+    let open4 = ex.index + ex[0].length - 1, subject = balanced(code2, open4), rest = code2.slice(subject.end), negated = !1;
     for (let m2 = CHAIN_MODIFIER.exec(rest); m2; m2 = CHAIN_MODIFIER.exec(rest))
       (m2[1] === "not" || m2[1] === "not_to" || m2[1] === "to_not") && (negated = !0), rest = rest.slice(m2[0].length);
     let m = /^\s*\.?\s*(\w+)\s*(\(?)/.exec(rest), display = m?.[1] ?? "expect", expected = "";
@@ -4884,7 +4885,7 @@ function detectAssertionChanges(path14, lines) {
   }
   return findings;
 }
-var JS_EXT = /* @__PURE__ */ new Set(["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"]), FALSY_IF = /\bif\s*\(\s*(?:false|0|!\s*true|!\s*1|null|undefined|void\s+0)\s*\)/, TRY_OPEN = /\btry\s*\{/g, TEST_GLOBALS = /* @__PURE__ */ new Set(["it", "test", "describe", "expect", "assert", "beforeEach", "afterEach", "beforeAll", "afterAll", "suite", "specify", "xit", "fit", "xtest", "xdescribe", "fdescribe"]), TEST_MODULES = /^(?:vitest|@jest\/globals|node:test|mocha|chai|bun:test|@playwright\/test|(?:node:)?assert(?:\/strict)?|expect)$/, DECLARED_NAME = /^\s*(?:export\s+)?(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?:[=;:]|$)(.*)|(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\()/, DESTRUCTURE = /^\s*(?:export\s+)?(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(.+)$/, IMPORT_FROM = /^\s*import\s+(?!type\b)(.+?)\s+from\s+["'`]([^"'`]+)["'`]/, FRAMEWORK_SOURCE = /^(?:require\s*\(\s*["'`]([^"'`]+)["'`]\s*\)(?:\s*\.\s*[\w$]+)*|chai(?:\s*\.\s*[\w$]+)*|[\w$]+\s*\.\s*extend\s*\()/, ARROW_START = /^\s*(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)?(?:async\s*)?(?:\([^()]*\)|[A-Za-z_$][\w$]*)\s*=>\s*(.*)$/, FUNCTION_START = /^\s*(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\([^()]*\)\s*\{\s*$/, ASSERTION_CALL = /(?<![\w$.])(?:expect\s*[({]|assert\w*\s*[.(])/;
+var JS_EXT = /* @__PURE__ */ new Set(["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"]), FALSY_IF = /\bif\s*\(\s*(?:false|0|!\s*true|!\s*1|null|undefined|void\s+0)\s*\)/, TRY_OPEN = /\btry\s*\{/g, TEST_GLOBALS = /* @__PURE__ */ new Set(["it", "test", "describe", "expect", "assert", "beforeEach", "afterEach", "beforeAll", "afterAll", "suite", "specify", "xit", "fit", "xtest", "xdescribe", "fdescribe"]), TEST_MODULES = /^(?:vitest(?:\/.+)?|@vitest\/.+|@jest\/globals|jest-circus(?:\/.+)?|node:test|mocha|chai|bun:test|ava|tape|uvu(?:\/.+)?|tap|node-tap|@playwright\/.+|(?:node:)?assert(?:\/strict)?|expect)$/, DECLARED_NAME = /^\s*(?:export\s+)?(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?:[=;:]|$)(.*)|(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\()/, DESTRUCTURE = /^\s*(?:export\s+)?(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(.+)$/, IMPORT_FROM = /^\s*import\s+(?!type\b)(.+?)\s+from\s+["'`]([^"'`]+)["'`]/, FRAMEWORK_SOURCE = /^(?:require\s*\(\s*["'`]([^"'`]+)["'`]\s*\)(?:\s*\.\s*[\w$]+)*|chai(?:\s*\.\s*[\w$]+)*|[\w$]+\s*\.\s*extend\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*\()/, EXTEND_CALL = /\.\s*extend\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*\(/, SPECIFIER = /(?:\bfrom\s*|\brequire\s*\(\s*|\bimport\s*\(\s*|^\s*import\s+)["'`]([^"'`]+)["'`]/gm, RE_EXPORT = /\bexport\s+(?:\*(?:\s+as\s+[\w$]+)?|(?:type\s+)?\{[^}]*\})\s*from\s*["'`]([^"'`]+)["'`]/g, MODULE_EXTS = [".ts", ".tsx", ".js", ".mjs", ".cjs", ".mts", ".cts", ".jsx"], ARROW_START = /^\s*(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)?(?:async\s*)?(?:\([^()]*\)|[A-Za-z_$][\w$]*)\s*=>\s*(.*)$/, FUNCTION_START = /^\s*(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\([^()]*\)\s*\{\s*$/, ASSERTION_CALL = /(?<![\w$.])(?:expect\s*[({]|assert\w*\s*[.(])/;
 function detectRestructure(path14, lines, fileText) {
   let skips = [], weakenings = [];
   if (!isTestFile(path14) || !JS_EXT.has(extOf(path14))) return { skips, weakenings };
@@ -4930,16 +4931,16 @@ function detectRestructure(path14, lines, fileText) {
       at && (seq[at.li].code[at.col] === "{" ? anyExisting(at.li, close(at.li, at.col).li) : existing(at.li)) && skips.push(`assertions behind ${f[0].replace(/\s+/g, " ")}`);
     }
     for (let t of code2.matchAll(TRY_OPEN)) {
-      let open3 = { li: i, col: t.index + t[0].length - 1 }, end = close(open3.li, open3.col);
+      let open4 = { li: i, col: t.index + t[0].length - 1 }, end = close(open4.li, open4.col);
       if (end.col === 1 / 0) continue;
       let after = next(end.li, end.col + 1);
       if (!after) continue;
       let rest = seq[after.li].code.slice(after.col), c = /^catch\s*(?:\([^)]*\)\s*)?\{/.exec(rest);
       if (!c) continue;
-      let catchOpen = { li: after.li, col: after.col + c[0].length - 1 }, catchEnd = close(catchOpen.li, catchOpen.col), body = between(open3, end), handler = between(catchOpen, catchEnd);
-      /\bthrow\b/.test(handler) || ASSERTION_CALL.test(handler) || /\.\s*(?:toThrow\w*|rejects|throws)\b/.test(body) || anyExisting(open3.li, end.li) && weakenings.push("existing assertions wrapped in a try/catch that swallows their failures");
+      let catchOpen = { li: after.li, col: after.col + c[0].length - 1 }, catchEnd = close(catchOpen.li, catchOpen.col), body = between(open4, end), handler = between(catchOpen, catchEnd);
+      /\bthrow\b/.test(handler) || ASSERTION_CALL.test(handler) || /\.\s*(?:toThrow\w*|rejects|throws)\b/.test(body) || anyExisting(open4.li, end.li) && weakenings.push("existing assertions wrapped in a try/catch that swallows their failures");
     }
-    let shadow = shadowedGlobal(code2, line.text), calledAfter = (name) => seq.slice(i + 1).some((x) => new RegExp(`(?<![\\w$.])${name}\\s*\\(`).test(x.code));
+    let shadow = shadowedGlobal(code2, line.text, path14, fileText), calledAfter = (name) => seq.slice(i + 1).some((x) => new RegExp(`(?<![\\w$.])${name}\\s*\\(`).test(x.code));
     shadow && (!/^\s/.test(line.text) || /^\s*import\b/.test(code2) || calledAfter(shadow)) && skips.push(`a binding that shadows the test global ${shadow}`);
     let arrow = ARROW_START.exec(code2), fn = arrow ? null : FUNCTION_START.exec(code2), prev = "";
     for (let j = i - 1; j >= 0 && !prev; j--) prev = seq[j].code.trim();
@@ -4957,22 +4958,25 @@ function detectRestructure(path14, lines, fileText) {
   }
   return { skips: uniq(skips), weakenings: uniq(weakenings) };
 }
-function shadowedGlobal(code2, raw) {
-  let d = DECLARED_NAME.exec(code2);
+function shadowedGlobal(code2, raw, from, fileText) {
+  let plainRelative = (source) => {
+    let m = /require\s*\(\s*["'`](\.{1,2}\/[^"'`]*)["'`]/.exec(source);
+    return m ? relativeModuleBacked(from, m[1], fileText) === "plain" : !0;
+  }, d = DECLARED_NAME.exec(code2);
   if (d) {
     let name = d[1] ?? d[3];
     if (name && TEST_GLOBALS.has(name)) {
       let rhs = (d[2] ?? "").trim().replace(/^=\s*/, ""), source = rawRhs(raw);
-      if (!(d[1] && rhs && FRAMEWORK_SOURCE.test(source) && frameworkModule(source))) return name;
+      if (!(d[1] && rhs && FRAMEWORK_SOURCE.test(source) && frameworkModule(source)) && plainRelative(source)) return name;
     }
   }
   let ds = DESTRUCTURE.exec(code2);
   if (ds) {
     let hit = ds[1].split(",").map((b) => b.split(":").pop().split("=")[0].trim().replace(/^\.\.\./, "")).find((n) => TEST_GLOBALS.has(n)), source = rawRhs(raw);
-    if (hit && !(FRAMEWORK_SOURCE.test(source) && frameworkModule(source))) return hit;
+    if (hit && !(FRAMEWORK_SOURCE.test(source) && frameworkModule(source)) && plainRelative(source)) return hit;
   }
   let im = IMPORT_FROM.exec(raw);
-  if (im && !TEST_MODULES.test(im[2])) {
+  if (im && !TEST_MODULES.test(im[2]) && (!/^\.{1,2}\//.test(im[2]) || relativeModuleBacked(from, im[2], fileText) === "plain")) {
     let clause = im[1], bindings = [], braces = /\{([^}]*)\}/.exec(clause);
     if (braces) for (let b of braces[1].split(",")) bindings.push(b.trim().replace(/^type\s+/, "").split(/\s+as\s+/).pop().trim());
     let def = /^([A-Za-z_$][\w$]*)/.exec(clause.trim());
@@ -4981,6 +4985,37 @@ function shadowedGlobal(code2, raw) {
     if (hit) return hit;
   }
   return null;
+}
+function relativeModuleCandidates(from, spec) {
+  let target = posix.normalize(posix.join(posix.dirname(normalisePath(from)), spec));
+  if (target.startsWith("../") || target === "..") return [];
+  let out = [target, ...MODULE_EXTS.map((e) => target + e), ...MODULE_EXTS.map((e) => `${target}/index${e}`)], js = /\.(m|c)?jsx?$/.exec(target);
+  return js && out.push(...[".ts", ".tsx", ".mts", ".cts"].map((e) => target.slice(0, -js[0].length) + e)), [...new Set(out)];
+}
+function relativeSpecifiers(text2) {
+  return [...new Set([...text2.matchAll(SPECIFIER)].map((m) => m[1]).filter((x) => /^\.{1,2}\//.test(x)))];
+}
+function relativeReExports(text2) {
+  return [...new Set([...text2.matchAll(RE_EXPORT)].map((m) => m[1]).filter((x) => /^\.{1,2}\//.test(x)))];
+}
+function resolveModule(from, spec, fileText) {
+  if (!fileText) return null;
+  for (let c of relativeModuleCandidates(from, spec)) {
+    let text2 = fileText(c);
+    if (text2 !== void 0) return { path: c, text: text2 };
+  }
+  return null;
+}
+function relativeModuleBacked(from, spec, fileText) {
+  let mod = resolveModule(from, spec, fileText);
+  if (!mod) return "missing";
+  let backed = (text2) => EXTEND_CALL.test(text2) || [...text2.matchAll(SPECIFIER)].some((m) => TEST_MODULES.test(m[1]));
+  if (backed(mod.text)) return "framework";
+  for (let re of relativeReExports(mod.text)) {
+    let next = resolveModule(mod.path, re, fileText);
+    if (next && backed(next.text)) return "framework";
+  }
+  return "plain";
 }
 function rawRhs(raw) {
   let m = /=\s*(.+?)\s*;?\s*$/.exec(raw);
@@ -5024,9 +5059,9 @@ var NPM_DEP_SECTIONS = /* @__PURE__ */ new Set(["dependencies", "devDependencies
 function scanJsonManifest(lines, sections, scalars) {
   let scan = { added: [], removed: [] }, section;
   for (let l of lines) {
-    let open3 = /^\s*"([^"]+)"\s*:\s*\{\s*$/.exec(l.text);
-    if (open3) {
-      section = open3[1];
+    let open4 = /^\s*"([^"]+)"\s*:\s*\{\s*$/.exec(l.text);
+    if (open4) {
+      section = open4[1];
       continue;
     }
     if (/^\s*\}/.test(l.text)) {
@@ -5113,9 +5148,9 @@ function scanCargo(lines) {
 function scanGoMod(lines) {
   let scan = { added: [], removed: [] }, block;
   for (let l of lines) {
-    let open3 = /^\s*(require|replace|exclude|retract|tool|godebug)\s*\(\s*$/.exec(l.text);
-    if (open3) {
-      block = open3[1];
+    let open4 = /^\s*(require|replace|exclude|retract|tool|godebug)\s*\(\s*$/.exec(l.text);
+    if (open4) {
+      block = open4[1];
       continue;
     }
     if (/^\s*\)\s*$/.test(l.text)) {
@@ -5150,8 +5185,8 @@ function detectConfigChange(path14, lines) {
   if (base === "package.json") {
     let section, changed = /* @__PURE__ */ new Set();
     for (let l of lines) {
-      let open3 = /^\s*"([^"]+)"\s*:\s*\{\s*$/.exec(l.text);
-      open3 ? section = open3[1] : /^\s*\}/.test(l.text) ? section = null : l.type !== "ctx" && section && PKG_CONFIG_SECTIONS.has(section) && changed.add(section);
+      let open4 = /^\s*"([^"]+)"\s*:\s*\{\s*$/.exec(l.text);
+      open4 ? section = open4[1] : /^\s*\}/.test(l.text) ? section = null : l.type !== "ctx" && section && PKG_CONFIG_SECTIONS.has(section) && changed.add(section);
     }
     if (changed.size > 0) return `package.json ${[...changed].join(", ")} changed`;
   }
@@ -5650,10 +5685,10 @@ function expandWords(pairs, vars, budget) {
 }
 function expandBraces(word, mask2, budget = { n: MAX_EXPANSIONS }) {
   if (budget.n <= 0 || word.length > 4096 || !word.includes("{")) return [[word, mask2]];
-  for (let open3 = word.indexOf("{"); open3 !== -1; open3 = word.indexOf("{", open3 + 1)) {
-    if (mask2[open3] !== "u") continue;
+  for (let open4 = word.indexOf("{"); open4 !== -1; open4 = word.indexOf("{", open4 + 1)) {
+    if (mask2[open4] !== "u") continue;
     let depth = 0, commas = [], close = -1;
-    for (let i = open3 + 1; i < word.length; i++) {
+    for (let i = open4 + 1; i < word.length; i++) {
       if (mask2[i] !== "u") continue;
       let c = word[i];
       if (c === "{") depth++;
@@ -5667,9 +5702,9 @@ function expandBraces(word, mask2, budget = { n: MAX_EXPANSIONS }) {
     }
     if (close === -1) return [[word, mask2]];
     if (!commas.length) continue;
-    let out = [], cuts = [open3, ...commas, close];
+    let out = [], cuts = [open4, ...commas, close];
     for (let k = 0; k + 1 < cuts.length; k++) {
-      let a = (cuts[k] ?? 0) + 1, b = cuts[k + 1] ?? 0, text2 = word.slice(0, open3) + word.slice(a, b) + word.slice(close + 1), m = mask2.slice(0, open3) + mask2.slice(a, b) + mask2.slice(close + 1);
+      let a = (cuts[k] ?? 0) + 1, b = cuts[k + 1] ?? 0, text2 = word.slice(0, open4) + word.slice(a, b) + word.slice(close + 1), m = mask2.slice(0, open4) + mask2.slice(a, b) + mask2.slice(close + 1);
       for (let r of expandBraces(text2, m, budget)) {
         if (budget.n-- <= 0) return out.length ? out : [[word, mask2]];
         out.push(r);
@@ -6124,9 +6159,9 @@ function tokenize(input) {
   }
   return flush(), pendingHeredocs.length && readHeredocBodies(), tokens;
 }
-function matchParen(s, open3) {
+function matchParen(s, open4) {
   let depth = 0;
-  for (let i = open3; i < s.length; i++) {
+  for (let i = open4; i < s.length; i++) {
     let c = s[i];
     if (c === "(") depth++;
     else if (c === ")") {
@@ -6490,8 +6525,8 @@ var ClaudeCodeAdapter = class {
     this.windowCalls.delete(toolUseId);
     let start = Date.parse(call.at), end = resultAt ? Date.parse(resultAt) : NaN;
     if (!Number.isFinite(start)) return;
-    let open3 = call.open || opts.background || !Number.isFinite(end);
-    this.toolWindows.push({ callId: toolUseId, tool: call.name, start: call.at, end: Number.isFinite(end) && end >= start ? resultAt : call.at, ...open3 ? { open: !0 } : {} });
+    let open4 = call.open || opts.background || !Number.isFinite(end);
+    this.toolWindows.push({ callId: toolUseId, tool: call.name, start: call.at, end: Number.isFinite(end) && end >= start ? resultAt : call.at, ...open4 ? { open: !0 } : {} });
   }
   // -- edit extraction -------------------------------------------------------
   emitEdits(call, outcome) {
@@ -6587,15 +6622,15 @@ function cleanPromptText(raw) {
 `).trim();
 }
 function tagText(text2, tag) {
-  let open3 = `<${tag}>`, i = text2.indexOf(open3);
+  let open4 = `<${tag}>`, i = text2.indexOf(open4);
   if (i < 0) return;
-  let j = text2.indexOf(`</${tag}>`, i + open3.length);
-  return j < 0 ? void 0 : text2.slice(i + open3.length, j);
+  let j = text2.indexOf(`</${tag}>`, i + open4.length);
+  return j < 0 ? void 0 : text2.slice(i + open4.length, j);
 }
 function stripTags(text2, tag) {
-  let open3 = `<${tag}>`, close = `</${tag}>`, out = "", pos = 0;
+  let open4 = `<${tag}>`, close = `</${tag}>`, out = "", pos = 0;
   for (; ; ) {
-    let i = text2.indexOf(open3, pos), j = i < 0 ? -1 : text2.indexOf(close, i + open3.length);
+    let i = text2.indexOf(open4, pos), j = i < 0 ? -1 : text2.indexOf(close, i + open4.length);
     if (j < 0) return out + text2.slice(pos);
     out += text2.slice(pos, i), pos = j + close.length;
   }
@@ -7117,7 +7152,7 @@ function readJsString(src, start) {
 function findJsToolCalls(src, name) {
   let out = [], re = new RegExp(`\\btools\\.${name.replace(/[.$]/g, "\\$&")}\\s*\\(`, "g"), m;
   for (; (m = re.exec(src)) !== null; ) {
-    let open3 = m.index + m[0].length, depth = 1, i = open3;
+    let open4 = m.index + m[0].length, depth = 1, i = open4;
     for (; i < src.length && depth > 0; ) {
       let c = src[i] ?? "";
       if (c === '"' || c === "'" || c === "`") {
@@ -7126,7 +7161,7 @@ function findJsToolCalls(src, name) {
       }
       c === "(" || c === "{" || c === "[" ? depth++ : (c === ")" || c === "}" || c === "]") && depth--, i++;
     }
-    out.push({ index: m.index, args: src.slice(open3, Math.max(open3, i - 1)) }), re.lastIndex = i;
+    out.push({ index: m.index, args: src.slice(open4, Math.max(open4, i - 1)) }), re.lastIndex = i;
   }
   return out;
 }
@@ -8952,7 +8987,7 @@ async function buildReport(opts = {}) {
     let kept = attributed.filter((h) => !(isIgnored(h.hunk) && h.match === "none"));
     ignoredHunks = attributed.length - kept.length, attributed = kept;
   }
-  let mode = sessions.length === 0 ? "risk-scan" : "provenance", texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== "deleted").map((h) => h.file))]), packages = await pythonPackageDirs(root, baseRev, hunks);
+  let mode = sessions.length === 0 ? "risk-scan" : "provenance", texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== "deleted").map((h) => h.file))], hunks), packages = await pythonPackageDirs(root, baseRev, hunks);
   attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p), protectedGlob, riskScan: mode === "risk-scan", rulesFiles, pythonPackage: (d) => packages.has(d) }), mode === "risk-scan" && (attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== "unattributed") }))), unreviewed.size && (attributed = attributed.map((h) => unreviewed.has(h.hunk.file) || h.hunk.oldFile !== void 0 && unreviewed.has(h.hunk.oldFile) ? { ...h, labels: [...h.labels, { kind: "unreviewed", severity: "risk", detail: `Content could not be shown as text (binary by git attributes and too big to re-diff, or an untracked file over 2 MB or unreadable): ${h.hunk.file}` }] } : h));
   let reportSessions = sessions, reportPrompts = prompts;
   if (mode === "risk-scan" && attributed.length) {
@@ -9047,20 +9082,61 @@ function guessAdapter(file) {
   return file.includes(".codex") || /rollout-.*\.jsonl$/.test(file) ? codexAdapter : file.includes("opencode") ? opencodeAdapter : claudeCodeAdapter;
 }
 var FILE_TEXT_CAP = 512 * 1024;
-async function loadConfigTexts(root, target, files) {
+async function loadConfigTexts(root, target, files, hunks = []) {
   let out = /* @__PURE__ */ new Map(), rev = null;
   if (typeof target == "string") {
     let m = /^(?:.*?)\.\.\.?(.*)$/.exec(target);
     if (m && (rev = m[1] || "HEAD"), rev?.startsWith("-")) return out;
   }
+  let read = async (rel) => {
+    if (out.has(rel)) return out.get(rel);
+    let text2;
+    return rev === null ? text2 = await readRepoText(root, rel, FILE_TEXT_CAP) : (text2 = await git(root, ["show", "--no-textconv", `${rev}:${rel}`], { trim: !1 }).catch(() => {
+    }), text2 !== void 0 && text2.length > FILE_TEXT_CAP && (text2 = void 0)), text2 !== void 0 && out.set(rel, text2), text2;
+  };
   for (let rel of files)
-    if (!(!needsFileText(rel) && !needsSourceText(rel)))
-      try {
-        let text2 = rev === null ? (await lstat2(path10.join(root, rel))).isSymbolicLink() ? null : await readFile6(path10.join(root, rel), "utf8") : await git(root, ["show", "--no-textconv", `${rev}:${rel}`], { trim: !1 });
-        text2 !== null && text2.length <= FILE_TEXT_CAP && out.set(rel, text2);
-      } catch {
-      }
+    (needsFileText(rel) || needsSourceText(rel)) && await read(rel);
+  let specs = /* @__PURE__ */ new Map();
+  for (let h of hunks) {
+    if (h.status === "deleted" || !needsSourceText(h.file)) continue;
+    let added = h.lines.filter((l) => l.type === "add").map((l) => l.text).join(`
+`);
+    for (let spec of relativeSpecifiers(added)) (specs.get(h.file) ?? specs.set(h.file, /* @__PURE__ */ new Set()).get(h.file)).add(spec);
+  }
+  let budget = MAX_MODULE_READS, resolve = async (from, spec) => {
+    for (let c of relativeModuleCandidates(from, spec)) {
+      if (budget-- <= 0) return null;
+      let text2 = await read(c);
+      if (text2 !== void 0) return { path: c, text: text2 };
+    }
+    return null;
+  };
+  for (let [from, set] of specs)
+    for (let spec of set) {
+      let mod = await resolve(from, spec);
+      if (mod) for (let re of relativeReExports(mod.text)) await resolve(mod.path, re);
+    }
   return out;
+}
+var MAX_MODULE_READS = 2e3;
+async function readRepoText(root, rel, cap) {
+  try {
+    let top = await realpath5(root), abs = path10.join(top, ...rel.split("/"));
+    if (!(await lstat2(abs)).isFile()) return;
+    let real = await realpath5(abs);
+    if (!real.startsWith(top.endsWith(path10.sep) ? top : `${top}${path10.sep}`)) return;
+    let fh = await open2(real, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOFOLLOW ?? 0));
+    try {
+      let st = await fh.stat();
+      if (!st.isFile() || st.size > cap) return;
+      let text2 = await fh.readFile("utf8");
+      return text2.length <= cap ? text2 : void 0;
+    } finally {
+      await fh.close();
+    }
+  } catch {
+    return;
+  }
 }
 
 // src/report/html.ts
@@ -9914,15 +9990,15 @@ function cutAtLine(md, maxChars) {
 
 _Report truncated to fit the size limit._
 `, lines = md.split(`
-`), kept = "", open3 = 0;
+`), kept = "", open4 = 0;
   for (let line of lines) {
-    let opens = (line.match(/<details>/g) ?? []).length, closes = (line.match(/<\/details>/g) ?? []).length, nextOpen = Math.max(0, open3 + opens - closes), candidate = `${kept}${line}
+    let opens = (line.match(/<details>/g) ?? []).length, closes = (line.match(/<\/details>/g) ?? []).length, nextOpen = Math.max(0, open4 + opens - closes), candidate = `${kept}${line}
 `;
     if (candidate.length + nextOpen * 11 + note.length > maxChars) break;
-    kept = candidate, open3 = nextOpen;
+    kept = candidate, open4 = nextOpen;
   }
   let out = `${kept}${`
-</details>`.repeat(open3)}${note}`;
+</details>`.repeat(open4)}${note}`;
   return out.length <= maxChars ? out : note.slice(0, maxChars);
 }
 function build(report, o) {
@@ -10288,14 +10364,14 @@ function renderReport(report, format, opts = {}) {
 }
 
 // src/guard.ts
-import { constants as fsConstants, createReadStream as createReadStream4 } from "node:fs";
-import { access, lstat as lstat3, readdir as readdir4, readFile as readFile8, realpath as realpath6 } from "node:fs/promises";
+import { constants as fsConstants2, createReadStream as createReadStream4 } from "node:fs";
+import { access, lstat as lstat3, readdir as readdir4, readFile as readFile8, realpath as realpath7 } from "node:fs/promises";
 import readline2 from "node:readline";
 import path12 from "node:path";
 
 // src/session-start.ts
 import { createHash as createHash2 } from "node:crypto";
-import { mkdir as mkdir2, open as open2, readFile as readFile7, realpath as realpath5 } from "node:fs/promises";
+import { mkdir as mkdir2, open as open3, readFile as readFile7, realpath as realpath6 } from "node:fs/promises";
 import os8 from "node:os";
 import path11 from "node:path";
 function dataDir() {
@@ -10320,7 +10396,7 @@ async function recordSessionStart(payload) {
     } catch {
       return;
     }
-    root = await realpath5(root).catch(() => path11.resolve(root));
+    root = await realpath6(root).catch(() => path11.resolve(root));
     let fresh = payload.source !== "resume" && payload.source !== "compact";
     return fresh && await writeRecord(id, root), await readFile7(recordPath(id), "utf8").then((t) => JSON.parse(t).session_id === id, () => !1) ? hookOutput(`${recordMarker(id)} (why-diff recorded the commit this session starts from)`) : fresh ? hookOutput(`${failedMarker(id)} (why-diff could not record the commit this session starts from; its Stop hook will block)`) : void 0;
   } catch {
@@ -10334,7 +10410,7 @@ async function writeRecord(id, root) {
   try {
     let head = await git(root, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]).catch(() => "") || null, indexTree = await git(root, ["write-tree"]).catch(() => "") || void 0, record = { session_id: id, root, head, at: (/* @__PURE__ */ new Date()).toISOString(), ...indexTree && /^[0-9a-f]{40,64}$/.test(indexTree) ? { indexTree } : {} }, file = recordPath(id);
     await mkdir2(path11.dirname(file), { recursive: !0, mode: 448 });
-    let fh = await open2(file, "wx", 384);
+    let fh = await open3(file, "wx", 384);
     try {
       await fh.writeFile(`${JSON.stringify(record)}
 `);
@@ -10408,7 +10484,7 @@ async function guard(payload, opts, state, notes) {
   state.relevant = !0;
   let statTime = opts.statTime ?? changeTime, metaTimes = await gitMetaTimes(gitEntry, statTime), sessionId = payload.session_id, record = sessionId ? await readBaseRecord(sessionId, statTime) : void 0, session = await claudeCodeAdapter.parse(payload.transcript_path);
   if (state.relevant = session.edits.some((e) => !e.failed) || (session.toolWindows?.length ?? 0) > 0, !state.relevant) return NO_BLOCK;
-  let root = await repoRoot(cwd), real = (p) => realpath6(p).catch(() => path12.resolve(p));
+  let root = await repoRoot(cwd), real = (p) => realpath7(p).catch(() => path12.resolve(p));
   if (await real(root) !== await real(path12.dirname(gitEntry)))
     throw new FailClosedError(`git reports the work tree at ${root}, not at ${path12.dirname(gitEntry)} where the .git entry is (core.worktree or a .git file points elsewhere)`);
   let roots = [root, ...await worktreeRoots(root)].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdVariants = rootVariants(session.cwd), icase = await isCaseInsensitive(root), paths = [...new Set(session.edits.filter((e) => !e.failed).map((e) => {
@@ -10438,7 +10514,7 @@ async function guard(payload, opts, state, notes) {
       throw new FailClosedError(`base record missing: the SessionStart hook recorded one for this session, and it is gone (${recordPath(sessionId)})`);
     {
       let dir = path12.dirname(sessionId ? recordPath(sessionId) : recordPath("-"));
-      if (await access(dir, fsConstants.W_OK).then(() => !1, (err) => !GONE2.has(err.code ?? ""))) throw new FailClosedError(`the base record directory cannot be written (${dir}), so the session's base cannot be trusted`);
+      if (await access(dir, fsConstants2.W_OK).then(() => !1, (err) => !GONE2.has(err.code ?? ""))) throw new FailClosedError(`the base record directory cannot be written (${dir}), so the session's base cannot be trusted`);
       notes.push("no SessionStart base record; the base comes from the reflogs");
     }
   }
