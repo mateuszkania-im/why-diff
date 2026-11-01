@@ -19,6 +19,8 @@ export const NOTE_PROMPT_CHARS = 1500;
 const MAX_NOTED_COMMITS = 50;
 const MAX_RANGE_COMMITS = 2000;
 const MAX_HUNKS = 20_000;
+/** Noted hunks read across all notes of a range (newest notes first). */
+export const MAX_NOTED_HUNKS = 50_000;
 const MAX_PATH = 4096;
 /** `IntentVerdict.model` for a verdict that came from a note, not from an intent check run here. */
 export const NOTE_MODEL = 'git-notes';
@@ -208,24 +210,55 @@ export async function readNotes(root: string, target: DiffTarget): Promise<Prove
  * Labels are left alone. Returns the hunks plus the prompts and pseudo-sessions now referenced.
  */
 export function applyNotes(hunks: AttributedHunk[], notes: ProvenanceNote[]): { hunks: AttributedHunk[]; prompts: Prompt[]; sessions: Session[]; applied: number } {
-  const byFile = new Map<string, Array<{ h: NoteHunk; note: ProvenanceNote }>>();
-  for (const note of notes) {
+  // Per file, every noted hunk sorted by start line with a running maximum of end lines, so a diff
+  // hunk finds its overlaps by binary search instead of a scan. Notes are read newest first, up to
+  // MAX_NOTED_HUNKS hunks in all; among overlapping noted hunks the first in that order wins.
+  const span = (start: number, lines: number): [number, number] => [start, start + Math.max(lines, 1) - 1];
+  type Entry = { h: NoteHunk; note: ProvenanceNote; order: number; start: number; end: number };
+  const byFile = new Map<string, Entry[]>();
+  let order = 0;
+  outer: for (const note of notes) {
     for (const h of note.hunks) {
+      if (order >= MAX_NOTED_HUNKS) break outer;
+      const [start, end] = span(h.newStart, h.newLines);
       const list = byFile.get(h.file) ?? [];
-      list.push({ h, note });
+      list.push({ h, note, order: order++, start, end });
       byFile.set(h.file, list);
     }
   }
+  const index = new Map<string, { entries: Entry[]; maxEnd: number[] }>();
+  for (const [file, entries] of byFile) {
+    entries.sort((a, b) => a.start - b.start || a.order - b.order);
+    const maxEnd: number[] = [];
+    let m = -Infinity;
+    for (const e of entries) maxEnd.push((m = Math.max(m, e.end)));
+    index.set(file, { entries, maxEnd });
+  }
+  const firstOverlap = (file: string, s: number, e: number): Entry | undefined => {
+    const idx = index.get(file);
+    if (!idx) return undefined;
+    // entries[0..hi) start at or before e
+    let lo = 0;
+    let hi = idx.entries.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (idx.entries[mid]!.start <= e) lo = mid + 1;
+      else hi = mid;
+    }
+    let best: Entry | undefined;
+    // walk back while some entry at or before i can still reach s
+    for (let i = lo - 1; i >= 0 && idx.maxEnd[i]! >= s; i--) {
+      const x = idx.entries[i]!;
+      if (x.end >= s && (!best || x.order < best.order)) best = x;
+    }
+    return best;
+  };
   const prompts = new Map<string, Prompt>();
   const sessions = new Map<string, Session>();
   let applied = 0;
-  const span = (start: number, lines: number): [number, number] => [start, start + Math.max(lines, 1) - 1];
   const out = hunks.map((a) => {
     const [s, e] = span(a.hunk.newStart, a.hunk.newLines);
-    const hit = byFile.get(a.hunk.file)?.find(({ h }) => {
-      const [hs, he] = span(h.newStart, h.newLines);
-      return hs <= e && s <= he;
-    });
+    const hit = firstOverlap(a.hunk.file, s, e);
     if (!hit) return a;
     applied++;
     const next: AttributedHunk = { ...a, match: hit.h.match, coverage: hit.h.coverage, source: 'notes' };

@@ -5,7 +5,9 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildReport } from '../src/pipeline.js';
-import { noteFromReport, parseNote, writeNote, NOTE_MAX_BYTES } from '../src/notes.js';
+import { applyNotes, noteFromReport, parseNote, writeNote, MAX_NOTED_HUNKS, NOTE_MAX_BYTES, type ProvenanceNote } from '../src/notes.js';
+import type { AttributedHunk } from '../src/types.js';
+import { expectScalesSubQuadratically } from './helpers/perf.js';
 import { tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
 
 const root = path.resolve(__dirname, '..');
@@ -260,3 +262,33 @@ describe('rendering a notes report', () => {
     expect(renderReport(r, 'terminal', {})).toContain('refs/notes/why-diff');
   });
 });
+
+describe('applyNotes cost (sec030 #11)', () => {
+  const note = (n: number, offset = 1_000_000): ProvenanceNote => parseNote(JSON.stringify({
+    whyDiffNote: 1, prompts: [], hunks: Array.from({ length: n }, (_, k) => ({ file: 'x.js', newStart: offset + k * 2, newLines: 1, match: 'none', labels: [] })),
+  }))!;
+  const diff = (n: number): AttributedHunk[] => Array.from({ length: n }, (_, k) => ({ hunk: { file: 'x.js', newStart: k * 10 + 1, newLines: 3 }, match: 'none', coverage: 0, labels: [], editIds: [], edits: [] }) as unknown as AttributedHunk);
+
+  it('scales sub-quadratically with notes and diff hunks on one file', () => {
+    const small = { notes: Array.from({ length: 10 }, () => note(500)), hunks: diff(500) };
+    const large = { notes: Array.from({ length: 10 }, () => note(2000)), hunks: diff(2000) };
+    expectScalesSubQuadratically(() => applyNotes(small.hunks, small.notes), () => applyNotes(large.hunks, large.notes));
+  });
+
+  it('50 notes of 13k hunks against 5k diff hunks stays well under a second', () => {
+    const notes = Array.from({ length: 50 }, () => note(13_000));
+    const t0 = performance.now();
+    applyNotes(diff(5000), notes);
+    expect(performance.now() - t0).toBeLessThan(1500);
+  });
+
+  it('keeps the first match in note order, and caps the noted hunks it reads', () => {
+    const a = parseNote(JSON.stringify({ whyDiffNote: 1, prompts: [], hunks: [{ file: 'x.js', newStart: 1, newLines: 5, match: 'exact', coverage: 1, labels: [] }] }))!;
+    const b = parseNote(JSON.stringify({ whyDiffNote: 1, prompts: [], hunks: [{ file: 'x.js', newStart: 2, newLines: 1, match: 'partial', coverage: 0.5, labels: [] }] }))!;
+    expect(applyNotes(diff(1), [a, b]).hunks[0]!.match).toBe('exact');
+    expect(applyNotes(diff(1), [b, a]).hunks[0]!.match).toBe('partial');
+    const filler = Array.from({ length: Math.ceil(MAX_NOTED_HUNKS / 13_000) }, () => note(13_000));
+    expect(applyNotes(diff(1), [...filler, a]).applied).toBe(0);
+  });
+});
+
