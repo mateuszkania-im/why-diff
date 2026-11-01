@@ -8,7 +8,7 @@ import { BINARY_HUNK_HEADER, type Harness, type Hunk, type Prompt, type Report, 
 import { getDiffDetailed, git, isCaseInsensitive, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget, type SparseTrust } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
 import { attribute, repoRelativePath, rootVariants } from './attribute.js';
-import { labelHunks, needsFileText } from './labels.js';
+import { labelHunks, needsFileText, needsSourceText } from './labels.js';
 import { contributingSessionIds, summarize } from './summary.js';
 import { compactHunks, editTable } from './compact.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
@@ -393,7 +393,7 @@ async function loadConfigTexts(root: string, target: DiffTarget, files: string[]
     if (rev?.startsWith('-')) return out;
   }
   for (const rel of files) {
-    if (!needsFileText(rel)) continue;
+    if (!needsFileText(rel) && !needsSourceText(rel)) continue;
     try {
       // A symlink on disk is never followed (it may point outside the repo).
       const text = rev === null

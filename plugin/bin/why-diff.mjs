@@ -4220,6 +4220,9 @@ function needsFileText(path14) {
   let p = normalisePath(path14), base = posix.basename(p);
   return RUNNER_CONFIG.test(base) || PYTEST_CONFIG.test(base) || isCiFile(p);
 }
+function needsSourceText(path14) {
+  return isTestFile(normalisePath(path14)) && JS_EXT.has(extOf(path14));
+}
 function labelHunks(hunks, ctx) {
   let scope = buildScopeIndex(hunks, ctx);
   return hunks.map((h) => {
@@ -4243,11 +4246,11 @@ function computeLabels(h, path14, scope, ctx) {
     agent ? "risk" : "info",
     agent ? "Agent changed a test file" : "Test file changed (not by the agent)"
   );
-  let skips = detectTestSkips(path14, lines);
+  let restructured = detectRestructure(path14, lines, scope.fileText), skips = [...detectTestSkips(path14, lines), ...restructured.skips];
   skips.length > 0 && push("test-skip-added", "risk", `Adds ${listOf(skips)}`);
   let disabled = detectTestsDisabled(path14, h.hunk, lines, scope);
   disabled.length > 0 && push("tests-disabled", "risk", disabled.join("; "));
-  let assertions = detectAssertionChanges(path14, lines);
+  let assertions = [...detectAssertionChanges(path14, lines), ...restructured.weakenings];
   assertions.length > 0 && push("assertion-removed", "risk", assertions.join("; ")), isSnapshotFile(path14) && push("snapshot-updated", "warn", "Snapshot file changed");
   let deps = detectNewDependencies(path14, lines);
   deps.length > 0 && push("dependency-added", "warn", `New ${deps.length === 1 ? "dependency" : "dependencies"}: ${listOf(deps)}`), isLockfile(path14) && push("lockfile", "info", `Lockfile churn (${posix.basename(path14)})`);
@@ -4880,6 +4883,118 @@ function detectAssertionChanges(path14, lines) {
     findings.unshift(unpaired.length === 1 ? `removed: ${first}` : `${unpaired.length} assertions removed, e.g. ${first}`);
   }
   return findings;
+}
+var JS_EXT = /* @__PURE__ */ new Set(["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"]), FALSY_IF = /\bif\s*\(\s*(?:false|0|!\s*true|!\s*1|null|undefined|void\s+0)\s*\)/, TRY_OPEN = /\btry\s*\{/g, TEST_GLOBALS = /* @__PURE__ */ new Set(["it", "test", "describe", "expect", "assert", "beforeEach", "afterEach", "beforeAll", "afterAll", "suite", "specify", "xit", "fit", "xtest", "xdescribe", "fdescribe"]), TEST_MODULES = /^(?:vitest|@jest\/globals|node:test|mocha|chai|bun:test|@playwright\/test|(?:node:)?assert(?:\/strict)?|expect)$/, DECLARED_NAME = /^\s*(?:export\s+)?(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?:[=;:]|$)(.*)|(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\()/, DESTRUCTURE = /^\s*(?:export\s+)?(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(.+)$/, IMPORT_FROM = /^\s*import\s+(?!type\b)(.+?)\s+from\s+["'`]([^"'`]+)["'`]/, FRAMEWORK_SOURCE = /^(?:require\s*\(\s*["'`]([^"'`]+)["'`]\s*\)(?:\s*\.\s*[\w$]+)*|chai(?:\s*\.\s*[\w$]+)*|[\w$]+\s*\.\s*extend\s*\()/, ARROW_START = /^\s*(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)?(?:async\s*)?(?:\([^()]*\)|[A-Za-z_$][\w$]*)\s*=>\s*(.*)$/, FUNCTION_START = /^\s*(?:(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\([^()]*\)\s*\{\s*$/, ASSERTION_CALL = /(?<![\w$.])(?:expect\s*[({]|assert\w*\s*[.(])/;
+function detectRestructure(path14, lines, fileText) {
+  let skips = [], weakenings = [];
+  if (!isTestFile(path14) || !JS_EXT.has(extOf(path14))) return { skips, weakenings };
+  let style = commentStyle(path14), delKeys = lines.filter((l) => l.type === "del" && parseAssertion(l.text, path14)).map((l) => normaliseLine(l.text)).filter((k) => k.length > 0), seq = lines.filter((l) => l.type !== "del").map((line) => ({ line, code: codeOf(line.text, style) })), existing = (i) => {
+    let l = seq[i]?.line;
+    if (!l) return !1;
+    if (l.type === "ctx") return parseAssertion(l.text, path14) !== null;
+    let k = normaliseLine(l.text);
+    return delKeys.some((d) => k.includes(d));
+  }, anyExisting = (from, to) => {
+    for (let i = from; i <= to; i++) if (existing(i)) return !0;
+    return !1;
+  }, close = (li, col) => {
+    let depth = 0;
+    for (let i = li; i < seq.length; i++) {
+      let code2 = seq[i].code;
+      for (let c = i === li ? col : 0; c < code2.length; c++)
+        if (code2[c] === "{") depth++;
+        else if (code2[c] === "}" && --depth === 0) return { li: i, col: c };
+    }
+    return { li: seq.length - 1, col: 1 / 0 };
+  }, between = (a, b) => {
+    let out = "";
+    for (let i = a.li; i <= b.li && i < seq.length; i++) {
+      let code2 = seq[i].code;
+      out += `${code2.slice(i === a.li ? a.col + 1 : 0, i === b.li ? b.col : code2.length)}
+`;
+    }
+    return out;
+  }, next = (li, col) => {
+    for (let i = li; i < seq.length; i++) {
+      let code2 = seq[i].code;
+      for (let c = i === li ? col : 0; c < code2.length; c++) if (!/\s/.test(code2[c])) return { li: i, col: c };
+    }
+    return null;
+  };
+  for (let i = 0; i < seq.length; i++) {
+    let { line, code: code2 } = seq[i];
+    if (line.type !== "add") continue;
+    let f = FALSY_IF.exec(code2);
+    if (f) {
+      let at = next(i, f.index + f[0].length);
+      at && (seq[at.li].code[at.col] === "{" ? anyExisting(at.li, close(at.li, at.col).li) : existing(at.li)) && skips.push(`assertions behind ${f[0].replace(/\s+/g, " ")}`);
+    }
+    for (let t of code2.matchAll(TRY_OPEN)) {
+      let open3 = { li: i, col: t.index + t[0].length - 1 }, end = close(open3.li, open3.col);
+      if (end.col === 1 / 0) continue;
+      let after = next(end.li, end.col + 1);
+      if (!after) continue;
+      let rest = seq[after.li].code.slice(after.col), c = /^catch\s*(?:\([^)]*\)\s*)?\{/.exec(rest);
+      if (!c) continue;
+      let catchOpen = { li: after.li, col: after.col + c[0].length - 1 }, catchEnd = close(catchOpen.li, catchOpen.col), body = between(open3, end), handler = between(catchOpen, catchEnd);
+      /\bthrow\b/.test(handler) || ASSERTION_CALL.test(handler) || /\.\s*(?:toThrow\w*|rejects|throws)\b/.test(body) || anyExisting(open3.li, end.li) && weakenings.push("existing assertions wrapped in a try/catch that swallows their failures");
+    }
+    let shadow = shadowedGlobal(code2, line.text), calledAfter = (name) => seq.slice(i + 1).some((x) => new RegExp(`(?<![\\w$.])${name}\\s*\\(`).test(x.code));
+    shadow && (!/^\s/.test(line.text) || /^\s*import\b/.test(code2) || calledAfter(shadow)) && skips.push(`a binding that shadows the test global ${shadow}`);
+    let arrow = ARROW_START.exec(code2), fn = arrow ? null : FUNCTION_START.exec(code2), prev = "";
+    for (let j = i - 1; j >= 0 && !prev; j--) prev = seq[j].code.trim();
+    let continues = /(?:[(,=:?[]|&&|\|\||\breturn)$/.test(prev);
+    if ((arrow || fn) && !continues) {
+      let name = arrow ? arrow[1] : fn[1] ?? fn[2], moved = !1;
+      if (arrow && arrow[2] && !arrow[2].trim().startsWith("{"))
+        moved = existing(i);
+      else {
+        let col = code2.lastIndexOf("{");
+        col >= 0 && (moved = anyExisting(i + 1, close(i, col).li));
+      }
+      moved && !usedElsewhere(name, fileText?.(path14), seq.map((x) => x.code)) && skips.push(`existing assertions moved into ${name ? `${name}()` : "a function"} that is never called`);
+    }
+  }
+  return { skips: uniq(skips), weakenings: uniq(weakenings) };
+}
+function shadowedGlobal(code2, raw) {
+  let d = DECLARED_NAME.exec(code2);
+  if (d) {
+    let name = d[1] ?? d[3];
+    if (name && TEST_GLOBALS.has(name)) {
+      let rhs = (d[2] ?? "").trim().replace(/^=\s*/, ""), source = rawRhs(raw);
+      if (!(d[1] && rhs && FRAMEWORK_SOURCE.test(source) && frameworkModule(source))) return name;
+    }
+  }
+  let ds = DESTRUCTURE.exec(code2);
+  if (ds) {
+    let hit = ds[1].split(",").map((b) => b.split(":").pop().split("=")[0].trim().replace(/^\.\.\./, "")).find((n) => TEST_GLOBALS.has(n)), source = rawRhs(raw);
+    if (hit && !(FRAMEWORK_SOURCE.test(source) && frameworkModule(source))) return hit;
+  }
+  let im = IMPORT_FROM.exec(raw);
+  if (im && !TEST_MODULES.test(im[2])) {
+    let clause = im[1], bindings = [], braces = /\{([^}]*)\}/.exec(clause);
+    if (braces) for (let b of braces[1].split(",")) bindings.push(b.trim().replace(/^type\s+/, "").split(/\s+as\s+/).pop().trim());
+    let def = /^([A-Za-z_$][\w$]*)/.exec(clause.trim());
+    def && def[1] !== "type" && bindings.push(def[1]);
+    let hit = bindings.find((n) => TEST_GLOBALS.has(n));
+    if (hit) return hit;
+  }
+  return null;
+}
+function rawRhs(raw) {
+  let m = /=\s*(.+?)\s*;?\s*$/.exec(raw);
+  return m ? m[1] : "";
+}
+function frameworkModule(source) {
+  let m = /require\s*\(\s*["'`]([^"'`]+)["'`]/.exec(source);
+  return m ? TEST_MODULES.test(m[1]) : !0;
+}
+function usedElsewhere(name, fileText, hunkCode) {
+  if (!name) return !1;
+  let re = new RegExp(`(?<![\\w$.])${name.replace(/\$/g, "\\$")}(?![\\w$])`, "g");
+  return ((fileText !== void 0 ? fileText : hunkCode.join(`
+`)).match(re)?.length ?? 0) > 1;
 }
 function detectNewDependencies(path14, lines) {
   let base = posix.basename(path14), scan = null;
@@ -8939,7 +9054,7 @@ async function loadConfigTexts(root, target, files) {
     if (m && (rev = m[1] || "HEAD"), rev?.startsWith("-")) return out;
   }
   for (let rel of files)
-    if (needsFileText(rel))
+    if (!(!needsFileText(rel) && !needsSourceText(rel)))
       try {
         let text2 = rev === null ? (await lstat2(path10.join(root, rel))).isSymbolicLink() ? null : await readFile6(path10.join(root, rel), "utf8") : await git(root, ["show", "--no-textconv", `${rev}:${rel}`], { trim: !1 });
         text2 !== null && text2.length <= FILE_TEXT_CAP && out.set(rel, text2);

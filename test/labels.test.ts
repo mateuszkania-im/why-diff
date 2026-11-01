@@ -1248,3 +1248,127 @@ describe('sec033 #6b: tautologies and an added .not', () => {
     expect(kinds(hunk('test/a.test.js', ['-  expect(f(3)).not.toBe(a);', '+  expect(f(3)).not.toBe(b);']))).not.toContain('assertion-removed');
   });
 });
+
+describe('restructured tests: dead guards, swallowing try/catch, shadowed globals, uncalled wrappers', () => {
+  const T = 'test/a.test.js';
+  const detail = (lines: string[], kind: LabelKind, fileText?: string): string | undefined => {
+    const [out] = labelHunks([hunk(T, lines)], { ...ctx, ...(fileText === undefined ? {} : { fileText: () => fileText }) });
+    return out?.labels.find((l) => l.kind === kind)?.detail;
+  };
+
+  describe('(a) a constant-false if around existing assertions is a skip', () => {
+    it.each([
+      ['inline if (false)', [' it("t3",()=>{', '-  expect(f(3)).toBe(3);', '+  if (false) expect(f(3)).toBe(3);', ' });']],
+      ['if (0) block around an unchanged assertion', ['+  if (0) {', '   expect(f(3)).toBe(3);', '+  }']],
+      ['if (!true) block, assertion re-indented', ['+  if (!true) {', '-  expect(a).toBe(1);', '+    expect(a).toBe(1);', '+  }']],
+      ['if (undefined) right before an assertion', ['+  if (undefined)', '   expect(f(3)).toBe(3);']],
+      ['if (null) with the assertion on the next line, braces', ['+  if (null) { // later', '   assert.equal(f(3), 3);', '+  }']],
+    ])('%s', (_name, lines) => {
+      expect(detail(lines, 'test-skip-added')).toContain('if (');
+    });
+
+    it.each([
+      ['if (process.env.CI) around an expect', ['+  if (process.env.CI) {', '-  expect(a).toBe(1);', '+    expect(a).toBe(1);', '+  }']],
+      ['if (false) with no assertion in it', ['+  if (false) {', '+    console.log("x");', '+  }', '   expect(a).toBe(1);']],
+      ['if (false) in a source file', ['+  if (false) expect(a).toBe(1);']],
+    ])('not: %s', (_name, lines) => {
+      const file = _name.includes('source') ? 'src/a.js' : T;
+      const [out] = labelHunks([hunk(file, lines)], ctx);
+      expect(out?.labels.map((l) => l.kind)).not.toContain('test-skip-added');
+    });
+  });
+
+  describe('(b) a try/catch that swallows existing assertions is a weakening', () => {
+    it.each([
+      ['one line, empty catch', ['-  expect(f(3)).toBe(3);', '+  try { expect(f(3)).toBe(3); } catch {}']],
+      ['block, catch logs', ['+  try {', '-  expect(a).toBe(1);', '+    expect(a).toBe(1);', '+  } catch (e) {', '+    console.log(e);', '+  }']],
+      ['block around unchanged assertions', ['+  try {', '   expect(a).toBe(1);', '   expect(b).toBe(2);', '+  } catch (_) {}']],
+    ])('%s', (_name, lines) => {
+      expect(detail(lines, 'assertion-removed')).toContain('try/catch');
+    });
+
+    it.each([
+      ['catch rethrows', ['+  try {', '-  expect(a).toBe(1);', '+    expect(a).toBe(1);', '+  } catch (e) {', '+    cleanup();', '+    throw e;', '+  }']],
+      ['catch asserts on the error', ['+  try {', '+    parse("x");', '+  } catch (e) {', '+    expect(e.message).toBe("bad");', '+  }']],
+      ['the try checks a throw', ['+  try {', '-  expect(() => run()).toThrow("bad");', '+    expect(() => run()).toThrow("bad");', '+  } catch {}']],
+      ['rejects', ['+  try {', '-  await expect(p).rejects.toThrow();', '+    await expect(p).rejects.toThrow();', '+  } catch {}']],
+      ['a try/catch with no existing assertion', ['+  try {', '+    setup();', '+  } catch {}', '   expect(a).toBe(1);']],
+    ])('not: %s', (_name, lines) => {
+      expect(detail(lines, 'assertion-removed')).toBeUndefined();
+    });
+  });
+
+  describe('(c) a local or foreign binding that shadows a test global is a skip', () => {
+    it.each([
+      ['const it = () => {}', '+const it = () => {};'],
+      ['let test = noop', '+let test = noop;'],
+      ['function expect()', '+function expect() { return { toBe() {} }; }'],
+      ['var describe', '+var describe = function () {};'],
+      ['import from a local helper', "+import { it, expect } from './my-helpers';"],
+      ['import renamed into a global name', "+import { skipAll as it } from 'some-lib';"],
+      ['require from a local helper', "+const { it } = require('./fake');"],
+      ['destructured from an object', '+const { expect } = fakes;'],
+    ])('%s', (_name, line) => {
+      expect(detail([line], 'test-skip-added')).toContain('shadows');
+    });
+
+    it.each([
+      ["import from vitest", "+import { it, expect, describe } from 'vitest';"],
+      ['import from node:test', "+import { describe, it } from 'node:test';"],
+      ['import from @jest/globals', "+import { expect, test } from '@jest/globals';"],
+      ['require chai', "+const { expect } = require('chai');"],
+      ['import playwright test', "+import { test, expect } from '@playwright/test';"],
+      ['names that only start like a global', '+const items = [];\n'],
+      ['a property named it', '+const obj = { it: 1 };'],
+      ['a member assignment', '+globalThis.testValue = 1;'],
+    ])('not: %s', (_name, line) => {
+      expect(detail([line.replace(/\n$/, '')], 'test-skip-added')).toBeUndefined();
+    });
+
+    it('not in a source file', () => {
+      const [out] = labelHunks([hunk('src/a.js', ['+const test = 1;'])], ctx);
+      expect(out?.labels.map((l) => l.kind)).not.toContain('test-skip-added');
+    });
+  });
+
+  describe('(d) existing assertions moved into a function that is never called is a skip', () => {
+    it.each([
+      ['expression arrow statement', ['-  expect(f(3)).toBe(3);', '+  () => expect(f(3)).toBe(3);']],
+      ['named arrow, never called', ['+  const check = () => {', '-  expect(a).toBe(1);', '+    expect(a).toBe(1);', '+  };']],
+      ['function declaration, never called', ['+  function verify() {', '-  expect(a).toBe(1);', '+    expect(a).toBe(1);', '+  }']],
+      ['async function expression', ['+  const later = async function (x) {', '-  expect(a).toBe(1);', '+    expect(a).toBe(1);', '+  };']],
+    ])('%s', (_name, lines) => {
+      expect(detail(lines, 'test-skip-added')).toContain('never called');
+    });
+
+    it.each([
+      ['a helper that is called in the hunk', ['+  const check = () => {', '-  expect(a).toBe(1);', '+    expect(a).toBe(1);', '+  };', '+  check();']],
+      ['a new test (it(...) callback)', ['+it("new", () => {', '-  expect(a).toBe(1);', '+  expect(a).toBe(1);', '+});']],
+      ['a callback argument', ['+  await waitFor(() => {', '-  expect(a).toBe(1);', '+    expect(a).toBe(1);', '+  });']],
+      ['a function with only new assertions', ['+  function verify() {', '+    expect(g()).toBe(1);', '+  }']],
+    ])('not: %s', (_name, lines) => {
+      expect(detail(lines, 'test-skip-added')).toBeUndefined();
+    });
+
+    it('a helper called elsewhere in the file is fine; one only declared is not', () => {
+      const lines = ['+  function verify() {', '-  expect(a).toBe(1);', '+    expect(a).toBe(1);', '+  }'];
+      expect(detail(lines, 'test-skip-added', 'it("x", () => {\n  function verify() {\n    expect(a).toBe(1);\n  }\n  verify();\n});\n')).toBeUndefined();
+      expect(detail(lines, 'test-skip-added', 'it("x", () => {\n  function verify() {\n    expect(a).toBe(1);\n  }\n});\n')).toContain('never called');
+    });
+  });
+});
+
+describe('restructured tests: an arrow continuing a call is an argument', () => {
+  it('a reformatted callback argument is not an uncalled wrapper', () => {
+    const [out] = labelHunks([hunk('test/a.test.js', ['-  expect(x).toBe(1);', '+  items.forEach(', '+    (x) => expect(x).toBe(1),', '+  );'])], ctx);
+    expect(out?.labels.map((l) => l.kind)).not.toContain('test-skip-added');
+  });
+});
+
+describe('restructured tests: local variables named like a test global', () => {
+  it('an indented local that is never called is not a shadow; one that is then called is', () => {
+    const kinds = (lines: string[]) => labelHunks([hunk('test/a.test.js', lines)], ctx)[0]?.labels.map((l) => l.kind) ?? [];
+    expect(kinds(['+    const test = renameHunk(p, "", "deleted", []);', '+    const [t] = labelHunks([test, src], ctx);'])).not.toContain('test-skip-added');
+    expect(kinds(['+  const it = () => {};', '   it("t1", () => {', '     expect(f(1)).toBe(1);'])).toContain('test-skip-added');
+  });
+});
