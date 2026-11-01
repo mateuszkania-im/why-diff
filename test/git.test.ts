@@ -1,12 +1,12 @@
 import { realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { parseUnifiedDiff } from '../src/diff-parse.js';
 import { buildReport } from '../src/pipeline.js';
-import { GitError, commitTimes, currentBranch, getDiff, hasHead, isShallow, listUntracked, repoName, repoRoot, resolveDefaultTarget, worktreeRoots } from '../src/git.js';
+import { GitError, commitTimes, currentBranch, getDiff, getDiffDetailed, git, hasHead, isShallow, listUntracked, repoName, repoRoot, resolveDefaultTarget, worktreeRoots } from '../src/git.js';
 import { tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
 
 const ENV = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
@@ -588,6 +588,49 @@ describe('getDiff: attributes, textconv and fsmonitor cannot hide changes', () =
     const repo = repoWithChange();
     sh(repo, 'config', 'core.bigFileThreshold', '1');
     expect(added(await getDiff(repo, { workingTree: true }), 'a.test.js')).toEqual(['it.skip("a", () => {});']);
+  });
+
+  it('switches off a filter whose name holds "=" (not expressible with -c)', async () => {
+    const repo = repoWithChange();
+    writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js filter=a=b\n');
+    appendFileSync(path.join(repo, '.git', 'config'), '[filter "a=b"]\n\tclean = sed s/it.skip/it/\n');
+    expect(added(await getDiff(repo, { workingTree: true }), 'a.test.js')).toEqual(['it.skip("a", () => {});']);
+  });
+
+  it('keeps GIT_CONFIG_COUNT entries from the environment', async () => {
+    const repo = repoWithChange();
+    writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js filter=hide\n');
+    sh(repo, 'config', 'filter.hide.clean', 'sed s/it.skip/it/');
+    const saved = { ...process.env };
+    Object.assign(process.env, { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'from-env' });
+    try {
+      expect(added(await getDiff(repo, { workingTree: true }), 'a.test.js')).toEqual(['it.skip("a", () => {});']);
+      expect(await git(repo, ['config', 'user.name'])).toBe('from-env');
+    } finally {
+      for (const k of ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0']) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    }
+  });
+
+  it('re-diffs per file: one file too big to re-diff is reported unreviewed, the others still show as text', async () => {
+    const repo = freshRepo();
+    put(repo, 'aa/huge.js', `${'x'.repeat(100)}\n`.repeat(2000));
+    put(repo, 'zz/a.test.js', 'it("a", () => {});\n');
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-qm', 'init');
+    put(repo, 'aa/huge.js', `${'y'.repeat(100)}\n`.repeat(2000));
+    put(repo, 'zz/a.test.js', 'it.skip("a", () => {});\n');
+    writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js -diff\n');
+    process.env.WHY_DIFF_REDIFF_MAX_BYTES = '50000';
+    try {
+      const { diff, unreviewed } = await getDiffDetailed(repo, { workingTree: true });
+      expect(added(diff, 'zz/a.test.js')).toEqual(['it.skip("a", () => {});']);
+      expect(unreviewed).toEqual(['aa/huge.js']);
+    } finally {
+      delete process.env.WHY_DIFF_REDIFF_MAX_BYTES;
+    }
   });
 });
 

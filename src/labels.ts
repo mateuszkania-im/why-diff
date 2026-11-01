@@ -252,7 +252,7 @@ const CI_PATTERNS: readonly RegExp[] = [
   /(?:^|\/)\.travis\.ya?ml$/,
 ];
 
-function isCiFile(path: string): boolean {
+export function isCiFile(path: string): boolean {
   return CI_PATTERNS.some((re) => re.test(path));
 }
 

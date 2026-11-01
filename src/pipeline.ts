@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { lstat, readFile, stat } from 'node:fs/promises';
 import type { Harness, Hunk, Prompt, Report, Session, SessionAdapter } from './types.js';
-import { getDiff, git, isCaseInsensitive, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
+import { getDiffDetailed, git, isCaseInsensitive, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
 import { attribute, repoRelativePath, rootVariants } from './attribute.js';
 import { labelHunks, needsFileText } from './labels.js';
@@ -118,7 +118,9 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   const ignoredGlob = compileGlobs(config.ignore);
 
   log(`diffing ${rangeLabel}`);
-  const allHunks = parseUnifiedDiff(await getDiff(root, target, { paths: opts.paths }));
+  const detailed = await getDiffDetailed(root, target, { paths: opts.paths });
+  const allHunks = parseUnifiedDiff(detailed.diff);
+  const unreviewed = new Set(detailed.unreviewed);
 
   // The team-rules files themselves: any change is a finding, and `ignore` can never hide it.
   const rulesFiles = new Set<string>();
@@ -182,6 +184,12 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   const packages = await pythonPackageDirs(root, baseRev, hunks);
   attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p), protectedGlob, riskScan: mode === 'risk-scan', rulesFiles, pythonPackage: (d) => packages.has(d) });
   if (mode === 'risk-scan') attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== 'unattributed') }));
+  // Fail closed: a file git attributes show as binary, whose text could not be produced, is a finding.
+  if (unreviewed.size) {
+    attributed = attributed.map((h) => (unreviewed.has(h.hunk.file) || (h.hunk.oldFile !== undefined && unreviewed.has(h.hunk.oldFile))
+      ? { ...h, labels: [...h.labels, { kind: 'unreviewed', severity: 'risk', detail: `Shown as binary by git attributes and too big to diff as text: ${h.hunk.file}` }] }
+      : h));
+  }
 
   // No transcripts here: the author may have left provenance as git notes (`why-diff notes`).
   // They add prompts to the hunks they cover; labels stay the ones computed above from the diff.

@@ -12,7 +12,8 @@ import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
-import { emptyTree, git, hasHead, isCaseInsensitive, listUntracked, repoRoot, worktreeRoots } from './git.js';
+import { emptyTree, FailClosedError, git, hasHead, isCaseInsensitive, listUntracked, repoRoot, worktreeRoots } from './git.js';
+import { isCiFile, isTestFile } from './labels.js';
 import { globToRegExp, repoRelativePath, rootVariants } from './attribute.js';
 import { compileGlobs, loadConfig, type WhyDiffConfig } from './config.js';
 import type { Hunk, LabelKind, Session } from './types.js';
@@ -48,7 +49,13 @@ const NO_BLOCK: GuardResult = { block: false, hits: [] };
 export async function runGuard(payload: GuardPayload, opts: GuardOptions): Promise<GuardResult> {
   try {
     return await guard(payload, opts);
-  } catch {
+  } catch (err) {
+    // Fail closed only where git could be made to hide the agent's changes (a filter driver that
+    // cannot be switched off, an unreadable config): say so instead of letting the agent finish.
+    if (err instanceof FailClosedError) {
+      const hit = `- why-diff could not check this session's changes: ${err.message}`;
+      return { block: true, hits: [hit], message: `why-diff guard: ${hit.slice(2)}\n\nTell the user that the repository's git configuration stops why-diff from reading the real content of your changes, and what you changed, so they can check it.\n` };
+    }
     return NO_BLOCK; // never break the user's session because of why-diff itself
   }
 }
@@ -134,6 +141,17 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   const hits: string[] = [];
   const keys: string[] = [];
   for (const h of report.hunks) {
+    // Fail closed: a file the session touched that git attributes show as binary and whose text could
+    // not be produced blocks when it is a test, CI or protected file, whoever wrote it.
+    if (h.labels.some((l) => l.kind === 'unreviewed')) {
+      const names = [h.hunk.file, ...(h.hunk.oldFile ? [h.hunk.oldFile] : [])];
+      if (names.some((f) => isTestFile(f) || isCiFile(f) || protectedGlob(f))) {
+        const detail = `could not be diffed as text (git attributes mark it binary): ${h.hunk.file}`;
+        hits.push(`- ${h.hunk.file} unreviewed: ${detail}`);
+        keys.push(`${h.hunk.file}\tunreviewed\t${detail}`);
+        continue;
+      }
+    }
     let timed = false;
     if (h.match !== 'exact' && h.match !== 'partial') {
       // A shell command leaves a file-only hunk. It counts only when the session's own command

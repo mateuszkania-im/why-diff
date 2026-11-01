@@ -60,7 +60,7 @@ const MATCHES: ReadonlySet<string> = new Set<MatchStrength>(['exact', 'partial',
 const VERDICTS: ReadonlySet<string> = new Set<Verdict>(['requested', 'implied', 'unrequested', 'unclear']);
 const LABEL_KINDS: ReadonlySet<string> = new Set<LabelKind>([
   'test-modified', 'test-skip-added', 'tests-disabled', 'assertion-removed', 'snapshot-updated', 'dependency-added', 'lockfile',
-  'config-changed', 'ci-changed', 'lint-suppressed', 'type-any-added', 'secret-like', 'unattributed', 'out-of-scope', 'bash-edit', 'protected-path',
+  'config-changed', 'ci-changed', 'lint-suppressed', 'type-any-added', 'secret-like', 'unattributed', 'out-of-scope', 'bash-edit', 'protected-path', 'unreviewed',
 ]);
 
 /** The compact provenance of a report (already secret-redacted by the pipeline). */

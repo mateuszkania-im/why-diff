@@ -160,7 +160,8 @@ export type LabelKind =
   | 'unattributed'         // no agent edit explains this hunk (human or unknown tool)
   | 'out-of-scope'         // file never mentioned in prompts and not near other touched files (heuristic)
   | 'bash-edit'            // produced via shell command, low-confidence attribution
-  | 'protected-path';      // agent edit under a path the team marked protected (.why-diff.json)
+  | 'protected-path'       // agent edit under a path the team marked protected (.why-diff.json)
+  | 'unreviewed';          // git attributes show the file as binary and its text could not be produced
 
 export interface Label {
   kind: LabelKind;
@@ -246,6 +247,7 @@ export const FILE_LEVEL_LABELS: ReadonlySet<LabelKind> = new Set<LabelKind>([
   'out-of-scope',
   'dependency-added',
   'protected-path',
+  'unreviewed',
 ]);
 
 export interface Report {

@@ -288,6 +288,37 @@ describe('sec030 #5: git attributes, textconv and diff config cannot hide hunks'
       writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js -diff\n');
     })).toBe(true);
   }, 60_000);
+  it('blocks behind a huge decoy file marked -diff', async () => {
+    process.env.WHY_DIFF_REDIFF_MAX_BYTES = '50000';
+    try {
+      expect(await editedRepo((repo) => {
+        writeFileSync(path.join(repo, 'huge.js'), `${'x'.repeat(100)}\n`.repeat(2000));
+        sh(repo, ['add', 'huge.js']);
+        sh(repo, ['commit', '-qm', 'huge'], LONG_AGO);
+        writeFileSync(path.join(repo, 'huge.js'), `${'y'.repeat(100)}\n`.repeat(2000));
+        writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js -diff\n');
+      })).toBe(true);
+    } finally {
+      delete process.env.WHY_DIFF_REDIFF_MAX_BYTES;
+    }
+  });
+  it('blocks (fail closed) when the test file of the session cannot be re-diffed as text', async () => {
+    process.env.WHY_DIFF_REDIFF_MAX_BYTES = '200';
+    try {
+      expect(await editedRepo((repo) => writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js -diff\n'))).toBe(true);
+    } finally {
+      delete process.env.WHY_DIFF_REDIFF_MAX_BYTES;
+    }
+  });
+  it('blocks (fail closed) when the filter listing cannot be read', async () => {
+    expect(await editedRepo((repo) => appendFileSync(path.join(repo, '.git', 'config'), '[broken\n'))).toBe(true);
+  });
+  it('blocks with a filter whose name holds "="', async () => {
+    expect(await editedRepo((repo) => {
+      writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js filter=a=b\n');
+      appendFileSync(path.join(repo, '.git', 'config'), '[filter "a=b"]\n\tclean = sed s/it.skip/it/\n');
+    })).toBe(true);
+  });
   it('blocks with diff.noprefix, diff.mnemonicPrefix and diff.relative set', async () => {
     expect(await editedRepo((repo) => {
       sh(repo, ['config', 'diff.noprefix', 'true']);

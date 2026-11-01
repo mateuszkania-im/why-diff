@@ -22,7 +22,7 @@ export const CONFIG_FILE = '.why-diff.json';
 export const LABEL_KINDS: readonly LabelKind[] = [
   'test-modified', 'test-skip-added', 'tests-disabled', 'assertion-removed', 'snapshot-updated', 'dependency-added',
   'lockfile', 'config-changed', 'ci-changed', 'lint-suppressed', 'type-any-added', 'secret-like', 'unattributed',
-  'out-of-scope', 'bash-edit', 'protected-path',
+  'out-of-scope', 'bash-edit', 'protected-path', 'unreviewed',
 ];
 
 export const MAX_GLOB_LENGTH = 512;

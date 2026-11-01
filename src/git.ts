@@ -100,26 +100,57 @@ const SAFE_CONFIG = [
   'core.bigFileThreshold=512m',
 ].flatMap((c) => ['-c', c]);
 
-const filterOverrides = new Map<string, Promise<string[]>>();
+/**
+ * Raised when why-diff cannot make git show the true content (a filter driver it cannot switch off,
+ * an unreadable config). The guard blocks on it instead of letting the agent finish unchecked.
+ */
+export class FailClosedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FailClosedError';
+  }
+}
+
+const filterOverrides = new Map<string, Promise<Record<string, string>>>();
 
 /**
- * `-c` arguments that switch off every filter driver configured for the repository at `cwd`
- * (`filter.<name>.clean` / `process` / `smudge`): a clean filter rewrites working tree content
- * before git compares it, so `*.js filter=x` plus `filter.x.clean = sed s/it.skip/it/` would
- * hide a change. Names come from the config as data and only ever travel as single arguments.
+ * Environment that switches off every filter driver configured for the repository at `cwd`
+ * (`filter.<name>.clean` / `process` / `smudge` / `required`): a clean filter rewrites working tree
+ * content before git compares it, so `*.js filter=x` plus `filter.x.clean = sed s/it.skip/it/`
+ * would hide a change. The overrides travel as `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`, which
+ * take any name (`-c` cannot carry one holding `=`), after the caller's own `GIT_CONFIG_COUNT`
+ * entries. If the config cannot be listed, this throws {@link FailClosedError}.
  */
-function filterArgs(cwd: string): Promise<string[]> {
+function filterEnv(cwd: string): Promise<Record<string, string>> {
   let found = filterOverrides.get(cwd);
   if (!found) {
     found = execFileAsync('git', ['config', '-z', '--name-only', '--get-regexp', '^filter\\.'], { cwd, encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } })
-      .then(({ stdout }) => stdout, () => '')
+      .then(({ stdout }) => stdout, (err: NodeJS.ErrnoException & { code?: number | string; stdout?: string; stderr?: string }) => {
+        // exit 1 with no output: no filter configured
+        if ((err.code as unknown) === 1 && !err.stdout && !err.stderr) return '';
+        if (err.code === 'ENOENT') throw new Error('git executable not found on PATH');
+        throw new FailClosedError(`cannot list git filter drivers (${String(err.stderr ?? err.message).trim()})`);
+      })
       .then((out) => {
         const names = new Set<string>();
         for (const key of out.split('\0')) {
-          const m = /^filter\.(.+)\.[^.]+$/s.exec(key);
-          if (m && !/[\0\n=]/.test(m[1]!)) names.add(m[1]!);
+          if (!key) continue;
+          const m = /^filter\.([\s\S]+)\.[^.]+$/.exec(key);
+          if (!m) throw new FailClosedError(`cannot switch off git filter config ${JSON.stringify(key)}`);
+          names.add(m[1]!);
         }
-        return [...names].flatMap((n) => ['-c', `filter.${n}.clean=`, '-c', `filter.${n}.process=`, '-c', `filter.${n}.smudge=`, '-c', `filter.${n}.required=false`]);
+        const env: Record<string, string> = {};
+        let n = Number(process.env.GIT_CONFIG_COUNT ?? 0);
+        if (!Number.isInteger(n) || n < 0) n = 0;
+        for (const name of names) {
+          for (const [k, v] of [['clean', ''], ['process', ''], ['smudge', ''], ['required', 'false']] as const) {
+            env[`GIT_CONFIG_KEY_${n}`] = `filter.${name}.${k}`;
+            env[`GIT_CONFIG_VALUE_${n}`] = v;
+            n++;
+          }
+        }
+        if (names.size) env.GIT_CONFIG_COUNT = String(n);
+        return env;
       });
     filterOverrides.set(cwd, found);
     // Config can change between runs in one process (tests); a guard run is short.
@@ -128,17 +159,23 @@ function filterArgs(cwd: string): Promise<string[]> {
   return found;
 }
 
+/** Environment for every git process: no optional locks, C locale, filter drivers off. */
+async function gitEnv(cwd: string): Promise<NodeJS.ProcessEnv> {
+  return { ...process.env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', ...(await filterEnv(cwd)) };
+}
+
 /**
  * Run git in `cwd` without a shell. Resolves with trimmed-right stdout.
  * `-c core.quotePath=false` keeps non-ASCII paths readable in diff headers; see {@link SAFE_CONFIG}.
  */
-export async function git(cwd: string, args: string[], opts: { trim?: boolean } = {}): Promise<string> {
+export async function git(cwd: string, args: string[], opts: { trim?: boolean; maxBuffer?: number } = {}): Promise<string> {
+  const env = await gitEnv(cwd);
   try {
-    const { stdout } = await execFileAsync('git', [...SAFE_CONFIG, ...(await filterArgs(cwd)), ...args], {
+    const { stdout } = await execFileAsync('git', [...SAFE_CONFIG, ...args], {
       cwd,
-      maxBuffer: MAX_BUFFER,
+      maxBuffer: opts.maxBuffer ?? MAX_BUFFER,
       encoding: 'utf8',
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' },
+      env,
     });
     return opts.trim === false ? stdout : stdout.replace(/\s+$/, '');
   } catch (err) {
@@ -222,6 +259,18 @@ export async function hasHead(cwd: string): Promise<boolean> {
  *   "new file" sections for untracked files, read from disk (binary skipped).
  */
 export async function getDiff(cwd: string, target: DiffTarget, opts: DiffOptions = {}): Promise<string> {
+  return (await getDiffDetailed(cwd, target, opts)).diff;
+}
+
+/** A diff plus the files shown as binary stubs that could not be re-diffed as text (see {@link revealTextMarkedBinary}). */
+export interface DetailedDiff {
+  diff: string;
+  /** Repo paths git showed as binary because of attributes, whose text could not be produced */
+  unreviewed: string[];
+}
+
+/** {@link getDiff}, also listing the files whose real content could not be shown. */
+export async function getDiffDetailed(cwd: string, target: DiffTarget, opts: DiffOptions = {}): Promise<DetailedDiff> {
   try {
     return await getDiffUnwrapped(cwd, target, opts);
   } catch (err) {
@@ -235,7 +284,7 @@ export async function getDiff(cwd: string, target: DiffTarget, opts: DiffOptions
 /** Git errors a deeper fetch can fix: a revision or merge base the shallow history lacks. */
 const MISSING_REVISION = /unknown revision|bad revision|no merge base|ambiguous argument|not a valid object name|bad object|invalid symmetric difference/i;
 
-async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptions): Promise<string> {
+async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptions): Promise<DetailedDiff> {
   const unified = `--unified=${opts.unified ?? 3}`;
   // No textconv and no external diff: the diff shows the bytes, not what a filter makes of them.
   const common = ['diff', '--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/', '-M', unified];
@@ -255,7 +304,8 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
     baseRev = await emptyTree(cwd); // unborn branch: everything tracked is "added"
   }
   const pathspec = opts.paths?.length ? ['--', ...opts.paths] : [];
-  let diff = await revealTextMarkedBinary(cwd, [...common, baseRev], await git(cwd, [...common, baseRev, ...pathspec], { trim: false }));
+  const revealed = await revealTextMarkedBinary(cwd, [...common, baseRev], await git(cwd, [...common, baseRev, ...pathspec], { trim: false }));
+  let diff = revealed.diff;
 
   if (target.includeUntracked !== false) {
     const root = await repoRoot(cwd);
@@ -265,7 +315,7 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
       if (synthetic) diff += synthetic;
     }
   }
-  return diff;
+  return { diff, unreviewed: revealed.unreviewed };
 }
 
 /** Git's binary sniff: a NUL byte within the first this many bytes of either side. */
@@ -279,30 +329,57 @@ const BINARY_SNIFF = 8000;
  * replaces the binary stub. NUL bytes later in such a file are shown as U+2400. There is no file or
  * size cap: if the content cannot be checked, the file is re-diffed as text (fail closed).
  */
-async function revealTextMarkedBinary(cwd: string, args: string[], diff: string): Promise<string> {
-  if (!diff.includes('Binary files ') && !diff.includes('GIT binary patch')) return diff;
+async function revealTextMarkedBinary(cwd: string, args: string[], diff: string): Promise<DetailedDiff> {
+  if (!diff.includes('Binary files ') && !diff.includes('GIT binary patch')) return { diff, unreviewed: [] };
   const sections = splitSections(diff);
   const binary = new Map<number, string[]>();
   for (const [i, section] of sections.entries()) {
     const h = parseUnifiedDiff(section)[0];
     if (h?.header === BINARY_HUNK_HEADER) binary.set(i, [...new Set([h.file, ...(h.oldFile ? [h.oldFile] : [])])]);
   }
-  if (!binary.size) return diff;
-  const files = [...new Set([...binary.values()].flat())];
-  const realBinary = await binaryByContent(cwd, args, files).catch(() => new Set<string>());
-  const text = files.filter((f) => !realBinary.has(f));
-  if (!text.length) return diff;
-  const out = await git(cwd, [...args, '--text', '--', ...text.map((f) => `:(literal)${f}`)], { trim: false }).catch(() => '');
+  if (!binary.size) return { diff, unreviewed: [] };
+  const realBinary = await binaryByContent(cwd, args, [...new Set([...binary.values()].flat())]).catch(() => new Set<string>());
+  // One re-diff per file group (a rename re-diffs both of its names together), in small batches; a
+  // batch that fails (too big, git error) is retried file by file, and a file that still fails is
+  // reported as unreviewed rather than passed off as binary.
+  const groups = [...binary.values()].filter((names) => !names.some((n) => realBinary.has(n)));
+  const maxBuffer = Number(process.env.WHY_DIFF_REDIFF_MAX_BYTES) || REDIFF_MAX_BYTES;
   const byFile = new Map<string, string>();
-  for (const section of splitSections(out)) {
-    const h = parseUnifiedDiff(section)[0];
-    if (h) byFile.set(h.file, section.replace(/\0/g, '\u2400'));
+  const unreviewed = new Set<string>();
+  const rediff = (names: string[]): Promise<string> =>
+    git(cwd, [...args, '--text', '--', ...names.map((f) => `:(literal)${f}`)], { trim: false, maxBuffer });
+  const take = (out: string): void => {
+    for (const section of splitSections(out)) {
+      const h = parseUnifiedDiff(section)[0];
+      if (h) byFile.set(h.file, section.replace(/\0/g, '\u2400'));
+    }
+  };
+  for (let i = 0; i < groups.length; i += REDIFF_BATCH) {
+    const batch = groups.slice(i, i + REDIFF_BATCH);
+    try {
+      take(await rediff(batch.flat()));
+    } catch {
+      for (const names of batch) {
+        try {
+          take(await rediff(names));
+        } catch {
+          unreviewed.add(names[0]!);
+        }
+      }
+    }
   }
-  return sections.map((section, i) => {
-    const names = binary.get(i);
-    return (names && byFile.get(names[0]!)) ?? section;
-  }).join('');
+  return {
+    diff: sections.map((section, i) => {
+      const names = binary.get(i);
+      return (names && byFile.get(names[0]!)) ?? section;
+    }).join(''),
+    unreviewed: [...unreviewed],
+  };
 }
+
+const REDIFF_BATCH = 16;
+/** Output cap for one re-diff (`WHY_DIFF_REDIFF_MAX_BYTES` overrides it, for tests). */
+const REDIFF_MAX_BYTES = 64 * 1024 * 1024;
 
 /**
  * Of `files` (paths on either side of the diff `args` describes), those whose content is binary by
@@ -354,6 +431,7 @@ function blobHeads(cwd: string, shas: string[], n: number): Promise<Map<string, 
   if (!shas.length) return Promise.resolve(heads);
   return new Promise((resolve, reject) => {
     const child = spawn('git', [...SAFE_CONFIG, 'cat-file', '--batch'], { cwd, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' }, stdio: ['pipe', 'pipe', 'ignore'] });
+    // cat-file --batch reads raw objects: no filters apply.
     let pending: Buffer = Buffer.alloc(0);
     let current: { sha: string; left: number; head: Buffer[]; kept: number } | null = null;
     child.stdout.on('data', (chunk: Buffer) => {
