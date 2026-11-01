@@ -15,7 +15,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // Guard runs over real repositories (submodules, CLI children) take seconds on Windows runners.
 vi.setConfig({ testTimeout: 30_000 });
-import { runGuard, windowsVolumeCommand, type GuardOptions } from '../src/guard.js';
+import { parseDarwinMounts, parseLinuxMountinfo, pickMount, runGuard, windowsVolumeCommand, type GuardOptions } from '../src/guard.js';
 import * as gitModule from '../src/git.js';
 import { recordSessionStart } from '../src/session-start.js';
 import type { LabelKind } from '../src/types.js';
@@ -968,8 +968,64 @@ describe.skipIf(posix)('sec035 fix round 2 (R4): can the owner set a file\'s NTF
     const script = 'Add-Type -TypeDefinition $env:WD_SRC; [WdCt]::Set($env:WD_FILE, [DateTime]::Parse($env:WD_AT).ToUniversalTime().ToFileTimeUtc())';
     const out = execFileSync(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: { ...process.env, WD_SRC: src, WD_FILE: f, WD_AT: new Date(target).toISOString() } });
     const ctime = statSync(f).ctimeMs;
-    // Recorded outcome (documentation, see README Limitations): the call succeeds as the file's owner and ctime moves.
+    // Recorded outcome on the GitHub windows-latest runner (documentation, see README Limitations): the call succeeds as the file's owner and ctime moves.
     expect(out.trim()).toBe('True');
     expect(Math.abs(ctime - target)).toBeLessThan(2000);
   }, 60_000);
+});
+
+describe('sec035 fix round 2 (I, J, K): mount entries by device, and a linked worktree\'s own git dir', () => {
+  it('a mount table line that cannot be read, or a mount point with a control character, throws', () => {
+    expect(() => parseDarwinMounts('/dev/disk3s1s1 on / (apfs, local)\ngarbage line\n')).toThrow(/unreadable/);
+    expect(() => parseDarwinMounts('/dev/disk9 on /tmp/a\tb (hfs, local, mounted by eve)\n')).toThrow(/control character/);
+    expect(() => parseLinuxMountinfo('36 35 98:0 / / rw - ext4 /dev/root rw\nnot mountinfo\n')).toThrow(/unreadable/);
+    expect(parseDarwinMounts('/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n')[0]).toMatchObject({ mountPoint: '/', type: 'apfs' });
+    expect(parseLinuxMountinfo('36 35 8:1 / /home rw,relatime shared:1 - ext4 /dev/sda1 rw\n')[0]).toMatchObject({ mountPoint: '/home', type: 'ext4', majorMinor: '8:1' });
+  });
+
+  it('the entry is the one with the path\'s device, not the longest path prefix', async () => {
+    const entries = parseDarwinMounts('/dev/disk3s1s1 on / (apfs, local)\n/dev/disk9 on /repo/.git (hfs, local, mounted by eve)\n/dev/disk8 on /elsewhere (hfs, local, mounted by eve)\n');
+    const devs: Record<string, bigint> = { '/': 1n, '/repo/.git': 9n, '/elsewhere': 8n };
+    const byDev = (mp: string) => Promise.resolve(devs[mp]);
+    // A path under /repo/.git whose device is the root file system's: the prefix says disk9, the device says /.
+    expect((await pickMount(entries, '/repo/.git/objects', 1n, byDev)).mountPoint).toBe('/');
+    // A path whose device is disk8, wherever the path string points.
+    expect((await pickMount(entries, '/repo/x', 8n, byDev)).mountPoint).toBe('/elsewhere');
+    await expect(pickMount(entries, '/repo/x', 77n, byDev)).rejects.toThrow(/no mount entry/);
+    // Linux: major:minor from st_dev.
+    const linux = parseLinuxMountinfo('1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 0:50 / /run/media/u/img rw - ext4 /dev/loop0 rw\n');
+    expect((await pickMount(linux, '/run/media/u/img/repo', 50n, byDev)).mountPoint).toBe('/run/media/u/img');
+    expect((await pickMount(linux, '/home/u/repo', (8n << 8n) | 1n, byDev)).mountPoint).toBe('/');
+  });
+
+  it('a linked worktree whose own git dir is on a user-mounted volume blocks; its device is recorded and checked', async () => {
+    const data = temp('wd-s35-data-');
+    process.env.CLAUDE_PLUGIN_DATA = data;
+    const x = repo();
+    const wt = path.join(temp('wd-s35-wtj-'), 'wt');
+    git(x.repo, ['worktree', 'add', '-q', '-b', 'feature', wt]);
+    await recordSessionStart({ session_id: SID, cwd: wt });
+    const rec = JSON.parse(readFileSync(path.join(data, 'sessions', `${hash(SID)}.json`), 'utf8')) as { worktreeGitDev?: number };
+    expect(typeof rec.worktreeGitDev).toBe('number');
+    const wtGit = path.join(x.repo, '.git', 'worktrees', 'wt');
+    const src = path.join(wt, 'src', 'f.js');
+    replaceIn(src, 'x;', 'x + 0;');
+    let callAt = 0;
+    const times = async (p: string) => (path.resolve(p).startsWith(path.join(data, 'sessions')) ? callAt - 5000 : (await lstat(p)).ctimeMs);
+    const mounted = await guardRun(wt, x.home, (t) => { callAt = t; return [edit(t, src, 'x;', 'x + 0;')]; }, {
+      statTime: times, userMount: async (p: string) => (path.resolve(p).startsWith(wtGit) ? `/dev/disk9 on ${wtGit} (hfs, local, mounted by eve)` : undefined),
+    } as Partial<GuardOptions>);
+    expect(mounted.block).toBe(true);
+    expect(mounted.message).toContain('worktree git dir');
+    const moved = await guardRun(wt, x.home, (t) => { callAt = t; return [edit(t, src, 'x;', 'x + 0;')]; }, {
+      statTime: times,
+      pathStat: async (p: string) => {
+        const st = await lstat(p);
+        const hit = path.resolve(p) === wtGit || path.resolve(p).startsWith(`${wtGit}${path.sep}`);
+        return { dev: hit ? Number(st.dev) + 1000 : Number(st.dev), ctimeMs: st.ctimeMs, symlink: st.isSymbolicLink() };
+      },
+    });
+    expect(moved.block).toBe(true);
+    expect(moved.message).toContain('worktree git dir');
+  });
 });
