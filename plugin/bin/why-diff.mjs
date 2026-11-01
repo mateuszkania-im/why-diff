@@ -28,9 +28,9 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 // node_modules/picocolors/picocolors.js
 var require_picocolors = __commonJS({
   "node_modules/picocolors/picocolors.js"(exports, module) {
-    var p = process || {}, argv = p.argv || [], env = p.env || {}, isColorSupported = !(env.NO_COLOR || argv.includes("--no-color")) && (!!env.FORCE_COLOR || argv.includes("--color") || p.platform === "win32" || (p.stdout || {}).isTTY && env.TERM !== "dumb" || !!env.CI), formatter = (open4, close, replace = open4) => (input) => {
-      let string = "" + input, index = string.indexOf(close, open4.length);
-      return ~index ? open4 + replaceClose(string, close, replace, index) + close : open4 + string + close;
+    var p = process || {}, argv = p.argv || [], env = p.env || {}, isColorSupported = !(env.NO_COLOR || argv.includes("--no-color")) && (!!env.FORCE_COLOR || argv.includes("--color") || p.platform === "win32" || (p.stdout || {}).isTTY && env.TERM !== "dumb" || !!env.CI), formatter = (open5, close, replace = open5) => (input) => {
+      let string = "" + input, index = string.indexOf(close, open5.length);
+      return ~index ? open5 + replaceClose(string, close, replace, index) + close : open5 + string + close;
     }, replaceClose = (string, close, replace, index) => {
       let result = "", cursor = 0;
       do
@@ -2663,20 +2663,20 @@ function parseUnifiedDiff(diff) {
   let hunks = [], lines = diff.split(`
 `);
   lines.length > 0 && lines[lines.length - 1] === "" && lines.pop();
-  let file = null, open4 = null, newFile = (oldPath, newPath) => ({
+  let file = null, open5 = null, newFile = (oldPath, newPath) => ({
     oldPath,
     newPath,
     status: "modified",
     binary: !1,
     emittedHunk: !1
   }), finishFile = () => {
-    file && file.binary && !file.emittedHunk ? hunks.push(binaryHunk(file, hunks.length + 1)) : file && !file.binary && !file.emittedHunk && isModeOnlyChange(file) ? hunks.push(modeChangeHunk(file, hunks.length + 1)) : file && !file.binary && !file.emittedHunk && isContentlessMove(file) && hunks.push(contentlessHunk(file, hunks.length + 1)), file = null, open4 = null;
+    file && file.binary && !file.emittedHunk ? hunks.push(binaryHunk(file, hunks.length + 1)) : file && !file.binary && !file.emittedHunk && isModeOnlyChange(file) ? hunks.push(modeChangeHunk(file, hunks.length + 1)) : file && !file.binary && !file.emittedHunk && isContentlessMove(file) && hunks.push(contentlessHunk(file, hunks.length + 1)), file = null, open5 = null;
   };
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i] ?? "";
-    if (open4 && (open4.remainingOld > 0 || open4.remainingNew > 0)) {
-      if (line.startsWith("\\") || consumeBodyLine(open4, line)) continue;
-      open4 = null;
+    if (open5 && (open5.remainingOld > 0 || open5.remainingNew > 0)) {
+      if (line.startsWith("\\") || consumeBodyLine(open5, line)) continue;
+      open5 = null;
     }
     if (line.startsWith("\\")) continue;
     let gitMatch = DIFF_GIT.exec(line);
@@ -2706,7 +2706,7 @@ function parseUnifiedDiff(diff) {
         header: line,
         lines: []
       };
-      open4 = {
+      open5 = {
         hunk,
         remainingOld: oldLines,
         remainingNew: newLines,
@@ -2742,14 +2742,14 @@ function parseUnifiedDiff(diff) {
   }
   return finishFile(), hunks;
 }
-function consumeBodyLine(open4, line) {
+function consumeBodyLine(open5, line) {
   let marker = line[0], text2 = line.slice(1);
-  return marker === "+" && open4.remainingNew > 0 ? (open4.hunk.lines.push({ type: "add", text: text2, newNo: open4.newNo++ }), open4.remainingNew--, !0) : marker === "-" && open4.remainingOld > 0 ? (open4.hunk.lines.push({ type: "del", text: text2, oldNo: open4.oldNo++ }), open4.remainingOld--, !0) : (marker === " " || line === "") && open4.remainingOld > 0 && open4.remainingNew > 0 ? (open4.hunk.lines.push({
+  return marker === "+" && open5.remainingNew > 0 ? (open5.hunk.lines.push({ type: "add", text: text2, newNo: open5.newNo++ }), open5.remainingNew--, !0) : marker === "-" && open5.remainingOld > 0 ? (open5.hunk.lines.push({ type: "del", text: text2, oldNo: open5.oldNo++ }), open5.remainingOld--, !0) : (marker === " " || line === "") && open5.remainingOld > 0 && open5.remainingNew > 0 ? (open5.hunk.lines.push({
     type: "ctx",
     text: line === "" ? "" : text2,
-    oldNo: open4.oldNo++,
-    newNo: open4.newNo++
-  }), open4.remainingOld--, open4.remainingNew--, !0) : !1;
+    oldNo: open5.oldNo++,
+    newNo: open5.newNo++
+  }), open5.remainingOld--, open5.remainingNew--, !0) : !1;
 }
 function isModeOnlyChange(file) {
   return file.oldMode !== void 0 && file.newMode !== void 0 && file.status === "modified";
@@ -4536,15 +4536,15 @@ function uniq(xs) {
 function listOf(items) {
   return uniq(items).join(", ");
 }
-function balanced(s, open4) {
+function balanced(s, open5) {
   let pairs = { "(": ")", "[": "]", "{": "}" }, stack = [];
-  for (let i = open4; i < s.length; i++) {
+  for (let i = open5; i < s.length; i++) {
     let c = s.charAt(i), close = pairs[c];
     if (close !== void 0) stack.push(close);
     else if (c === stack[stack.length - 1] && (stack.pop(), stack.length === 0))
-      return { inner: s.slice(open4 + 1, i), end: i + 1 };
+      return { inner: s.slice(open5 + 1, i), end: i + 1 };
   }
-  return { inner: s.slice(open4 + 1), end: s.length };
+  return { inner: s.slice(open5 + 1), end: s.length };
 }
 function splitTopLevel(s) {
   let out = [], depth = 0, cur = "";
@@ -4833,7 +4833,7 @@ function parseAssertion(line, path14) {
   if (!code2 || /^(?:def|function|func|fn|public|private|protected)\b/.test(code2)) return null;
   let literals = [...line.matchAll(STRING_LITERAL)].map((m) => m[0].slice(1, -1)).filter((x) => x.trim() !== ""), base = { raw: line.trim(), key: normaliseLine(line), literals }, norm = (s) => s.replace(/\s+/g, ""), ex = EXPECT_CALL.exec(code2);
   if (ex) {
-    let open4 = ex.index + ex[0].length - 1, subject = balanced(code2, open4), rest = code2.slice(subject.end), negated = !1;
+    let open5 = ex.index + ex[0].length - 1, subject = balanced(code2, open5), rest = code2.slice(subject.end), negated = !1;
     for (let m2 = CHAIN_MODIFIER.exec(rest); m2; m2 = CHAIN_MODIFIER.exec(rest))
       (m2[1] === "not" || m2[1] === "not_to" || m2[1] === "to_not") && (negated = !0), rest = rest.slice(m2[0].length);
     let m = /^\s*\.?\s*(\w+)\s*(\(?)/.exec(rest), display = m?.[1] ?? "expect", expected = "";
@@ -5013,14 +5013,14 @@ function detectRestructure(path14, lines, fileText) {
       at && (seq[at.li].code[at.col] === "{" ? anyExisting(at.li, close(at.li, at.col).li) : existing(at.li)) && skips.push(`assertions behind ${f[0].replace(/\s+/g, " ")}`);
     }
     for (let t of code2.matchAll(TRY_OPEN)) {
-      let open4 = { li: i, col: t.index + t[0].length - 1 }, end = close(open4.li, open4.col);
+      let open5 = { li: i, col: t.index + t[0].length - 1 }, end = close(open5.li, open5.col);
       if (end.col === 1 / 0) continue;
       let after = next(end.li, end.col + 1);
       if (!after) continue;
       let rest = seq[after.li].code.slice(after.col), c = /^catch\s*(?:\([^)]*\)\s*)?\{/.exec(rest);
       if (!c) continue;
-      let catchOpen = { li: after.li, col: after.col + c[0].length - 1 }, catchEnd = close(catchOpen.li, catchOpen.col), body = between(open4, end), handler = between(catchOpen, catchEnd);
-      /\bthrow\b/.test(handler) || ASSERTION_CALL.test(handler) || /\.\s*(?:toThrow\w*|rejects|throws)\b/.test(body) || anyExisting(open4.li, end.li) && weakenings.push("existing assertions wrapped in a try/catch that swallows their failures");
+      let catchOpen = { li: after.li, col: after.col + c[0].length - 1 }, catchEnd = close(catchOpen.li, catchOpen.col), body = between(open5, end), handler = between(catchOpen, catchEnd);
+      /\bthrow\b/.test(handler) || ASSERTION_CALL.test(handler) || /\.\s*(?:toThrow\w*|rejects|throws)\b/.test(body) || anyExisting(open5.li, end.li) && weakenings.push("existing assertions wrapped in a try/catch that swallows their failures");
     }
     let shadow = shadowedGlobal(code2, line.text, path14, fileText), calledAfter = (name) => seq.slice(i + 1).some((x) => new RegExp(`(?<![\\w$.])${name}\\s*\\(`).test(x.code));
     shadow && (!/^\s/.test(line.text) || /^\s*import\b/.test(code2) || calledAfter(shadow)) && skips.push(`a binding that shadows the test global ${shadow}`);
@@ -5141,9 +5141,9 @@ var NPM_DEP_SECTIONS = /* @__PURE__ */ new Set(["dependencies", "devDependencies
 function scanJsonManifest(lines, sections, scalars) {
   let scan = { added: [], removed: [] }, section;
   for (let l of lines) {
-    let open4 = /^\s*"([^"]+)"\s*:\s*\{\s*$/.exec(l.text);
-    if (open4) {
-      section = open4[1];
+    let open5 = /^\s*"([^"]+)"\s*:\s*\{\s*$/.exec(l.text);
+    if (open5) {
+      section = open5[1];
       continue;
     }
     if (/^\s*\}/.test(l.text)) {
@@ -5230,9 +5230,9 @@ function scanCargo(lines) {
 function scanGoMod(lines) {
   let scan = { added: [], removed: [] }, block;
   for (let l of lines) {
-    let open4 = /^\s*(require|replace|exclude|retract|tool|godebug)\s*\(\s*$/.exec(l.text);
-    if (open4) {
-      block = open4[1];
+    let open5 = /^\s*(require|replace|exclude|retract|tool|godebug)\s*\(\s*$/.exec(l.text);
+    if (open5) {
+      block = open5[1];
       continue;
     }
     if (/^\s*\)\s*$/.test(l.text)) {
@@ -5267,8 +5267,8 @@ function detectConfigChange(path14, lines) {
   if (base === "package.json") {
     let section, changed = /* @__PURE__ */ new Set();
     for (let l of lines) {
-      let open4 = /^\s*"([^"]+)"\s*:\s*\{\s*$/.exec(l.text);
-      open4 ? section = open4[1] : /^\s*\}/.test(l.text) ? section = null : l.type !== "ctx" && section && PKG_CONFIG_SECTIONS.has(section) && changed.add(section);
+      let open5 = /^\s*"([^"]+)"\s*:\s*\{\s*$/.exec(l.text);
+      open5 ? section = open5[1] : /^\s*\}/.test(l.text) ? section = null : l.type !== "ctx" && section && PKG_CONFIG_SECTIONS.has(section) && changed.add(section);
     }
     if (changed.size > 0) return `package.json ${[...changed].join(", ")} changed`;
   }
@@ -5767,10 +5767,10 @@ function expandWords(pairs, vars, budget) {
 }
 function expandBraces(word, mask2, budget = { n: MAX_EXPANSIONS }) {
   if (budget.n <= 0 || word.length > 4096 || !word.includes("{")) return [[word, mask2]];
-  for (let open4 = word.indexOf("{"); open4 !== -1; open4 = word.indexOf("{", open4 + 1)) {
-    if (mask2[open4] !== "u") continue;
+  for (let open5 = word.indexOf("{"); open5 !== -1; open5 = word.indexOf("{", open5 + 1)) {
+    if (mask2[open5] !== "u") continue;
     let depth = 0, commas = [], close = -1;
-    for (let i = open4 + 1; i < word.length; i++) {
+    for (let i = open5 + 1; i < word.length; i++) {
       if (mask2[i] !== "u") continue;
       let c = word[i];
       if (c === "{") depth++;
@@ -5784,9 +5784,9 @@ function expandBraces(word, mask2, budget = { n: MAX_EXPANSIONS }) {
     }
     if (close === -1) return [[word, mask2]];
     if (!commas.length) continue;
-    let out = [], cuts = [open4, ...commas, close];
+    let out = [], cuts = [open5, ...commas, close];
     for (let k = 0; k + 1 < cuts.length; k++) {
-      let a = (cuts[k] ?? 0) + 1, b = cuts[k + 1] ?? 0, text2 = word.slice(0, open4) + word.slice(a, b) + word.slice(close + 1), m = mask2.slice(0, open4) + mask2.slice(a, b) + mask2.slice(close + 1);
+      let a = (cuts[k] ?? 0) + 1, b = cuts[k + 1] ?? 0, text2 = word.slice(0, open5) + word.slice(a, b) + word.slice(close + 1), m = mask2.slice(0, open5) + mask2.slice(a, b) + mask2.slice(close + 1);
       for (let r of expandBraces(text2, m, budget)) {
         if (budget.n-- <= 0) return out.length ? out : [[word, mask2]];
         out.push(r);
@@ -6241,9 +6241,9 @@ function tokenize(input) {
   }
   return flush(), pendingHeredocs.length && readHeredocBodies(), tokens;
 }
-function matchParen(s, open4) {
+function matchParen(s, open5) {
   let depth = 0;
-  for (let i = open4; i < s.length; i++) {
+  for (let i = open5; i < s.length; i++) {
     let c = s[i];
     if (c === "(") depth++;
     else if (c === ")") {
@@ -6607,8 +6607,8 @@ var ClaudeCodeAdapter = class {
     this.windowCalls.delete(toolUseId);
     let start = Date.parse(call.at), end = resultAt ? Date.parse(resultAt) : NaN;
     if (!Number.isFinite(start)) return;
-    let open4 = call.open || opts.background || !Number.isFinite(end);
-    this.toolWindows.push({ callId: toolUseId, tool: call.name, start: call.at, end: Number.isFinite(end) && end >= start ? resultAt : call.at, ...open4 ? { open: !0 } : {} });
+    let open5 = call.open || opts.background || !Number.isFinite(end);
+    this.toolWindows.push({ callId: toolUseId, tool: call.name, start: call.at, end: Number.isFinite(end) && end >= start ? resultAt : call.at, ...open5 ? { open: !0 } : {} });
   }
   // -- edit extraction -------------------------------------------------------
   emitEdits(call, outcome) {
@@ -6704,15 +6704,15 @@ function cleanPromptText(raw) {
 `).trim();
 }
 function tagText(text2, tag) {
-  let open4 = `<${tag}>`, i = text2.indexOf(open4);
+  let open5 = `<${tag}>`, i = text2.indexOf(open5);
   if (i < 0) return;
-  let j = text2.indexOf(`</${tag}>`, i + open4.length);
-  return j < 0 ? void 0 : text2.slice(i + open4.length, j);
+  let j = text2.indexOf(`</${tag}>`, i + open5.length);
+  return j < 0 ? void 0 : text2.slice(i + open5.length, j);
 }
 function stripTags(text2, tag) {
-  let open4 = `<${tag}>`, close = `</${tag}>`, out = "", pos = 0;
+  let open5 = `<${tag}>`, close = `</${tag}>`, out = "", pos = 0;
   for (; ; ) {
-    let i = text2.indexOf(open4, pos), j = i < 0 ? -1 : text2.indexOf(close, i + open4.length);
+    let i = text2.indexOf(open5, pos), j = i < 0 ? -1 : text2.indexOf(close, i + open5.length);
     if (j < 0) return out + text2.slice(pos);
     out += text2.slice(pos, i), pos = j + close.length;
   }
@@ -7234,7 +7234,7 @@ function readJsString(src, start) {
 function findJsToolCalls(src, name) {
   let out = [], re = new RegExp(`\\btools\\.${name.replace(/[.$]/g, "\\$&")}\\s*\\(`, "g"), m;
   for (; (m = re.exec(src)) !== null; ) {
-    let open4 = m.index + m[0].length, depth = 1, i = open4;
+    let open5 = m.index + m[0].length, depth = 1, i = open5;
     for (; i < src.length && depth > 0; ) {
       let c = src[i] ?? "";
       if (c === '"' || c === "'" || c === "`") {
@@ -7243,7 +7243,7 @@ function findJsToolCalls(src, name) {
       }
       c === "(" || c === "{" || c === "[" ? depth++ : (c === ")" || c === "}" || c === "]") && depth--, i++;
     }
-    out.push({ index: m.index, args: src.slice(open4, Math.max(open4, i - 1)) }), re.lastIndex = i;
+    out.push({ index: m.index, args: src.slice(open5, Math.max(open5, i - 1)) }), re.lastIndex = i;
   }
   return out;
 }
@@ -10072,15 +10072,15 @@ function cutAtLine(md, maxChars) {
 
 _Report truncated to fit the size limit._
 `, lines = md.split(`
-`), kept = "", open4 = 0;
+`), kept = "", open5 = 0;
   for (let line of lines) {
-    let opens = (line.match(/<details>/g) ?? []).length, closes = (line.match(/<\/details>/g) ?? []).length, nextOpen = Math.max(0, open4 + opens - closes), candidate = `${kept}${line}
+    let opens = (line.match(/<details>/g) ?? []).length, closes = (line.match(/<\/details>/g) ?? []).length, nextOpen = Math.max(0, open5 + opens - closes), candidate = `${kept}${line}
 `;
     if (candidate.length + nextOpen * 11 + note.length > maxChars) break;
-    kept = candidate, open4 = nextOpen;
+    kept = candidate, open5 = nextOpen;
   }
   let out = `${kept}${`
-</details>`.repeat(open4)}${note}`;
+</details>`.repeat(open5)}${note}`;
   return out.length <= maxChars ? out : note.slice(0, maxChars);
 }
 function build(report, o) {
@@ -10447,7 +10447,7 @@ function renderReport(report, format, opts = {}) {
 
 // src/guard.ts
 import { constants as fsConstants2, createReadStream as createReadStream4, realpath as realpathCb } from "node:fs";
-import { access, lstat as lstat4, readdir as readdir4, readFile as readFile8, realpath as realpath7, stat as stat5, statfs } from "node:fs/promises";
+import { access, lstat as lstat4, open as open4, readdir as readdir4, readFile as readFile8, realpath as realpath7, stat as stat5, statfs } from "node:fs/promises";
 import { execFile as execFile3 } from "node:child_process";
 import readline2 from "node:readline";
 import os9 from "node:os";
@@ -10812,7 +10812,15 @@ async function checkSubmodules(ctx, repo, layeredActive) {
       unreviewed(p, `is on an untrusted file system (${err.message.replace(/^unreviewed: /, "")})`);
       continue;
     }
-    let rec2 = ctx.recordedSubmodules?.[key], subGitDev = await deviceOf(subCommon, ctx.pathStat);
+    let rec2 = ctx.recordedSubmodules?.[key];
+    if (rec2?.rootDev === void 0 && rec2?.gitDev === void 0 && subGitDir !== subCommon) {
+      let realGitDir = await real(subGitDir), [here, up] = await Promise.all([deviceOf(realGitDir, ctx.pathStat), deviceOf(path12.dirname(realGitDir), ctx.pathStat)]);
+      if (here === void 0 || here !== up) {
+        unreviewed(p, "has its worktree git dir at the root of its own volume, and no SessionStart record kept its device");
+        continue;
+      }
+    }
+    let subGitDev = await deviceOf(subCommon, ctx.pathStat);
     if (rec2?.rootDev !== void 0 || rec2?.gitDev !== void 0) {
       let rootNow = await deviceOf(await real(subRoot), ctx.pathStat), wtNow = subGitDir !== subCommon ? await deviceOf(subGitDir, ctx.pathStat) : void 0, wtWas = rec2.worktreeGitDev ?? rec2.gitDev;
       if (rec2.rootDev !== void 0 && rec2.rootDev !== rootNow || rec2.gitDev !== void 0 && rec2.gitDev !== subGitDev || wtNow !== void 0 && wtWas !== void 0 && wtNow !== wtWas) {
@@ -11052,7 +11060,8 @@ function parseLinuxMountinfo(text2) {
     if (f.length < 6 || r.length < 3 || !/^\d+:\d+$/.test(f[2])) throw new Error(`unreadable mountinfo line ${JSON.stringify(line.slice(0, 120))}`);
     let mountPoint = unescape(f[4]);
     if (CONTROL.test(mountPoint)) throw new Error(`mount point with a control character ${JSON.stringify(mountPoint)}`);
-    return { source: unescape(r[1]), mountPoint, type: r[0], options: [...f[5].split(","), ...r[2].split(",")], majorMinor: f[2] };
+    if (!/^\d+$/.test(f[0])) throw new Error(`unreadable mountinfo line ${JSON.stringify(line.slice(0, 120))}`);
+    return { source: unescape(r[1]), mountPoint, type: r[0], options: [...f[5].split(","), ...r[2].split(",")], majorMinor: f[2], mountId: f[0] };
   });
 }
 var mountTable;
@@ -11075,13 +11084,30 @@ async function pickMount(entries, real, dev, deviceOfMountPoint) {
   let prefix = (mp) => real === mp || real.startsWith(mp.endsWith("/") ? mp : `${mp}/`);
   return same.sort((a, b) => Number(prefix(b.mountPoint)) - Number(prefix(a.mountPoint)) || b.mountPoint.length - a.mountPoint.length)[0];
 }
+var SINGLE_DEVICE_FS = /* @__PURE__ */ new Set(["ext2", "ext3", "ext4", "xfs", "tmpfs"]);
+function pickLinuxMount(entries, fdinfo, dev) {
+  let id = /^mnt_id:\s*(\d+)\s*$/m.exec(fdinfo)?.[1];
+  if (!id) throw new Error("no mnt_id in fdinfo");
+  let entry = entries.find((m) => m.mountId === id);
+  if (!entry) throw new Error(`no mountinfo entry has mount ID ${id}`);
+  if (SINGLE_DEVICE_FS.has(entry.type) && entry.majorMinor !== linuxMajorMinor(dev)) throw new Error(`mount ${id} (${entry.mountPoint}) is device ${entry.majorMinor}, the path is ${linuxMajorMinor(dev)}`);
+  return entry;
+}
+async function linuxFdinfo(real) {
+  let fh = await open4(real, "r");
+  try {
+    return await readFile8(`/proc/self/fdinfo/${fh.fd}`, "utf8");
+  } finally {
+    await fh.close();
+  }
+}
 async function userMountOf(p) {
   if (process.platform !== "darwin" && process.platform !== "linux") return;
-  let real = await realpath7(p), dev = (await stat5(real, { bigint: !0 })).dev, best = await pickMount(await mounts(), real, dev, (mp) => stat5(mp, { bigint: !0 }).then((st) => st.dev, () => {
+  let real = await realpath7(p), dev = (await stat5(real, { bigint: !0 })).dev, best = process.platform === "linux" ? pickLinuxMount(await mounts(), await linuxFdinfo(real), dev) : await pickMount(await mounts(), real, dev, (mp) => stat5(mp, { bigint: !0 }).then((st) => st.dev, () => {
   })), describe = `${best.source} on ${best.mountPoint} (${[best.type, ...best.options].join(", ")})`;
   if (process.platform === "darwin")
     return best.options.some((o) => o.startsWith("mounted by")) || best.options.includes("nobrowse") && !best.mountPoint.startsWith("/System/Volumes/") || /disk image/i.test(best.options.join(",")) ? describe : void 0;
-  if (best.type.startsWith("fuse") || best.options.includes("uhelper=udisks2") || /^\/(run\/)?media\//.test(`${best.mountPoint}/`)) return describe;
+  if (best.type.startsWith("fuse") || /^\/(run\/)?media\//.test(`${best.mountPoint}/`)) return describe;
 }
 var darwinMounts;
 function darwinMountTypes() {
