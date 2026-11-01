@@ -15,11 +15,12 @@ import readline from 'node:readline';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
-import { emptyTree, FailClosedError, git, hasHead, indexEntries, isCaseInsensitive, listUntracked, repoRoot, sparseExcluded, sparseMissing, worktreeRoots, type SparseTrust } from './git.js';
+import { emptyTree, FailClosedError, git, GitError, hasHead, indexEntries, isCaseInsensitive, listUntracked, repoRoot, sparseExcluded, sparseMissing, worktreeRoots, type SparseTrust } from './git.js';
 import { globToRegExp, repoRelativePath, rootVariants } from './attribute.js';
 import { compileGlobs, loadConfig, type WhyDiffConfig } from './config.js';
 import type { Hunk, LabelKind, Session } from './types.js';
-import { failedMarker, recordMarker, recordPath, type BaseRecord } from './session-start.js';
+import { isConfigFile, isTestFile } from './labels.js';
+import { dataDir, failedMarker, recordMarker, recordPath, type BaseRecord } from './session-start.js';
 
 export const DEFAULT_BLOCK_ON: readonly LabelKind[] = ['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path', 'unreviewed'];
 
@@ -39,6 +40,8 @@ export interface GuardOptions {
   statTime?: (absPath: string) => Promise<number>;
   /** Change time of git object store files, for choosing the session base (tests); default: lstat ctime */
   objectTime?: (absPath: string) => Promise<number>;
+  /** lstat of a path: its device and whether it is a symlink (tests); default: lstat */
+  pathStat?: (absPath: string) => Promise<PathStat>;
 }
 
 export interface GuardResult {
@@ -134,45 +137,35 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // config, a `.git` file pointing nowhere).
   const cwd = payload.cwd ?? process.cwd();
   const gitEntry = await findGitEntry(cwd);
-  if (!gitEntry) return NO_BLOCK;
+  if (!gitEntry) {
+    // No `.git` now, but the session may have started in a repository: the agent can move `.git`
+    // (or the repository) away. The SessionStart record and the transcript marker say so.
+    await startedInRepository(payload, cwd, opts.statTime ?? changeTime, opts.pathStat ?? lstatOf);
+    return NO_BLOCK;
+  }
   // From here on an error blocks: an unreadable transcript could hide what the session did.
   state.relevant = true;
   // Read before any git command runs (none of why-diff's own may move them, but stat first anyway):
   // when the index and refs last changed, and the session's base record.
   const statTime = opts.statTime ?? changeTime;
-  const metaTimes = await gitMetaTimes(gitEntry, statTime);
+  const pathStat = opts.pathStat ?? lstatOf;
+  const metaTimes = await gitMetaTimes(gitEntry, statTime, pathStat);
   const sessionId = payload.session_id;
-  const record = sessionId ? await readBaseRecord(sessionId, statTime) : undefined;
+  const record = sessionId ? await readBaseRecord(sessionId, statTime, pathStat) : undefined;
   const session = await claudeCodeAdapter.parse(payload.transcript_path);
   // A session with no edits and no tool calls cannot have touched the repository.
   state.relevant = session.edits.some((e) => !e.failed) || (session.toolWindows?.length ?? 0) > 0;
   if (!state.relevant) return NO_BLOCK;
   const root = await repoRoot(cwd);
   const real = (p: string): Promise<string> => realpath(p).catch(() => path.resolve(p));
+  // Object write times count only from the repository's own file system (see sameDevice).
+  const objectTime = onDevice(opts.objectTime ?? changeTime, pathStat, await deviceOf(root, pathStat));
   // The work tree git reports must be the one the `.git` entry sits in: `core.worktree` (or a gitfile
   // in another directory pointing back) would make git diff a clean copy instead of the files the
   // agent changed.
   if ((await real(root)) !== (await real(path.dirname(gitEntry)))) {
     throw new FailClosedError(`git reports the work tree at ${root}, not at ${path.dirname(gitEntry)} where the .git entry is (core.worktree or a .git file points elsewhere)`);
   }
-  const roots = [root, ...(await worktreeRoots(root))].flatMap(rootVariants).sort((a, b) => b.length - a.length);
-  const cwdVariants = rootVariants(session.cwd);
-  const icase = await isCaseInsensitive(root);
-  // Shell commands can name globs (`rm test/*.test.js`): those become `:(glob)` pathspecs,
-  // whose `*`/`?` stay within a segment and `**` spans segments, like the shell.
-  const paths = [...new Set(session.edits
-    .filter((e) => !e.failed)
-    .map((e) => {
-      const rel = repoRelativePath(e.filePath, roots, session.cwd, cwdVariants);
-      if (!rel) return null;
-      const p = rel.split(path.sep).join('/');
-      // On a case-insensitive file system `TEST/F.test.js` names `test/f.test.js`.
-      const magic = `:(${e.kind === 'bash' && SHELL_GLOB.test(p) ? 'glob' : 'literal'}${icase ? ',icase' : ''})`;
-      // Paths are compared in NFC; a file stored under its NFD name (Linux) still has to be diffed.
-      return [...new Set([p, p.normalize('NFD')])].map((v) => `${magic}${v}`);
-    })
-    .flatMap((p) => p ?? []))];
-
   const windows = windowCheck(session);
   // The base record from SessionStart: trusted only if its file last changed before the session's
   // first tool call (the agent cannot write it earlier, and rewriting it moves its ctime). A record
@@ -201,7 +194,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
       }
       // The index at session start: staged changes from before the session are not the agent's.
       const tree = record.data.indexTree;
-      if (tree && (await git(root, ['cat-file', '-e', `${tree}^{tree}`]).then(() => true, () => false)) && (await writtenBefore(root, tree, windows.firstStart, opts.objectTime ?? changeTime))) {
+      if (tree && (await git(root, ['cat-file', '-e', `${tree}^{tree}`]).then(() => true, () => false)) && (await writtenBefore(root, tree, windows.firstStart, objectTime))) {
         indexBase = tree;
         notes.push(`index compared against the index tree recorded at session start: ${tree}`);
       }
@@ -220,14 +213,79 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
 
   let baseRev = 'HEAD';
   const headed = await hasHead(root);
-  if (headed) baseRev = await sessionBase(root, Date.parse(session.startedAt), opts.objectTime ?? changeTime, recordedHead);
+  if (headed) baseRev = await sessionBase(root, Date.parse(session.startedAt), objectTime, recordedHead);
 
   // The policy comes from the session-start commit, so the agent cannot loosen it mid-session.
   // An invalid config must not break the session: fall back to defaults.
   const config: WhyDiffConfig = await loadConfig(root, baseRev).catch(() => ({}));
   const blocking = opts.blocking ?? new Set<LabelKind>([...DEFAULT_BLOCK_ON, ...(config.blockOn ?? [])]);
   const protectedGlob = compileGlobs(config.protected);
-  const sparseTrust: SparseTrust = { before: Date.parse(session.startedAt) - WINDOW_SLACK_MS, timeOf: opts.objectTime ?? changeTime };
+  const ctx: SessionCheck = { payload, opts, session, windows, statTime, pathStat, objectTime, config, blocking, protectedGlob };
+  const hits = await checkRepository(ctx, { root, baseRev, headed, indexBase, metaTimes, prefix: '', depth: 0 });
+  return hits.length ? blocked(payload.transcript_path, hits) : NO_BLOCK;
+}
+
+/** What one guard run knows about the session, shared by the repository and its submodules. */
+interface SessionCheck {
+  payload: GuardPayload;
+  opts: GuardOptions;
+  session: Session;
+  windows: ReturnType<typeof windowCheck>;
+  statTime: (p: string) => Promise<number>;
+  pathStat: (p: string) => Promise<PathStat>;
+  objectTime: (p: string) => Promise<number>;
+  config: WhyDiffConfig;
+  blocking: Set<LabelKind>;
+  protectedGlob: (file: string) => string | undefined;
+}
+
+/** One repository to check: the session's, or a submodule of it (`prefix` is its path, with a slash). */
+interface RepoUnderCheck {
+  root: string;
+  baseRev: string;
+  headed: boolean;
+  indexBase?: string;
+  /** See {@link gitMetaTimes} */
+  metaTimes: number[];
+  prefix: string;
+  depth: number;
+}
+
+/** Submodules inside submodules are checked this many levels deep; deeper ones block as unreviewed. */
+const MAX_SUBMODULE_DEPTH = 3;
+
+/**
+ * The risky hunks this session is credited with in one repository (paths in the hits carry
+ * `repo.prefix`), then in each of its checked-out submodules, recursively.
+ */
+async function checkRepository(ctx: SessionCheck, repo: RepoUnderCheck): Promise<string[]> {
+  const { payload, opts, session, windows, statTime, pathStat, config, blocking, protectedGlob } = ctx;
+  const { root, baseRev, headed, indexBase, prefix } = repo;
+  // Refs are dated by the files of a backend this guard knows (see gitMetaTimes): any other one could
+  // move a branch without changing any of them.
+  const refStorage = (await git(root, ['config', '--get', 'extensions.refStorage']).catch((err: unknown) => {
+    if (err instanceof GitError && err.exitCode === 1 && !err.stderr.trim()) return 'files';
+    throw err;
+  })).trim().toLowerCase();
+  if (refStorage !== 'files' && refStorage !== 'reftable') throw new FailClosedError(`the repository ${prefix ? `${prefix.slice(0, -1)} ` : ''}keeps its refs in an unknown backend (extensions.refStorage = ${refStorage}), whose changes cannot be dated`);
+  const roots = [root, ...(await worktreeRoots(root))].flatMap(rootVariants).sort((a, b) => b.length - a.length);
+  const cwdVariants = rootVariants(session.cwd);
+  const icase = await isCaseInsensitive(root);
+  // Shell commands can name globs (`rm test/*.test.js`): those become `:(glob)` pathspecs,
+  // whose `*`/`?` stay within a segment and `**` spans segments, like the shell.
+  const paths = [...new Set(session.edits
+    .filter((e) => !e.failed)
+    .map((e) => {
+      const rel = repoRelativePath(e.filePath, roots, session.cwd, cwdVariants);
+      if (!rel) return null;
+      const p = rel.split(path.sep).join('/');
+      // On a case-insensitive file system `TEST/F.test.js` names `test/f.test.js`.
+      const magic = `:(${e.kind === 'bash' && SHELL_GLOB.test(p) ? 'glob' : 'literal'}${icase ? ',icase' : ''})`;
+      // Paths are compared in NFC; a file stored under its NFD name (Linux) still has to be diffed.
+      return [...new Set([p, p.normalize('NFD')])].map((v) => `${magic}${v}`);
+    })
+    .flatMap((p) => p ?? []))];
+  const sparseTrust: SparseTrust = { before: Date.parse(session.startedAt) - WINDOW_SLACK_MS, timeOf: ctx.objectTime };
 
   // Paths the session's own shell commands targeted literally (or by a glob), by kind of operation:
   // removed or moved away (rm, git rm, mv, git mv), or rewritten in place (sed -i, perl -i, `>`,
@@ -278,7 +336,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
       // in it is unknown. Blocks whatever the path.
       if (h.labels.some((l) => l.kind === 'unreviewed')) {
         const detail = `could not be diffed as text (git attributes mark it binary, or it is too big or unreadable): ${h.hunk.file}`;
-        hits.push(`- ${h.hunk.file} unreviewed: ${detail}`);
+        hits.push(`- ${prefix}${h.hunk.file} unreviewed: ${detail}`);
         continue;
       }
       let timed = false;
@@ -315,7 +373,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
       }
       for (const l of labels) {
         if (!blocking.has(l.kind)) continue;
-        const hit = `- ${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`;
+        const hit = `- ${prefix}${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`;
         if (!hits.includes(hit)) hits.push(hit);
       }
     }
@@ -326,7 +384,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // blocks without walking the whole working tree.
   if (paths.length) {
     const first = await check(paths, NO_CREDIT);
-    if (first.length) return blocked(payload.transcript_path, first);
+    if (first.length) return first;
   }
 
   // Files a shell command changed without naming them (a script computing the path, `rsync --delete`,
@@ -335,9 +393,16 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // A skip-worktree file missing from the working tree is excused only when the sparse checkout,
   // as the repository's own config and patterns from before the session define it, leaves it out.
   const excluded = await sparseExcluded(root, sparseTrust);
-  const inWindow = windows?.inWindow ?? null;
-  const byWindow = await toolWindowFiles(root, headed ? baseRev : undefined, inWindow, statTime, excluded);
+  const byWindow = await toolWindowFiles(root, headed ? baseRev : undefined, windows, opts.statTime ? statTime : undefined, pathStat, excluded);
   const hits: string[] = [];
+  // Files on another file system mounted inside the repository: their times prove nothing (a FAT
+  // image takes any ctime), so one that differs from the base, or any test or config file there,
+  // blocks as unreviewed.
+  for (const [f, mount] of [...byWindow.foreign].sort(([a], [b]) => (a < b ? -1 : 1))) {
+    if (byWindow.differs.has(f) || isTestFile(f) || isConfigFile(f)) {
+      hits.push(`- ${prefix}${f} unreviewed: on another file system mounted inside the repository (at ${prefix}${mount}), whose change times cannot be trusted`);
+    }
+  }
   // Untracked files credited by time alone are capped: past the cap they are not read, only reported.
   // Both by count and by total size: reading and labelling them is synchronous work.
   const timedNew = [...byWindow.written].filter((f) => byWindow.untracked.has(f)).sort();
@@ -360,7 +425,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   if (over.length) {
     for (const f of over) byWindow.written.delete(f);
     over.sort();
-    hits.push(`- ${over[0]} unreviewed: ${over.length} more untracked files written during this session's tool calls were not reviewed (over the caps of ${MAX_TIMED_UNTRACKED} files and ${byteCap} bytes read), e.g. ${over.slice(0, 3).join(', ')}`);
+    hits.push(`- ${prefix}${over[0]} unreviewed: ${over.length} more untracked files written during this session's tool calls were not reviewed (over the caps of ${MAX_TIMED_UNTRACKED} files and ${byteCap} bytes read), e.g. ${over.slice(0, 3).map((f) => `${prefix}${f}`).join(', ')}`);
   }
   const credit = { written: byWindow.written, removed: byWindow.removed, detached: new Set<string>(), layered: new Set<string>() };
   const all = [...paths];
@@ -372,8 +437,9 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // be told apart from the agent's detached work). Among them, a file gone from the index or HEAD
   // but still on disk was untracked, and counts as deleted, even when the command that did it never
   // named it.
+  const layeredActive = Boolean(windows && repo.metaTimes.some((t) => windows.inWindow(t) || t > windows.lastEnd));
   if (headed && windows) {
-    if (metaTimes.some((t) => windows.inWindow(t) || t > windows.lastEnd)) {
+    if (layeredActive) {
       for (const [args, deletedOnly] of [[[baseRev, 'HEAD'], false], [['--cached', indexBase ?? baseRev], false], [['--diff-filter=D', baseRev, 'HEAD'], true], [['--diff-filter=D', '--cached', indexBase ?? baseRev], true]] as const) {
         const out = await git(root, ['diff', '--name-only', '--no-renames', '-z', ...args, '--'], { trim: false });
         for (const f of out.split('\0')) {
@@ -388,10 +454,90 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
       }
     }
   }
-  if (!all.length) return hits.length ? blocked(payload.transcript_path, hits) : NO_BLOCK;
-  for (const hit of await check(all, credit)) if (!hits.includes(hit)) hits.push(hit);
-  return hits.length ? blocked(payload.transcript_path, hits) : NO_BLOCK;
+  if (all.length) for (const hit of await check(all, credit)) if (!hits.includes(hit)) hits.push(hit);
+  for (const hit of await checkSubmodules(ctx, repo, layeredActive)) if (!hits.includes(hit)) hits.push(hit);
+  return hits;
 }
+
+/**
+ * Every submodule of `repo` (a gitlink in its base, HEAD or index): checked out, it is checked like
+ * the repository itself ({@link checkRepository}), from the commit the base records for it, dated by
+ * its own work tree, index and ref times against the same session windows. It blocks as unreviewed
+ * when it cannot be read: not checked out while its gitlink changed during the session, a directory
+ * holding files but no repository, a symlink or a mount in its place, the recorded commit missing,
+ * or more than {@link MAX_SUBMODULE_DEPTH} levels deep. A clean, unchanged submodule finds nothing.
+ */
+async function checkSubmodules(ctx: SessionCheck, repo: RepoUnderCheck, layeredActive: boolean): Promise<string[]> {
+  const { root, baseRev, headed, indexBase, prefix, depth } = repo;
+  const links = new Map<string, { base?: string; head?: string; index?: string }>();
+  const link = (p: string): { base?: string; head?: string; index?: string } => {
+    let l = links.get(p);
+    if (!l) links.set(p, (l = {}));
+    return l;
+  };
+  for (const e of await indexEntries(root)) if (e.mode === GITLINK) link(e.path).index = e.oid;
+  if (headed) {
+    // Gitlinks gone from the index (removed, or replaced by a directory of files) but in the base or HEAD.
+    for (const revs of [[baseRev, 'HEAD'], ['--cached', indexBase ?? baseRev]]) {
+      const raw = (await git(root, ['diff', '--raw', '-z', '--no-renames', '--no-abbrev', ...revs, '--'], { trim: false })).split('\0');
+      for (let i = 0; i + 1 < raw.length; i += 2) {
+        const [oldMode, newMode] = raw[i]!.replace(/^:/, '').split(' ');
+        if (oldMode === GITLINK || newMode === GITLINK) link(raw[i + 1]!);
+      }
+    }
+  }
+  if (!links.size) return [];
+  const treeLink = async (rev: string, p: string): Promise<string | undefined> => {
+    const out = await git(root, ['ls-tree', '-z', rev, '--', `:(literal)${p}`], { trim: false });
+    const m = /^(\d+) \w+ ([0-9a-f]+)\t/.exec(out);
+    return m && m[1] === GITLINK ? m[2] : undefined;
+  };
+  const rootDev = await deviceOf(root, ctx.pathStat);
+  const real = (p: string): Promise<string> => realpath(p).catch(() => path.resolve(p));
+  const hits: string[] = [];
+  const unreviewed = (p: string, why: string): void => {
+    hits.push(`- ${prefix}${p} unreviewed: submodule ${why}, so its changes were not reviewed`);
+  };
+  for (const [p, l] of [...links].sort(([a], [b]) => (a < b ? -1 : 1))) {
+    if (headed) {
+      l.base = await treeLink(baseRev, p);
+      l.head = await treeLink('HEAD', p);
+    }
+    const changed = headed && new Set([l.base, l.head, l.index].map((x) => x ?? '-')).size > 1;
+    const abs = path.join(root, ...p.split('/'));
+    const st = await lstat(abs).catch(() => undefined);
+    if (!st) {
+      if (changed && layeredActive) unreviewed(p, 'is not checked out, and its recorded commit changed during the session');
+      continue;
+    }
+    if (st.isSymbolicLink() || !st.isDirectory() || (await ctx.pathStat(abs).then((x) => x.dev, () => rootDev)) !== rootDev) {
+      unreviewed(p, 'is a symlink, a file or a mount point in the place of the submodule directory');
+      continue;
+    }
+    const gitEntry = path.join(abs, '.git');
+    const hasGit = await lstat(gitEntry).then(() => true, () => false);
+    const subRoot = hasGit ? await repoRoot(abs).catch(() => undefined) : undefined;
+    if (!subRoot || (await real(subRoot)) !== (await real(abs))) {
+      if (hasGit || (await readdir(abs).catch(() => [] as string[])).length) unreviewed(p, 'holds files but no repository of its own (its .git is missing or points elsewhere)');
+      else if (changed && layeredActive) unreviewed(p, 'is not checked out, and its recorded commit changed during the session');
+      continue;
+    }
+    if (depth + 1 > MAX_SUBMODULE_DEPTH) {
+      unreviewed(p, `is nested more than ${MAX_SUBMODULE_DEPTH} levels deep`);
+      continue;
+    }
+    if (l.base && !(await git(subRoot, ['cat-file', '-e', `${l.base}^{commit}`]).then(() => true, () => false))) {
+      unreviewed(p, `lacks the commit the base records for it (${l.base.slice(0, 12)})`);
+      continue;
+    }
+    const metaTimes = await gitMetaTimes(gitEntry, ctx.statTime, ctx.pathStat);
+    const sub: RepoUnderCheck = { root: subRoot, baseRev: l.base ?? (await emptyTree(subRoot)), headed: await hasHead(subRoot), metaTimes, prefix: `${prefix}${p}/`, depth: depth + 1 };
+    for (const hit of await checkRepository(ctx, sub)) if (!hits.includes(hit)) hits.push(hit);
+  }
+  return hits;
+}
+
+const GITLINK = '160000';
 
 interface Credit {
   /** Files whose own change time lies in a tool call window */
@@ -431,6 +577,34 @@ async function blocked(transcript: string | undefined, hits: string[]): Promise<
   };
 }
 
+/**
+ * Outside any repository: throw {@link FailClosedError} when this session started in one, so a `.git`
+ * moved away during the session (or the repository renamed under the session's directory) cannot
+ * make the guard skip it. Proof: this session's SessionStart record names a root that is the cwd or
+ * contains it (a record that cannot be read proves a repository too); or the transcript carries the
+ * SessionStart failed marker, or the record marker while the record is gone. A transcript that
+ * exists but cannot be read counts as a marker. No record and no marker: not a repository session.
+ */
+async function startedInRepository(payload: GuardPayload, cwd: string, statTime: (p: string) => Promise<number>, pathStat: (p: string) => Promise<PathStat>): Promise<void> {
+  const sessionId = payload.session_id;
+  if (!sessionId) return;
+  const real = (p: string): Promise<string> => realpath(p).catch(() => path.resolve(p));
+  const gone = (why: string): FailClosedError => new FailClosedError(`no .git is found at or above ${cwd}, but ${why}: the repository (or its .git) was moved or removed during the session`);
+  const record = await readBaseRecord(sessionId, statTime, pathStat);
+  if (record) {
+    if (!record.data) throw gone(`this session has a SessionStart base record that cannot be read (${record.file})`);
+    const root = await real(record.data.root);
+    const here = await real(cwd);
+    if (here === root || here.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`)) {
+      throw gone(`this session started in the repository ${record.data.root} (SessionStart record)`);
+    }
+  }
+  // A transcript that does not exist carries no marker; one that cannot be read may hide one.
+  const markers = await transcriptMarkers(payload.transcript_path, sessionId).catch((err: NodeJS.ErrnoException) => (err.code === 'ENOENT' ? { ok: false, failed: false } : { ok: true, failed: true }));
+  if (markers.failed) throw gone('the SessionStart hook ran in a repository for this session (and could not record its base)');
+  if (markers.ok && !record) throw gone('the SessionStart hook recorded a base for this session, and the record is gone');
+}
+
 /** The nearest `.git` entry (directory, file or link) in `dir` or any directory above it, or null. */
 async function findGitEntry(dir: string): Promise<string | null> {
   for (let d = path.resolve(dir); ; d = path.dirname(d)) {
@@ -448,11 +622,12 @@ async function findGitEntry(dir: string): Promise<string | null> {
 /**
  * Change times of the files git rewrites when the index or a ref moves: the index, HEAD's reflog,
  * the ref HEAD points at (its loose file, or `packed-refs` when it has none) and `packed-refs`
- * when present; the HEAD file itself when detached. Read from the file system alone, so no git
+ * when present; the HEAD file itself when detached; with the reftable backend, `reftable/` and every
+ * file in it. Read from the file system alone, so no git
  * process can touch them first. A missing index is dated by the directory that held it. Nothing
  * that cannot be read fails: the times only add credit.
  */
-async function gitMetaTimes(gitEntry: string, timeOf: (p: string) => Promise<number>): Promise<number[]> {
+async function gitMetaTimes(gitEntry: string, statTime: (p: string) => Promise<number>, pathStat: (p: string) => Promise<PathStat>): Promise<number[]> {
   let gitDir = gitEntry;
   try {
     const st = await lstat(gitEntry);
@@ -465,6 +640,12 @@ async function gitMetaTimes(gitEntry: string, timeOf: (p: string) => Promise<num
     return [];
   }
   const common = await readFile(path.join(gitDir, 'commondir'), 'utf8').then((c) => path.resolve(gitDir, c.trim()), () => gitDir);
+  // A file on another device than the work tree (or, for a git dir outside it, than that git dir)
+  // sits on a mount: its time reads as changed after every call (see onDevice).
+  const workTree = path.dirname(gitEntry);
+  const inside = (d: string): boolean => !path.relative(workTree, d).startsWith('..') && !path.isAbsolute(path.relative(workTree, d));
+  const anchor = await deviceOf(inside(common) ? workTree : common, pathStat);
+  const timeOf = onDevice(statTime, pathStat, anchor);
   const time = (p: string): Promise<number | undefined> => timeOf(p).then((t) => t, () => undefined);
   const files: Array<Promise<number | undefined>> = [
     time(path.join(gitDir, 'index')).then((t) => t ?? time(gitDir)),
@@ -475,6 +656,12 @@ async function gitMetaTimes(gitEntry: string, timeOf: (p: string) => Promise<num
   const ref = /^ref:\s*(refs\/\S+)\s*$/.exec(head)?.[1];
   if (ref && !ref.split('/').includes('..')) files.push(time(path.join(common, ...ref.split('/'))));
   else files.push(time(path.join(gitDir, 'HEAD')));
+  // The reftable backend (`extensions.refStorage = reftable`, or `git refs migrate`) keeps every ref
+  // and reflog in `reftable/` (tables.list and the *.ref tables), of the common dir and of a worktree.
+  for (const dir of new Set([path.join(common, 'reftable'), path.join(gitDir, 'reftable')])) {
+    files.push(time(dir));
+    for (const f of await readdir(dir).catch(() => [] as string[])) files.push(time(path.join(dir, f)));
+  }
   return (await Promise.all(files)).filter((t): t is number => t !== undefined);
 }
 
@@ -530,8 +717,10 @@ async function writtenBefore(root: string, sha: string, cutoff: number, timeOf: 
 }
 
 /** The session's base record (see `why-diff session-start`) with its file's change time, if there is one. */
-async function readBaseRecord(sessionId: string, timeOf: (p: string) => Promise<number>): Promise<{ file: string; ctime: number; data?: BaseRecord } | undefined> {
+async function readBaseRecord(sessionId: string, statTime: (p: string) => Promise<number>, pathStat: (p: string) => Promise<PathStat> = lstatOf): Promise<{ file: string; ctime: number; data?: BaseRecord } | undefined> {
   const file = recordPath(sessionId);
+  // A record on another file system than the directory holding the data directory (a mount over it) has no trusted time.
+  const timeOf = onDevice(statTime, pathStat, await deviceOf(path.dirname(dataDir()), pathStat));
   let ctime: number;
   try {
     ctime = await timeOf(file);
@@ -564,6 +753,37 @@ async function changeTime(p: string): Promise<number> {
   return (await lstat(p)).ctimeMs;
 }
 
+/** What the guard reads of a path (lstat: a symlink is never followed). */
+export interface PathStat {
+  dev: number;
+  ctimeMs: number;
+  symlink: boolean;
+}
+
+async function lstatOf(p: string): Promise<PathStat> {
+  const st = await lstat(p);
+  return { dev: Number(st.dev), ctimeMs: st.ctimeMs, symlink: st.isSymbolicLink() };
+}
+
+/** The device of `p` (its file system), or undefined when it cannot be read. */
+async function deviceOf(p: string, pathStat: (p: string) => Promise<PathStat>): Promise<number | undefined> {
+  return pathStat(p).then((st) => st.dev, () => undefined);
+}
+
+/**
+ * `timeOf`, except that a path on another device than `dev` (a file system mounted inside the
+ * repository or the data directory) reads as changed now and forever (Infinity): ctime proves
+ * nothing there, since a user-mounted FAT image or FUSE file system reports any time it likes.
+ */
+function onDevice(timeOf: (p: string) => Promise<number>, pathStat: (p: string) => Promise<PathStat>, dev: number | undefined): (p: string) => Promise<number> {
+  if (dev === undefined) return timeOf;
+  return async (p) => {
+    const t = await timeOf(p);
+    const d = await deviceOf(p, pathStat);
+    return d !== undefined && d !== dev ? Infinity : t;
+  };
+}
+
 /**
  * Changed files (against `rev`, working tree and untracked) and every tracked file, whose change
  * time lies inside one of the session's tool call windows (`written`), and deleted ones whose
@@ -572,25 +792,66 @@ async function changeTime(p: string): Promise<number> {
  * change from git, not from the file's ctime. A human edit after the call moves the time out of
  * every window, so it is never credited; a human edit while an agent tool call is running is (the
  * one edge; long calls, subagents and background processes widen it).
+ *
+ * No symlink is followed: each directory above a file inside the repository is read with lstat. A
+ * symlink there (git sees every file under it as deleted, while a path lookup would find the moved
+ * originals through it) makes the file deleted, dated by the symlink's own change time, and credited
+ * when that lies in a window or after the last one. A directory or file on another device than the
+ * repository root (a mount) is not dated at all: it is returned in `foreign`, with its mount point.
  */
-async function toolWindowFiles(root: string, rev: string | undefined, inWindow: ((ms: number) => boolean) | null, timeOf: (p: string) => Promise<number>, excluded: ((file: string) => boolean) | null): Promise<{ written: Set<string>; removed: Set<string>; untracked: Set<string> }> {
+async function toolWindowFiles(root: string, rev: string | undefined, windows: { inWindow: (ms: number) => boolean; lastEnd: number } | null, statTime: ((p: string) => Promise<number>) | undefined, pathStat: (p: string) => Promise<PathStat>, excluded: ((file: string) => boolean) | null): Promise<{ written: Set<string>; removed: Set<string>; untracked: Set<string>; foreign: Map<string, string>; differs: Set<string> }> {
   const written = new Set<string>();
   const removed = new Set<string>();
   const untracked = new Set<string>();
-  if (!inWindow) return { written, removed, untracked };
+  const foreign = new Map<string, string>();
+  const differs = new Set<string>();
+  if (!windows) return { written, removed, untracked, foreign, differs };
+  const { inWindow, lastEnd } = windows;
+  const timeOf = statTime ?? changeTime;
 
   const changed = await git(root, ['diff', '--name-only', '--no-renames', '-z', rev ?? (await emptyTree(root)), '--'], { trim: false });
   const entries = await indexEntries(root);
   // Skip-worktree files the sparse checkout leaves out are expected to be missing.
   const sparse = await sparseMissing(root, entries, excluded);
   for (const f of await listUntracked(root)) untracked.add(f);
-  const files = [...new Set([...changed.split('\0').filter(Boolean), ...entries.map((e) => e.path), ...untracked])]
-    .filter((f) => !f.startsWith('.why-diff/') && !sparse.has(f));
+  for (const f of changed.split('\0')) if (f) differs.add(f);
+  for (const f of untracked) differs.add(f);
+  // Gitlinks are submodules: checked on their own (see checkSubmodules).
+  const gitlinks = new Set(entries.filter((e) => e.mode === GITLINK).map((e) => e.path));
+  const files = [...new Set([...differs, ...entries.map((e) => e.path)])]
+    .filter((f) => !f.startsWith('.why-diff/') && !sparse.has(f) && !gitlinks.has(f));
   // `git rev-parse --show-toplevel` prints `C:/x` on Windows: resolve it so the walk below compares like with like.
   const top = path.resolve(root);
+  const rootDev = await deviceOf(top, pathStat);
   const gone = (err: unknown): boolean => {
     if (GONE.has((err as NodeJS.ErrnoException).code ?? '')) return true;
     throw err;
+  };
+  // Each directory inside the repository, read once: fine, missing (or not a directory), a symlink,
+  // or on another device. A directory under a symlink or a mount takes that state from it.
+  type DirState = { kind: 'ok' | 'gone' } | { kind: 'symlink' | 'foreign'; at: string };
+  const dirStates = new Map<string, Promise<DirState>>();
+  const dirState = (rel: string): Promise<DirState> => {
+    if (!rel || rel === '.') return Promise.resolve({ kind: 'ok' });
+    let st = dirStates.get(rel);
+    if (!st) {
+      st = dirState(path.posix.dirname(rel)).then(async (up) => {
+        if (up.kind !== 'ok') return up;
+        const abs = path.join(top, ...rel.split('/'));
+        let ps: PathStat;
+        try {
+          ps = await pathStat(abs);
+        } catch (err) {
+          gone(err);
+          return { kind: 'gone' };
+        }
+        if (ps.symlink) return { kind: 'symlink', at: rel };
+        if (rootDev !== undefined && ps.dev !== rootDev) return { kind: 'foreign', at: rel };
+        return { kind: 'ok' };
+      });
+      dirStates.set(rel, st);
+    }
+    return st;
   };
   // Deleted: date it by the nearest path above it that still exists (up to the repo root). A parent
   // replaced by a file (ENOTDIR) or a symlink loop (ELOOP) is gone as a directory too. One lookup per directory.
@@ -609,12 +870,30 @@ async function toolWindowFiles(root: string, rev: string | undefined, inWindow: 
   };
   for (let i = 0; i < files.length; i += LSTAT_BATCH) {
     await Promise.all(files.slice(i, i + LSTAT_BATCH).map(async (f) => {
+      const up = await dirState(path.posix.dirname(f));
+      if (up.kind === 'symlink') {
+        // Never followed: the file is gone from the repository, removed when the symlink appeared.
+        const t = await timeOf(path.join(top, ...up.at.split('/'))).catch(() => Infinity);
+        if (inWindow(t) || t > lastEnd) removed.add(f);
+        return;
+      }
+      if (up.kind === 'foreign') {
+        foreign.set(f, up.at);
+        return;
+      }
       const abs = path.join(top, ...f.split('/'));
       let t: number | undefined;
-      try {
-        t = await timeOf(abs);
-      } catch (err) {
-        gone(err);
+      if (up.kind === 'ok') {
+        try {
+          const ps = await pathStat(abs);
+          if (rootDev !== undefined && ps.dev !== rootDev) {
+            foreign.set(f, f);
+            return;
+          }
+          t = statTime ? await statTime(abs) : ps.ctimeMs;
+        } catch (err) {
+          gone(err);
+        }
       }
       if (t !== undefined) {
         if (inWindow(t)) written.add(f);
@@ -624,7 +903,7 @@ async function toolWindowFiles(root: string, rev: string | undefined, inWindow: 
       if (d !== undefined && inWindow(d)) removed.add(f);
     }));
   }
-  return { written, removed, untracked };
+  return { written, removed, untracked, foreign, differs };
 }
 
 /**
