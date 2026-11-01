@@ -68,6 +68,14 @@ export interface DiffOptions {
    * content of each instead of trusting the index (the guard). Fails closed.
    */
   contentIndex?: boolean;
+  /**
+   * Working tree targets with `baseRev` (the guard): also diff `baseRev` against HEAD and against the
+   * index, for the files among `paths` that differ there, so a change kept only in a commit or only
+   * staged (the working tree put back) still shows. Returned apart in {@link DetailedDiff.layers}.
+   */
+  committedLayers?: boolean;
+  /** With {@link committedLayers}: diff the index against this tree (the index at session start) instead of the base */
+  indexBase?: string;
 }
 
 /** How far the guard trusts a sparse checkout (see {@link sparseExcluded}). */
@@ -340,6 +348,8 @@ export interface DetailedDiff {
   diff: string;
   /** Repo paths git showed as binary because of attributes, whose text could not be produced */
   unreviewed: string[];
+  /** With {@link DiffOptions.committedLayers}: base against HEAD, and base against the index */
+  layers?: { head: string; index: string };
 }
 
 /** {@link getDiff}, also listing the files whose real content could not be shown. */
@@ -410,6 +420,26 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
     }
   }
 
+  let layers: DetailedDiff['layers'];
+  if (opts.committedLayers && target.baseRev && opts.paths?.length && (await hasHead(cwd))) {
+    layers = { head: '', index: '' };
+    try {
+      for (const [layer, revs] of [['head', [baseRev, 'HEAD']], ['index', ['--cached', opts.indexBase ?? baseRev]]] as const) {
+        // Tree to tree and index to tree: blob ids only, no stat data and no working tree reads.
+        const nameArgs = ['diff', '--name-only', '--no-renames', '-z', ...revs];
+        const names = (match ? (await git(root, nameArgs, { trim: false })).split('\0').filter(match) : (await gitPaths(root, nameArgs, opts.paths)).split('\0'))
+          .filter((f) => f && !f.startsWith('.why-diff/'));
+        if (!names.length) continue;
+        const args = [...common, ...revs];
+        const shown = await revealTextMarkedBinary(root, args, await gitPaths(root, args, [...new Set(names)].map((f) => `:(literal)${f}`)));
+        layers[layer] = shown.diff;
+        unreviewed.push(...shown.unreviewed);
+      }
+    } catch (err) {
+      throw err instanceof FailClosedError ? err : new FailClosedError(`cannot diff the session base against HEAD and the index (${(err as Error).message})`);
+    }
+  }
+
   if (target.includeUntracked !== false) {
     const untracked = match ? (await listUntracked(cwd)).filter(match) : await listUntracked(cwd, opts.paths);
     for (const rel of untracked) {
@@ -423,7 +453,7 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
       }
     }
   }
-  return { diff, unreviewed };
+  return { diff, unreviewed, ...(layers ? { layers } : {}) };
 }
 
 /** One `git ls-files -s -v` entry. */

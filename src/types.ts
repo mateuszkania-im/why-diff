@@ -138,6 +138,8 @@ export interface Hunk {
   newLines: number;
   header: string;
   lines: DiffLine[];
+  /** The guard only: the hunk shows the session base against HEAD (`head`) or the index (`index`), not the working tree */
+  layer?: 'head' | 'index';
 }
 
 /** How confident the hunk->edit match is. */

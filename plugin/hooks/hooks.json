@@ -1,6 +1,13 @@
 {
-  "description": "why-diff guard: stop the agent from finishing silently after skipping, weakening or deleting tests, or touching CI and secrets. Runs the bundled CLI locally (no network).",
+  "description": "why-diff guard: stop the agent from finishing silently after skipping, weakening or deleting tests, or touching CI and secrets (SessionStart records the commit the session starts from). Runs the bundled CLI locally (no network).",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/why-diff.mjs\" session-start", "timeout": 10 }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

@@ -418,7 +418,9 @@ interface Pattern {
  * every pattern needs a call, member access or decorator shape.
  */
 const SKIP_PATTERNS: readonly Pattern[] = [
-  { re: /\b(?:describe|it|test|context|suite|specify|bench)\s*\.\s*(skip|only|todo|fixme|fails)\b/, name: '.$1' },
+  { re: /\b(?:describe|it|test|context|suite|specify|bench)\s*\.\s*(skip|only|todo|fixme|fails|skipIf)\b/, name: '.$1' },
+  // Vitest `it.runIf(cond)(...)`: a skip whenever the condition is false.
+  { re: /\b(?:describe|it|test|context|suite|specify|bench)\s*\.\s*(runIf)\s*\(/, name: '.$1' },
   { re: /(?<![\w$.])(xit|xdescribe|xtest|xcontext|xspecify|fit|fdescribe|fcontext)\s*[(\s]/, name: '$1', testOnly: true },
   { re: /@pytest\.mark\.(skip|skipif|xfail)\b/, name: '@pytest.mark.$1' },
   { re: /\bpytest\.(skip|xfail)\s*\(/, name: 'pytest.$1()' },
@@ -455,15 +457,35 @@ function matchPatterns(
   return hits;
 }
 
+/** `it["skip"]` / `it['only']` / ``it[`skip`]``: bracket access spelled as the member it names. */
+const BRACKET_MODIFIER = /\b(describe|it|test|context|suite|specify|bench)\s*\[\s*(["'`])(skip|only|todo|fixme|fails|skipIf|runIf)\2\s*\]/g;
+/** A test (or hook-less test body) opener ending the line: `it("x", () => {`, `test('x', async function () {`. */
+const TEST_OPENER = /(?<![\w$.])(?:it|test|specify)(?:\s*\.\s*\w+)?\s*\(.*(?:=>|\bfunction\b\s*\w*\s*\([^)]*\))\s*\{\s*$/;
+const BARE_RETURN = /^\s*return\s*;?\s*$/;
+
 function detectTestSkips(path: string, lines: DiffLine[]): string[] {
   const style = commentStyle(path);
   if (PROSE_EXT.has(extOf(path))) return [];
   const inTest = isTestFile(path);
   const hits: string[] = [];
-  for (const l of netAdded(lines)) {
+  const added = netAdded(lines);
+  for (const l of added) {
     // Ruby `skip "reason"`: keep the string so the lookahead can see it.
-    const text = extOf(path) === 'rb' ? l.text.replace(/#.*$/, '') : codeOf(l.text, style);
+    const raw = extOf(path) === 'rb' ? l.text : l.text.replace(BRACKET_MODIFIER, '$1.$3');
+    const text = extOf(path) === 'rb' ? raw.replace(/#.*$/, '') : codeOf(raw, style);
     hits.push(...matchPatterns(text, SKIP_PATTERNS, path, inTest, true));
+  }
+  if (inTest && SLASH_COMMENT_EXT.has(extOf(path))) {
+    // A bare `return` added as the first statement of a test body: the rest never runs.
+    const fresh = new Set(added);
+    let prev: string | undefined;
+    for (const l of lines) {
+      if (l.type === 'del') continue;
+      const code = codeOf(l.text, style);
+      if (!code.trim()) continue;
+      if (fresh.has(l) && BARE_RETURN.test(code) && prev !== undefined && TEST_OPENER.test(prev)) hits.push('early return');
+      prev = code;
+    }
   }
   return uniq(hits);
 }
@@ -813,6 +835,8 @@ interface Assertion {
   operands: string[];
   /** Contents of string literals on the original line (expected text, messages). */
   literals: string[];
+  /** `expect(subject)` forms only: the normalised value under test. */
+  subject?: string;
 }
 
 /** Canonical matcher aliases across frameworks. */
@@ -935,7 +959,7 @@ function parseAssertion(line: string, path: string): Assertion | null {
       expected = m[2] ? balanced(after, 0).inner : after.replace(/[;)\s]+$/, '');
     }
     const operands = [norm(subject.inner), ...splitTopLevel(expected).map(norm)].filter((o) => o !== '');
-    return { ...base, matcher: canonicalMatcher(display), display, negated, operands };
+    return { ...base, matcher: canonicalMatcher(display), display, negated, operands, ...(norm(subject.inner) ? { subject: norm(subject.inner) } : {}) };
   }
 
   // Continuation of a multi-line chain: `).toBe(5)` / `.not.toEqual(x)`
@@ -1058,6 +1082,34 @@ function literalChange(d: Assertion, a: Assertion, aliases: Aliases): { from: st
 }
 
 /**
+ * The value under test (`expect(subject)`) replaced by a literal, or by the value the old assertion
+ * expected (`expect(f(3)).toBe(3)` to `expect(3).toBe(3)`): the assertion no longer tests the code.
+ */
+function subjectToExpected(d: Assertion, a: Assertion, aliases: Aliases): string | null {
+  if (d.subject === undefined || a.subject === undefined || d.subject === a.subject) return null;
+  if (LITERAL.test(d.subject) || aliases.get(a.subject) === d.subject) return null;
+  const expected = d.operands.slice(1);
+  if (!LITERAL.test(a.subject) && !STRING_ONLY.test(a.subject) && !expected.includes(a.subject)) return null;
+  return `subject changed from ${clip(d.subject, 40)} to ${clip(a.subject, 40)} (${a.display} now compares a fixed value)`;
+}
+/** Equality matchers (`toBe`, `toEqual`, `toStrictEqual` and their aliases). */
+const EQUALITY: ReadonlySet<string> = new Set(['equal', 'strictequal']);
+
+/** `expect(x).toBe(x)` (whitespace ignored) introduced by the change: it can never fail. */
+function selfCompare(d: Assertion, a: Assertion): string | null {
+  const same = (x: Assertion): boolean => x.subject !== undefined && !x.negated && EQUALITY.has(x.matcher) && x.operands.length === 2 && x.operands[1] === x.subject;
+  return same(a) && !same(d) ? `${a.display} now compares the value with itself (${clip(a.subject ?? '', 40)})` : null;
+}
+
+/** A positive equality matcher turned into a `.not` equality matcher on the same subject: almost any value passes. */
+function notAdded(d: Assertion, a: Assertion, aliases: Aliases): string | null {
+  if (d.negated || !a.negated || !EQUALITY.has(d.matcher) || !EQUALITY.has(a.matcher) || d.subject === undefined || a.subject === undefined) return null;
+  const resolve = (o: string): string => aliases.get(o) ?? o;
+  return resolve(d.subject) === resolve(a.subject) ? `.not added: ${d.display} turned into .not.${a.display}` : null;
+}
+const STRING_ONLY = /^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\$]|\\.)*`)$/;
+
+/**
  * Removed or weakened assertions within a single hunk.
  *
  * 1. Parse every `-` and `+` line that looks like an assertion.
@@ -1115,6 +1167,11 @@ function detectAssertionChanges(path: string, lines: DiffLine[]): string[] {
   }
 
   for (const [d, a] of pairs) {
+    const fixed = subjectToExpected(d, a, aliases) ?? selfCompare(d, a) ?? notAdded(d, a, aliases);
+    if (fixed) {
+      findings.push(fixed);
+      continue;
+    }
     const rd = rankOf(d);
     const ra = rankOf(a);
     if (rd !== null && ra !== null && ra < rd) {
