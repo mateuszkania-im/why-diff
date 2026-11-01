@@ -7,7 +7,7 @@
  */
 
 import { execFile, spawn } from 'node:child_process';
-import { lstat, open, readFile, readlink, realpath, stat } from 'node:fs/promises';
+import { copyFile, lstat, mkdtemp, open, readFile, readlink, realpath, rm, stat } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -177,8 +177,8 @@ async function gitEnv(cwd: string): Promise<NodeJS.ProcessEnv> {
  * Run git in `cwd` without a shell. Resolves with trimmed-right stdout.
  * `-c core.quotePath=false` keeps non-ASCII paths readable in diff headers; see {@link SAFE_CONFIG}.
  */
-export async function git(cwd: string, args: string[], opts: { trim?: boolean; maxBuffer?: number } = {}): Promise<string> {
-  const env = await gitEnv(cwd);
+export async function git(cwd: string, args: string[], opts: { trim?: boolean; maxBuffer?: number; env?: Record<string, string> } = {}): Promise<string> {
+  const env = { ...(await gitEnv(cwd)), ...opts.env };
   try {
     const { stdout } = await execFileAsync('git', [...SAFE_CONFIG, ...args], {
       cwd,
@@ -315,6 +315,26 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
   const pathspec = opts.paths?.length ? ['--', ...opts.paths] : [];
   const revealed = await revealTextMarkedBinary(cwd, [...common, baseRev], await git(cwd, [...common, baseRev, ...pathspec], { trim: false }));
   let diff = revealed.diff;
+  const unreviewed = [...revealed.unreviewed];
+  // Files flagged assume-unchanged or skip-worktree: git diff takes their index entry for the
+  // working tree file, so a change to them would not show. Diff them again through a copy of the
+  // index with the flags cleared (the real index is never touched).
+  const hidden = await indexFlagged(cwd, opts.paths).catch(() => null);
+  if (hidden === null) throw new FailClosedError('cannot list index entries flagged assume-unchanged or skip-worktree');
+  if (hidden.length) {
+    const own = await diffWithoutIndexFlags(cwd, [...common, baseRev], hidden).catch(() => null);
+    if (own === null) {
+      unreviewed.push(...hidden);
+    } else {
+      const names = new Set(hidden);
+      const kept = splitSections(diff).filter((section) => {
+        const h = parseUnifiedDiff(section)[0];
+        return !h || !(names.has(h.file) || (h.oldFile !== undefined && names.has(h.oldFile)));
+      });
+      diff = kept.join('') + own.diff;
+      unreviewed.push(...own.unreviewed);
+    }
+  }
 
   if (target.includeUntracked !== false) {
     const root = await repoRoot(cwd);
@@ -324,7 +344,49 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
       if (synthetic) diff += synthetic;
     }
   }
-  return { diff, unreviewed: revealed.unreviewed };
+  return { diff, unreviewed };
+}
+
+/**
+ * Index entries flagged assume-unchanged (lowercase tag in `git ls-files -v`) or skip-worktree
+ * (`S`). In a sparse checkout (`core.sparseCheckout`), a skip-worktree file missing from the working
+ * tree is expected and left out.
+ */
+async function indexFlagged(cwd: string, paths?: string[]): Promise<string[]> {
+  const root = await repoRoot(cwd);
+  const out = await git(root, ['ls-files', '-v', '-z', ...(paths?.length ? ['--', ...paths] : [])], { trim: false });
+  const sparse = (await git(root, ['config', '--bool', 'core.sparseCheckout']).catch(() => '')) === 'true';
+  const flagged: string[] = [];
+  for (const entry of out.split('\0')) {
+    if (entry.length < 3 || entry[1] !== ' ') continue;
+    const tag = entry[0]!;
+    const file = entry.slice(2);
+    const skipWorktree = tag === 'S' || tag === 's';
+    if (!(skipWorktree || (tag >= 'a' && tag <= 'z'))) continue;
+    if (skipWorktree && sparse && !(await lstat(path.join(root, file)).then(() => true, () => false))) continue;
+    flagged.push(file);
+  }
+  return [...new Set(flagged)];
+}
+
+/** `args` (a `git diff` up to its base revision) for `files`, against a temporary copy of the index without their flags. */
+async function diffWithoutIndexFlags(cwd: string, args: string[], files: string[]): Promise<DetailedDiff> {
+  const root = await repoRoot(cwd);
+  const index = path.resolve(root, await git(root, ['rev-parse', '--git-path', 'index']));
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'why-diff-index-'));
+  try {
+    const copy = path.join(dir, 'index');
+    await copyFile(index, copy);
+    const env = { GIT_INDEX_FILE: copy };
+    const literal = files.map((f) => `:(literal)${f}`);
+    // One flag per call: git applies only the first of the two to the paths when both are given.
+    await git(root, ['update-index', '--no-skip-worktree', '--', ...files], { env });
+    await git(root, ['update-index', '--no-assume-unchanged', '--', ...files], { env });
+    const raw = await git(root, [...args, '--', ...literal], { trim: false, env });
+    return await revealTextMarkedBinary(root, args, raw);
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 /** Git's binary sniff: a NUL byte within the first this many bytes of either side. */

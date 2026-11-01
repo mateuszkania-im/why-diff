@@ -2635,7 +2635,7 @@ import { lstat as lstat2, readFile as readFile6, stat as stat4 } from "node:fs/p
 
 // src/git.ts
 import { execFile, spawn } from "node:child_process";
-import { lstat, open, readFile, readlink, realpath, stat } from "node:fs/promises";
+import { copyFile, lstat, mkdtemp, open, readFile, readlink, realpath, rm, stat } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path2 from "node:path";
@@ -2920,7 +2920,7 @@ async function gitEnv(cwd) {
   return { ...baseEnv(), ...await filterEnv(cwd) };
 }
 async function git(cwd, args, opts = {}) {
-  let env = await gitEnv(cwd);
+  let env = { ...await gitEnv(cwd), ...opts.env };
   try {
     let { stdout } = await execFileAsync("git", [...SAFE_CONFIG, ...args], {
       cwd,
@@ -2993,7 +2993,20 @@ async function getDiffUnwrapped(cwd, target, opts) {
   }
   let baseRev;
   target.baseRev && await hasHead(cwd) ? baseRev = target.baseRev : await hasHead(cwd) ? baseRev = target.base ? await mergeBase(cwd, target.base, "HEAD") : "HEAD" : baseRev = await emptyTree(cwd);
-  let pathspec = opts.paths?.length ? ["--", ...opts.paths] : [], revealed = await revealTextMarkedBinary(cwd, [...common, baseRev], await git(cwd, [...common, baseRev, ...pathspec], { trim: !1 })), diff = revealed.diff;
+  let pathspec = opts.paths?.length ? ["--", ...opts.paths] : [], revealed = await revealTextMarkedBinary(cwd, [...common, baseRev], await git(cwd, [...common, baseRev, ...pathspec], { trim: !1 })), diff = revealed.diff, unreviewed = [...revealed.unreviewed], hidden = await indexFlagged(cwd, opts.paths).catch(() => null);
+  if (hidden === null) throw new FailClosedError("cannot list index entries flagged assume-unchanged or skip-worktree");
+  if (hidden.length) {
+    let own = await diffWithoutIndexFlags(cwd, [...common, baseRev], hidden).catch(() => null);
+    if (own === null)
+      unreviewed.push(...hidden);
+    else {
+      let names = new Set(hidden);
+      diff = splitSections(diff).filter((section) => {
+        let h = parseUnifiedDiff(section)[0];
+        return !h || !(names.has(h.file) || h.oldFile !== void 0 && names.has(h.oldFile));
+      }).join("") + own.diff, unreviewed.push(...own.unreviewed);
+    }
+  }
   if (target.includeUntracked !== !1) {
     let root = await repoRoot(cwd), untracked = await listUntracked(cwd, opts.paths);
     for (let rel of untracked) {
@@ -3001,7 +3014,30 @@ async function getDiffUnwrapped(cwd, target, opts) {
       synthetic && (diff += synthetic);
     }
   }
-  return { diff, unreviewed: revealed.unreviewed };
+  return { diff, unreviewed };
+}
+async function indexFlagged(cwd, paths) {
+  let root = await repoRoot(cwd), out = await git(root, ["ls-files", "-v", "-z", ...paths?.length ? ["--", ...paths] : []], { trim: !1 }), sparse = await git(root, ["config", "--bool", "core.sparseCheckout"]).catch(() => "") === "true", flagged = [];
+  for (let entry of out.split("\0")) {
+    if (entry.length < 3 || entry[1] !== " ") continue;
+    let tag = entry[0], file = entry.slice(2), skipWorktree = tag === "S" || tag === "s";
+    (skipWorktree || tag >= "a" && tag <= "z") && (skipWorktree && sparse && !await lstat(path2.join(root, file)).then(() => !0, () => !1) || flagged.push(file));
+  }
+  return [...new Set(flagged)];
+}
+async function diffWithoutIndexFlags(cwd, args, files) {
+  let root = await repoRoot(cwd), index = path2.resolve(root, await git(root, ["rev-parse", "--git-path", "index"])), dir = await mkdtemp(path2.join(os.tmpdir(), "why-diff-index-"));
+  try {
+    let copy = path2.join(dir, "index");
+    await copyFile(index, copy);
+    let env = { GIT_INDEX_FILE: copy }, literal = files.map((f) => `:(literal)${f}`);
+    await git(root, ["update-index", "--no-skip-worktree", "--", ...files], { env }), await git(root, ["update-index", "--no-assume-unchanged", "--", ...files], { env });
+    let raw = await git(root, [...args, "--", ...literal], { trim: !1, env });
+    return await revealTextMarkedBinary(root, args, raw);
+  } finally {
+    await rm(dir, { recursive: !0, force: !0 }).catch(() => {
+    });
+  }
 }
 var BINARY_SNIFF = 8e3;
 async function revealTextMarkedBinary(cwd, args, diff) {

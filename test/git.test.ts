@@ -634,3 +634,37 @@ describe('getDiff: attributes, textconv and fsmonitor cannot hide changes', () =
   });
 });
 
+describe('getDiff: index flags cannot hide working tree changes', () => {
+  function flagged(flag: string): string {
+    const repo = freshRepo();
+    put(repo, 'a.test.js', 'it("a", () => {});\n');
+    put(repo, 'clean.test.js', 'it("c", () => {});\n');
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-qm', 'init');
+    sh(repo, 'update-index', flag, 'a.test.js', 'clean.test.js');
+    return repo;
+  }
+  const added = (diff: string, file: string): string[] =>
+    parseUnifiedDiff(diff).filter((h) => h.file === file).flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.text));
+  for (const flag of ['--skip-worktree', '--assume-unchanged']) {
+    it(`shows a change to a file flagged ${flag}, and nothing for a clean flagged file`, async () => {
+      const repo = flagged(flag);
+      put(repo, 'a.test.js', 'it.skip("a", () => {});\n');
+      const diff = await getDiff(repo, { workingTree: true });
+      expect(added(diff, 'a.test.js')).toEqual(['it.skip("a", () => {});']);
+      expect(parseUnifiedDiff(diff).some((h) => h.file === 'clean.test.js')).toBe(false);
+    });
+    it(`shows the deletion of a file flagged ${flag}`, async () => {
+      const repo = flagged(flag);
+      rmSync(path.join(repo, 'a.test.js'));
+      expect(parseUnifiedDiff(await getDiff(repo, { workingTree: true })).find((h) => h.file === 'a.test.js')?.status).toBe('deleted');
+    });
+  }
+  it('leaves the index flags as they were', async () => {
+    const repo = flagged('--skip-worktree');
+    put(repo, 'a.test.js', 'it.skip("a", () => {});\n');
+    await getDiff(repo, { workingTree: true });
+    expect(sh(repo, 'ls-files', '-v', 'a.test.js')).toBe('S a.test.js');
+  });
+});
+
