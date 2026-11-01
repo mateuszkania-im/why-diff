@@ -223,14 +223,24 @@ program
   .option('-s, --session <files...>', 'explicit transcript file(s) instead of auto-discovery')
   .option('--since <date>', 'only consider sessions after this date (ISO)')
   .option('--scan-all', 'also scan transcripts started outside the repo that edited files in it; slower')
+  .option('-c, --classify [backend]', 'LLM intent check, stored as each hunk\'s verdict: auto | claude-cli | anthropic | openai', false)
+  .option('-m, --model <model>', 'model for the intent check (default: haiku)')
   .option('--redact-prompts', 'omit prompt text from the note (secrets are always masked)')
   .option('--dry-run', 'print the note JSON instead of writing it')
   .option('-q, --quiet', 'no progress output')
   .action(async (o: Record<string, unknown>) => {
     const progress = (msg: string) => { if (!o.quiet) process.stderr.write(pc.dim(`· ${terminalSafe(msg)}\n`)); };
+    let classify: ClassifierKind = 'none';
+    if (o.classify === true) classify = 'auto';
+    else if (o.classify) {
+      if (!CLASSIFIERS.includes(o.classify as ClassifierKind)) throw new Error(`unknown --classify backend "${String(o.classify)}" (use ${CLASSIFIERS.join(', ')})`);
+      classify = o.classify as ClassifierKind;
+    }
     const built = await buildReport({
       base: o.base as string | undefined,
       committedOnly: true,
+      classify,
+      model: o.model as string | undefined,
       harnesses: parseHarnesses(o.harness),
       sessionFiles: o.session as string[] | undefined,
       since: parseSince(o.since),

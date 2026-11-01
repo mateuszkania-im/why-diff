@@ -109,7 +109,7 @@ git push origin refs/notes/why-diff            # share it
 ```
 
 - The note is compact JSON per hunk: file, new line range, match, intent verdict
-  (when `--classify` ran earlier it is not rerun here), label kinds, and the
+  (with `--classify`), label kinds, and the
   prompt text (cut to 1500 characters, secrets masked; `--redact-prompts`
   leaves it out) with its session id and harness.
 - `--dry-run` prints the JSON instead of writing it. `--base`, `--harness`,
