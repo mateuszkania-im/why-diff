@@ -1222,3 +1222,29 @@ describe('sec033 #6: label gaps', () => {
     expect(kinds(hunk('test/a.test.js', ['-  expect(out).toBe(3);', '+  expect(result).toBe(3);']))).not.toContain('assertion-removed');
   });
 });
+
+describe('sec033 #6b: tautologies and an added .not', () => {
+  it.each([
+    ['-  expect(f(3)).toBe(3);', '+  expect(f(3)).toBe(f(3));'],
+    ['-  expect(total(cart)).toEqual(30);', '+  expect(total(cart)).toEqual(total( cart ));'],
+    ['-  expect(out).toStrictEqual({ a: 1 });', '+  expect(out).toStrictEqual(out);'],
+  ])('flags a tautology introduced by the change: %s -> %s', (del, add) => {
+    expect(find(hunk('test/a.test.js', [del, add]), 'assertion-removed')?.detail).toContain('compares the value with itself');
+  });
+
+  it('does not flag a tautology that was already there', () => {
+    expect(kinds(hunk('test/a.test.js', ['-  expect(x).toBe(x); // old', '+  expect(x).toBe(x);']))).not.toContain('assertion-removed');
+  });
+
+  it.each([
+    ['-  expect(f(3)).toBe(3);', '+  expect(f(3)).not.toBe(999);'],
+    ['-  expect(f(3)).toEqual([1]);', '+  expect(f(3)).not.toEqual([2]);'],
+    ['-  expect(out).toStrictEqual(a);', '+  expect(out).not.toStrictEqual(b);'],
+  ])('flags a positive matcher turned into .not on the same subject: %s -> %s', (del, add) => {
+    expect(find(hunk('test/a.test.js', [del, add]), 'assertion-removed')?.detail).toContain('.not');
+  });
+
+  it('accepts a .not matcher kept as is', () => {
+    expect(kinds(hunk('test/a.test.js', ['-  expect(f(3)).not.toBe(a);', '+  expect(f(3)).not.toBe(b);']))).not.toContain('assertion-removed');
+  });
+});

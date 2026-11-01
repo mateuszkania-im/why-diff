@@ -1092,6 +1092,21 @@ function subjectToExpected(d: Assertion, a: Assertion, aliases: Aliases): string
   if (!LITERAL.test(a.subject) && !STRING_ONLY.test(a.subject) && !expected.includes(a.subject)) return null;
   return `subject changed from ${clip(d.subject, 40)} to ${clip(a.subject, 40)} (${a.display} now compares a fixed value)`;
 }
+/** Equality matchers (`toBe`, `toEqual`, `toStrictEqual` and their aliases). */
+const EQUALITY: ReadonlySet<string> = new Set(['equal', 'strictequal']);
+
+/** `expect(x).toBe(x)` (whitespace ignored) introduced by the change: it can never fail. */
+function selfCompare(d: Assertion, a: Assertion): string | null {
+  const same = (x: Assertion): boolean => x.subject !== undefined && !x.negated && EQUALITY.has(x.matcher) && x.operands.length === 2 && x.operands[1] === x.subject;
+  return same(a) && !same(d) ? `${a.display} now compares the value with itself (${clip(a.subject ?? '', 40)})` : null;
+}
+
+/** A positive equality matcher turned into a `.not` equality matcher on the same subject: almost any value passes. */
+function notAdded(d: Assertion, a: Assertion, aliases: Aliases): string | null {
+  if (d.negated || !a.negated || !EQUALITY.has(d.matcher) || !EQUALITY.has(a.matcher) || d.subject === undefined || a.subject === undefined) return null;
+  const resolve = (o: string): string => aliases.get(o) ?? o;
+  return resolve(d.subject) === resolve(a.subject) ? `.not added: ${d.display} turned into .not.${a.display}` : null;
+}
 const STRING_ONLY = /^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\$]|\\.)*`)$/;
 
 /**
@@ -1152,9 +1167,9 @@ function detectAssertionChanges(path: string, lines: DiffLine[]): string[] {
   }
 
   for (const [d, a] of pairs) {
-    const tautology = subjectToExpected(d, a, aliases);
-    if (tautology) {
-      findings.push(tautology);
+    const fixed = subjectToExpected(d, a, aliases) ?? selfCompare(d, a) ?? notAdded(d, a, aliases);
+    if (fixed) {
+      findings.push(fixed);
       continue;
     }
     const rd = rankOf(d);
