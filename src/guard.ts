@@ -10,7 +10,7 @@
  * the guard reads (a truncated index, an unreadable file), and that must not let it finish unchecked.
  */
 import { constants as fsConstants, createReadStream, realpath as realpathCb } from 'node:fs';
-import { access, lstat, readdir, readFile, realpath, stat, statfs } from 'node:fs/promises';
+import { access, lstat, open, readdir, readFile, realpath, stat, statfs } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import readline from 'node:readline';
 import os from 'node:os';
@@ -623,6 +623,16 @@ async function checkSubmodules(ctx: SessionCheck, repo: RepoUnderCheck, layeredA
       continue;
     }
     const rec = ctx.recordedSubmodules?.[key];
+    // Without devices recorded for it, a submodule's own worktree git dir (a linked worktree) on
+    // another device than its parent directory could be a volume mounted over it during the session.
+    if (rec?.rootDev === undefined && rec?.gitDev === undefined && subGitDir !== subCommon) {
+      const realGitDir = await real(subGitDir);
+      const [here, up] = await Promise.all([deviceOf(realGitDir, ctx.pathStat), deviceOf(path.dirname(realGitDir), ctx.pathStat)]);
+      if (here === undefined || here !== up) {
+        unreviewed(p, 'has its worktree git dir at the root of its own volume, and no SessionStart record kept its device');
+        continue;
+      }
+    }
     const subGitDev = await deviceOf(subCommon, ctx.pathStat);
     if (rec?.rootDev !== undefined || rec?.gitDev !== undefined) {
       const rootNow = await deviceOf(await real(subRoot), ctx.pathStat);
@@ -990,6 +1000,8 @@ export interface MountEntry {
   options: string[];
   /** Linux mountinfo `major:minor` */
   majorMinor?: string;
+  /** Linux mountinfo mount ID (first field) */
+  mountId?: string;
 }
 // eslint-disable-next-line no-control-regex
 const CONTROL = /[\x00-\x1f\x7f]/;
@@ -1013,7 +1025,8 @@ export function parseLinuxMountinfo(text: string): MountEntry[] {
     if (f.length < 6 || r.length < 3 || !/^\d+:\d+$/.test(f[2]!)) throw new Error(`unreadable mountinfo line ${JSON.stringify(line.slice(0, 120))}`);
     const mountPoint = unescape(f[4]!);
     if (CONTROL.test(mountPoint)) throw new Error(`mount point with a control character ${JSON.stringify(mountPoint)}`);
-    return { source: unescape(r[1]!), mountPoint, type: r[0]!, options: [...f[5]!.split(','), ...r[2]!.split(',')], majorMinor: f[2]! };
+    if (!/^\d+$/.test(f[0]!)) throw new Error(`unreadable mountinfo line ${JSON.stringify(line.slice(0, 120))}`);
+    return { source: unescape(r[1]!), mountPoint, type: r[0]!, options: [...f[5]!.split(','), ...r[2]!.split(',')], majorMinor: f[2]!, mountId: f[0]! };
   });
 }
 let mountTable: Promise<MountEntry[]> | undefined;
@@ -1051,17 +1064,46 @@ export async function pickMount(entries: MountEntry[], real: string, dev: bigint
   const prefix = (mp: string): boolean => real === mp || real.startsWith(mp.endsWith('/') ? mp : `${mp}/`);
   return same.sort((a, b) => Number(prefix(b.mountPoint)) - Number(prefix(a.mountPoint)) || b.mountPoint.length - a.mountPoint.length)[0]!;
 }
+/** File system types whose files report the mount's own device, so mountinfo's major:minor cross-checks the mount ID. */
+const SINGLE_DEVICE_FS: ReadonlySet<string> = new Set(['ext2', 'ext3', 'ext4', 'xfs', 'tmpfs']);
+/**
+ * Linux: the mountinfo entry of the mount an open file belongs to, by the `mnt_id` its
+ * `/proc/self/fdinfo/<fd>` names (exact for btrfs subvolumes, whose `st_dev` is an anonymous device
+ * that never equals mountinfo's major:minor, and for bind mounts). On file systems that report the
+ * mount's own device, the device must match too. Throws when nothing matches (exported for tests).
+ */
+export function pickLinuxMount(entries: MountEntry[], fdinfo: string, dev: bigint): MountEntry {
+  const id = /^mnt_id:\s*(\d+)\s*$/m.exec(fdinfo)?.[1];
+  if (!id) throw new Error('no mnt_id in fdinfo');
+  const entry = entries.find((m) => m.mountId === id);
+  if (!entry) throw new Error(`no mountinfo entry has mount ID ${id}`);
+  if (SINGLE_DEVICE_FS.has(entry.type) && entry.majorMinor !== linuxMajorMinor(dev)) throw new Error(`mount ${id} (${entry.mountPoint}) is device ${entry.majorMinor}, the path is ${linuxMajorMinor(dev)}`);
+  return entry;
+}
+/** Linux: `/proc/self/fdinfo` of `real`, opened read-only (a directory too) and closed again. */
+async function linuxFdinfo(real: string): Promise<string> {
+  const fh = await open(real, 'r');
+  try {
+    return await readFile(`/proc/self/fdinfo/${fh.fd}`, 'utf8');
+  } finally {
+    await fh.close();
+  }
+}
+
 /**
  * Why the file system holding `p` was mounted by a user (who can then write any time into it: an
  * HFS+ or ext4 image with crafted dates), or undefined. The entry is found by device ({@link pickMount});
  * untrusted: `mounted by <user>`, `nobrowse` outside `/System/Volumes`, or a disk image (macOS); FUSE,
- * udisks2, or under `/media` or `/run/media` (Linux). A mount table that cannot be read throws.
+ * or under `/media` or `/run/media` (Linux). On Linux the entry is found by mount ID ({@link pickLinuxMount}).
+ * A mount table that cannot be read throws.
  */
 async function userMountOf(p: string): Promise<string | undefined> {
   if (process.platform !== 'darwin' && process.platform !== 'linux') return undefined;
   const real = await realpath(p);
   const dev = (await stat(real, { bigint: true })).dev;
-  const best = await pickMount(await mounts(), real, dev, (mp) => stat(mp, { bigint: true }).then((st) => st.dev, () => undefined));
+  const best = process.platform === 'linux'
+    ? pickLinuxMount(await mounts(), await linuxFdinfo(real), dev)
+    : await pickMount(await mounts(), real, dev, (mp) => stat(mp, { bigint: true }).then((st) => st.dev, () => undefined));
   const describe = `${best.source} on ${best.mountPoint} (${[best.type, ...best.options].join(', ')})`;
   if (process.platform === 'darwin') {
     if (best.options.some((o) => o.startsWith('mounted by'))) return describe;
@@ -1070,7 +1112,9 @@ async function userMountOf(p: string): Promise<string | undefined> {
     if (/disk image/i.test(best.options.join(','))) return describe;
     return undefined;
   }
-  if (best.type.startsWith('fuse') || best.options.includes('uhelper=udisks2') || /^\/(run\/)?media\//.test(`${best.mountPoint}/`)) return describe;
+  // udisks2 mounts what a user plugs in or attaches under /media or /run/media (its mount option
+  // `uhelper=udisks2` lives in /run/mount/utab, not in mountinfo).
+  if (best.type.startsWith('fuse') || /^\/(run\/)?media\//.test(`${best.mountPoint}/`)) return describe;
   return undefined;
 }
 
