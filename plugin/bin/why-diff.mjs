@@ -5450,6 +5450,8 @@ function resolvePath(dir, p) {
   let expanded = p;
   return (expanded === "~" || expanded.startsWith("~/")) && (expanded = os.homedir() + expanded.slice(1)), path4.resolve(dir, expanded);
 }
+var LEXER_SPECIAL = /* @__PURE__ */ new Set(["\\", "'", '"', "$", "`", "#", " ", "	", `
+`, ";", "(", ")", "&", "|", "<", ">"]);
 function tokenize(input) {
   let tokens = [], pendingHeredocs = [], buf = "", mask2 = "", inWord = !1, i = 0, add = (text2, kind) => {
     buf += text2, mask2 += kind.repeat(text2.length);
@@ -5550,7 +5552,9 @@ function tokenize(input) {
         for (; i < input.length && /[\d-]/.test(input[i] ?? ""); ) i++;
       continue;
     }
-    add(ch, "u"), inWord = !0, i++;
+    let j = i + 1;
+    for (; j < input.length && !LEXER_SPECIAL.has(input[j] ?? ""); ) j++;
+    add(input.slice(i, j), "u"), inWord = !0, i = j;
   }
   return flush(), pendingHeredocs.length && readHeredocBodies(), tokens;
 }

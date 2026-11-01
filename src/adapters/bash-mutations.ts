@@ -840,6 +840,9 @@ function resolvePath(dir: string, p: string): string {
 // Lexer
 // ---------------------------------------------------------------------------
 
+/** Characters the lexer must look at one by one. */
+const LEXER_SPECIAL = new Set(['\\', "'", '"', '$', '`', '#', ' ', '\t', '\n', ';', '(', ')', '&', '|', '<', '>']);
+
 /** Tokenise a shell command line into words, operators and redirections. */
 export function tokenize(input: string): Token[] {
   const tokens: Token[] = [];
@@ -1026,9 +1029,12 @@ export function tokenize(input: string): Token[] {
       }
       continue;
     }
-    add(ch, 'u');
+    // An ordinary character: take the whole run of ordinary characters at once.
+    let j = i + 1;
+    while (j < input.length && !LEXER_SPECIAL.has(input[j] ?? '')) j++;
+    add(input.slice(i, j), 'u');
     inWord = true;
-    i++;
+    i = j;
   }
   flush();
   if (pendingHeredocs.length) readHeredocBodies();
