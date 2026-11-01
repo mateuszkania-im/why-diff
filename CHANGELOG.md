@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.4
+
+### Security
+
+Closes the label gaps left documented in 0.3.3. In JavaScript and TypeScript test files, these restructurings of existing assertions now carry a blocking label, so the guard blocks:
+
+- A constant-false guard (`if (false)`, `if (0)`, `if (!true)`, `if (null)`, `if (undefined)`) around existing `expect` / `assert` lines, or right before one, counts as `test-skip-added`.
+- An added `try` around existing assertions whose `catch` neither rethrows nor asserts counts as `assertion-removed`. A try that checks `.toThrow` or `rejects` is fine.
+- A binding that shadows a test global (`it`, `test`, `describe`, `expect`, `assert`, the hooks...) counts as `test-skip-added`. This covers a top-level `const` / `let` / `var` / `function`, an indented one that the hunk then calls, and an import of those names from anything other than a test framework (vitest, `@jest/globals`, `node:test`, mocha, chai, `bun:test`, `@playwright/test`, `node:assert`). `require` from a framework, `chai.expect` and `test.extend(...)` fixtures are fine.
+- Existing assertions moved into an added function literal that is never called (an arrow or function expression that starts the line, or a function declaration, whose name appears nowhere else in the file after the change) count as `test-skip-added`. A callback argument such as `it(...)`, `waitFor(() => {` or a continued `forEach(` is not a wrapper. The pipeline now reads the full text of changed JavaScript/TypeScript test files for this check.
+
+### Documentation
+
+- README Limitations: label heuristics are lexical and can still be evaded by sufficiently indirect code, which is inherent to any checker that does not run the tests.
+
 ## 0.3.3
 
 ### Security

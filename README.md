@@ -153,7 +153,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # required: a shallow clone has no merge base
-      - uses: mateuszkania-im/why-diff@v0.3.3
+      - uses: mateuszkania-im/why-diff@v0.3.4
         with:
           fail-on: risk    # optional
 ```
@@ -185,7 +185,7 @@ npx -y github:mateuszkania-im/why-diff --version
 That runs the committed standalone file `plugin/bin/why-diff.mjs` (one file, zero dependencies, nothing to build). From v0.2.0 each release also has a tarball, which skips the git clone and is faster:
 
 ```bash
-npx -y https://github.com/mateuszkania-im/why-diff/releases/download/v0.3.3/why-diff.tgz --version
+npx -y https://github.com/mateuszkania-im/why-diff/releases/download/v0.3.4/why-diff.tgz --version
 ```
 
 Tip: `alias why-diff="npx -y github:mateuszkania-im/why-diff"`.
@@ -294,7 +294,7 @@ Reports stay small on big diffs: every edit a hunk references is stored once in 
 - Git is run so that repository settings cannot change what it shows: no textconv, external diff, fsmonitor, filter drivers (`clean` / `process` / `smudge`), user attributes file, replace refs or grafts, and no inherited `GIT_*` environment variable (`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_CONFIG_*`...). Files flagged `assume-unchanged` or `skip-worktree` are diffed as if unflagged. The guard goes further: every file the session touched is diffed through a temporary index that keeps only blob ids, so git hashes the working tree content instead of trusting the index's stat data or flags, and a tracked file whose change time falls in a tool call window is checked even when `git diff` lists nothing. A skip-worktree file missing from the working tree counts as sparse, not deleted, only when the sparse patterns leave it out (cone directories, or the full patterns), `core.sparseCheckout` comes from the repository's own config (not `~/.gitconfig`, `$XDG_CONFIG_HOME` or the environment), and both the config file holding it and the patterns file predate the session. Any change to the repository's config during the session (even `git config core.editor vi`) therefore makes the guard treat every skip-worktree file missing from the working tree as deleted: in a sparse checkout it can block on test files outside the cone. Pathspec lists too long for one command line are split, or matched once over the whole tree. A file that `.gitattributes` or `.git/info/attributes` marks binary is diffed again as text unless its content is binary by git's own rule (a NUL byte in the first 8000 bytes); NUL bytes later in a text file show as `␀`. A file whose text still cannot be produced (over 64 MB of diff) gets the `unreviewed` risk label, and the guard blocks on it.
 - Besides the working tree, the guard diffs the base against HEAD and against the index, so a weakening kept only in a commit or only staged blocks too. A file that differs there, or that was untracked (gone from the index or HEAD, still on disk) by a command that never named it, is credited to the agent when the index, the branch ref, HEAD's reflog or `packed-refs` changed during one of its tool calls or after the last one; a human commit, `git rm --cached` or even an IDE's `git status` made while an agent call runs or after the agent's last call is credited too, so staged or committed changes from before the session can block then.
 - The guard reads at most 2000 untracked files (32 MB in all) credited by change time alone; any more block as `unreviewed` without being read. `why-diff guard` runs the check in a child process and kills it after 20 seconds, then blocks and says so; called as a library, `runGuard` has only a best-effort time limit that cannot interrupt synchronous work. The guard also blocks when git's work tree is not the directory holding the `.git` entry (`core.worktree`, or a `.git` file elsewhere pointing back).
-- Label heuristics can be evaded by restructuring code; the guard catches common weakenings, not every semantic one.
+- Label heuristics are lexical and can still be evaded by sufficiently indirect code, which is inherent to any checker that does not run the tests.
 - When the guard cannot finish checking a session that touched the repository (any `.git` entry at or above the cwd counts as one, even one git cannot read) (an unreadable or truncated index, a temporary index it cannot build, any other error), it blocks and says why rather than letting the agent finish. A session with no tool calls never blocks.
 - The guard trusts the session transcript, which the agent can rewrite (it is a file in your home directory). An agent that edits its own transcript to remove or alter its tool calls can hide changes from the guard; the guard is a check against careless or quietly risky edits, not a sandbox.
 - `chmod`, `chown` and `touch` never explain changed lines, and a bare `.` explains files below it only for restores (`git checkout -- .`) and formatters (`prettier --write .`).
