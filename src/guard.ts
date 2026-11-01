@@ -5,7 +5,9 @@
  * Scoped on purpose: only the files the session's transcript edited are diffed, against the last
  * commit before the session started (so edits the agent already committed still count), and only
  * hunks that the session's edits exactly explain can block. A human's uncommitted change in the
- * same file never does. Every internal error means "do not block".
+ * same file never does. Once the session is known to have touched the repository (or its transcript
+ * cannot be read), any error while checking it blocks, with the reason: the agent can break what
+ * the guard reads (a truncated index, an unreadable file), and that must not let it finish unchecked.
  */
 import { createReadStream } from 'node:fs';
 import { lstat, readdir, readFile } from 'node:fs/promises';
@@ -47,25 +49,40 @@ export interface GuardResult {
 const NO_BLOCK: GuardResult = { block: false, hits: [] };
 
 export async function runGuard(payload: GuardPayload, opts: GuardOptions): Promise<GuardResult> {
+  const state = { relevant: false };
   try {
-    return await guard(payload, opts);
+    return await guard(payload, opts, state);
   } catch (err) {
-    // Fail closed only where git could be made to hide the agent's changes (a filter driver that
-    // cannot be switched off, an unreadable config): say so instead of letting the agent finish.
-    if (err instanceof FailClosedError) {
-      const hit = `- why-diff could not check this session's changes: ${err.message}`;
-      return { block: true, hits: [hit], message: `why-diff guard: ${hit.slice(2)}\n\nTell the user that the repository's git configuration stops why-diff from reading the real content of your changes, and what you changed, so they can check it.\n` };
+    // Fail closed: git could be made to hide the agent's changes (a filter driver that cannot be
+    // switched off, an index that cannot be read), or anything else went wrong while checking a
+    // session that touched this repository. Say so instead of letting the agent finish.
+    if (err instanceof FailClosedError || state.relevant) {
+      let reason = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim();
+      if (reason.length > MAX_REASON) reason = `${reason.slice(0, MAX_REASON)}...`;
+      const hit = `- why-diff could not check this session: ${reason}`;
+      return {
+        block: true,
+        hits: [hit],
+        message: `why-diff guard: ${hit.slice(2)}\n\nTell the user that why-diff could not check the changes you made in this session (the reason is above), and what you changed, so they can check it.\n`,
+      };
     }
-    return NO_BLOCK; // never break the user's session because of why-diff itself
+    return NO_BLOCK; // not a session that touched this repository: never break it because of why-diff
   }
 }
 
-async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardResult> {
+const MAX_REASON = 400;
+
+async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevant: boolean }): Promise<GuardResult> {
   if (payload.stop_hook_active) return NO_BLOCK; // already blocked once this turn: let the agent explain and stop
   if (!payload.transcript_path) return NO_BLOCK;
 
-  const root = await repoRoot(payload.cwd ?? process.cwd());
+  const root = await repoRoot(payload.cwd ?? process.cwd()); // not a git repository: nothing to check
+  // From here on an error blocks: an unreadable transcript could hide what the session did.
+  state.relevant = true;
   const session = await claudeCodeAdapter.parse(payload.transcript_path);
+  // A session with no edits and no tool calls cannot have touched the repository.
+  state.relevant = session.edits.some((e) => !e.failed) || (session.toolWindows?.length ?? 0) > 0;
+  if (!state.relevant) return NO_BLOCK;
   const roots = [root, ...(await worktreeRoots(root))].flatMap(rootVariants).sort((a, b) => b.length - a.length);
   const cwdVariants = rootVariants(session.cwd);
   const icase = await isCaseInsensitive(root);
@@ -318,7 +335,7 @@ async function sessionBase(root: string, startedAt: number, timeOf: (p: string) 
 
   // A shallow boundary moved during the session can cut history short: no base can be trusted.
   const shallow = path.resolve(root, await git(root, ['rev-parse', '--git-path', 'shallow']));
-  const shallowTime = await timeOf(shallow).catch(() => undefined);
+  const shallowTime = await timeOf(shallow).catch((err: NodeJS.ErrnoException) => (err.code === 'ENOENT' ? undefined : Infinity));
   if (shallowTime !== undefined && shallowTime >= cutoff) throw new FailClosedError('the shallow history boundary (.git/shallow) changed during the session');
 
   // Only this repository's own object store counts: a commit found only through alternates is untrusted.
@@ -330,7 +347,10 @@ async function sessionBase(root: string, startedAt: number, timeOf: (p: string) 
     if (!oldPacks) {
       oldPacks = [];
       const dir = path.join(main, 'pack');
-      const files = await readdir(dir).catch(() => [] as string[]);
+      const files = await readdir(dir).catch((err: NodeJS.ErrnoException) => {
+        if (err.code === 'ENOENT') return [] as string[];
+        throw err;
+      });
       // A pack index rewritten during the session could list anything: no pack can be trusted then.
       for (const f of files.filter((x) => x.endsWith('.idx'))) {
         if ((await timeOf(path.join(dir, f)).catch(() => Infinity)) >= cutoff) throw new FailClosedError('a pack index (.git/objects/pack/*.idx) changed during the session');

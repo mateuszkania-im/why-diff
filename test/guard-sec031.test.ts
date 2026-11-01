@@ -63,6 +63,37 @@ async function guardRun(repo: string, home: string, calls: (t: number) => Synthe
   return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's31' }, { blocking: BL, home, objectTime: oldObjects, ...opts });
 }
 
+describe('sec031 #1: an error while checking a session that touched the repo blocks', () => {
+  it('a truncated .git/index after an it.skip edit blocks with a clear reason', async () => {
+    const { repo, home, tp } = makeRepo();
+    skipT5(tp);
+    const fd = openSync(path.join(repo, '.git', 'index'), 'r+');
+    ftruncateSync(fd, 10);
+    closeSync(fd);
+    const r = await guardRun(repo, home, (t) => [editCall(t, tp), bash(t + 5000, 'truncate -s 10 .git/index')]);
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('why-diff could not check this session');
+  });
+
+  it('a temporary index that cannot be created (unusable TMPDIR) blocks on a flagged file', async () => {
+    const { repo, home, tp } = makeRepo();
+    skipT5(tp);
+    sh(repo, ['update-index', '--assume-unchanged', TEST]);
+    for (const k of ['TMPDIR', 'TMP', 'TEMP']) process.env[k] = path.join(repo, 'no-such-dir', 'tmp');
+    const r = await guardRun(repo, home, (t) => [editCall(t, tp), bash(t + 5000, `git update-index --assume-unchanged ${TEST}`)]);
+    expect(r.block).toBe(true);
+  });
+
+  it('a session that never touched the repo does not block on a broken index', async () => {
+    const { repo, home } = makeRepo();
+    const fd = openSync(path.join(repo, '.git', 'index'), 'r+');
+    ftruncateSync(fd, 10);
+    closeSync(fd);
+    const r = await guardRun(repo, home, () => []);
+    expect(r.block).toBe(false);
+  });
+});
+
 describe('sec031 #2: no unbounded path list on a git command line', () => {
   // Long paths so a few thousand of them overflow ARG_MAX (1 MiB on macOS, 2 MiB on Linux, 32K chars on Windows).
   const win = process.platform === 'win32';
