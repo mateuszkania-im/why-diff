@@ -277,10 +277,10 @@ async function toolWindowFiles(root: string, rev: string | undefined, session: S
  * 2. otherwise HEAD's first-parent history: the first commit not written during the session;
  * 3. otherwise fail closed ({@link FailClosedError}).
  *
- * A commit counts as written before the session only when it is a loose object (in this store or an
- * alternate) whose file changed before the session started, or, not being loose, when no pack file
- * in any store was written during the session. An alternates list changed during the session fails
- * closed. A base that is no longer an ancestor of HEAD (an amend, a rebase) becomes its merge base.
+ * A commit counts as written before the session only when it is a loose object of this repository's
+ * own store whose file changed before the session started, or sits in one of its packs whose file
+ * did. Objects reachable only through alternates are never trusted. A `.git/shallow` changed during
+ * the session fails closed. A base that is no longer an ancestor of HEAD becomes its merge base.
  */
 async function sessionBase(root: string, startedAt: number, timeOf: (p: string) => Promise<number>): Promise<string> {
   if (!Number.isFinite(startedAt)) throw new FailClosedError('the transcript has no session start time');
@@ -290,31 +290,26 @@ async function sessionBase(root: string, startedAt: number, timeOf: (p: string) 
     return m ? { sha: m[1]!, at: Number(m[2]) * 1000 } : null;
   }).filter((e): e is { sha: string; at: number } => e !== null);
 
+  // A shallow boundary moved during the session can cut history short: no base can be trusted.
+  const shallow = path.resolve(root, await git(root, ['rev-parse', '--git-path', 'shallow']));
+  const shallowTime = await timeOf(shallow).catch(() => undefined);
+  if (shallowTime !== undefined && shallowTime >= cutoff) throw new FailClosedError('the shallow history boundary (.git/shallow) changed during the session');
+
+  // Only this repository's own object store counts: a commit found only through alternates is untrusted.
   const main = path.resolve(root, await git(root, ['rev-parse', '--git-path', 'objects']));
-  const stores = [main];
-  const alternatesFile = path.join(main, 'info', 'alternates');
-  const alternates = await readFile(alternatesFile, 'utf8').catch(() => undefined);
-  if (alternates !== undefined) {
-    if ((await timeOf(alternatesFile).catch(() => Infinity)) >= cutoff) throw new FailClosedError('the object alternates list changed during the session');
-    for (const line of alternates.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'))) stores.push(path.resolve(main, line));
-  }
-  let packedDuringSession: boolean | undefined;
+  let oldPacks: string[] | undefined;
   const writtenBefore = async (sha: string): Promise<boolean> => {
-    for (const store of stores) {
-      const t = await timeOf(path.join(store, sha.slice(0, 2), sha.slice(2))).catch(() => undefined);
-      if (t !== undefined) return t < cutoff;
-    }
-    // Packed: its own write time is unknown, so trust it only if no pack was written during the session.
-    if (packedDuringSession === undefined) {
-      packedDuringSession = false;
-      for (const store of stores) {
-        const dir = path.join(store, 'pack');
-        for (const f of (await readdir(dir).catch(() => [] as string[])).filter((x) => x.endsWith('.pack'))) {
-          if ((await timeOf(path.join(dir, f)).catch(() => Infinity)) >= cutoff) packedDuringSession = true;
-        }
+    const loose = await timeOf(path.join(main, sha.slice(0, 2), sha.slice(2))).catch(() => undefined);
+    if (loose !== undefined) return loose < cutoff;
+    if (!oldPacks) {
+      oldPacks = [];
+      const dir = path.join(main, 'pack');
+      for (const f of (await readdir(dir).catch(() => [] as string[])).filter((x) => x.endsWith('.pack'))) {
+        if ((await timeOf(path.join(dir, f)).catch(() => Infinity)) < cutoff) oldPacks.push(path.join(dir, `${f.slice(0, -5)}.idx`));
       }
     }
-    return !packedDuringSession;
+    for (const idx of oldPacks) if (await packIndexHas(idx, sha)) return true;
+    return false;
   };
   const isCommit = (sha: string): Promise<boolean> => git(root, ['cat-file', '-e', `${sha}^{commit}`]).then(() => true, () => false);
 
@@ -337,6 +332,27 @@ async function sessionBase(root: string, startedAt: number, timeOf: (p: string) 
   const ancestor = await git(root, ['merge-base', '--is-ancestor', base, 'HEAD']).then(() => true, () => false);
   if (!ancestor) base = await git(root, ['merge-base', base, 'HEAD']).catch(() => base!);
   return base;
+}
+
+/** Is `sha` listed in this pack index (version 2: magic, version, 256-entry fan-out, sorted names)? */
+async function packIndexHas(idxPath: string, sha: string): Promise<boolean> {
+  const buf = await readFile(idxPath).catch(() => undefined);
+  if (!buf || buf.length < 8 + 1024 || buf.readUInt32BE(0) !== 0xff744f63 || buf.readUInt32BE(4) !== 2) return false;
+  const want = Buffer.from(sha, 'hex');
+  const len = want.length;
+  const first = want[0]!;
+  let lo = first === 0 ? 0 : buf.readUInt32BE(8 + (first - 1) * 4);
+  let hi = buf.readUInt32BE(8 + first * 4);
+  const names = 8 + 1024;
+  if (names + hi * len > buf.length) return false;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    const c = buf.compare(want, 0, len, names + mid * len, names + (mid + 1) * len);
+    if (c === 0) return true;
+    if (c < 0) lo = mid + 1;
+    else hi = mid;
+  }
+  return false;
 }
 
 const REMOVE_OPS: ReadonlySet<string> = new Set(['delete', 'move']);

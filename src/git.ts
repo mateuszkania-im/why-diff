@@ -8,6 +8,8 @@
 
 import { execFile, spawn } from 'node:child_process';
 import { lstat, open, readFile, readlink, realpath, stat } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { parseUnifiedDiff } from './diff-parse.js';
@@ -124,7 +126,7 @@ const filterOverrides = new Map<string, Promise<Record<string, string>>>();
 function filterEnv(cwd: string): Promise<Record<string, string>> {
   let found = filterOverrides.get(cwd);
   if (!found) {
-    found = execFileAsync('git', ['config', '-z', '--name-only', '--get-regexp', '^filter\\.'], { cwd, encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } })
+    found = execFileAsync('git', ['config', '-z', '--name-only', '--get-regexp', '^filter\\.'], { cwd, encoding: 'utf8', env: baseEnv() })
       .then(({ stdout }) => stdout, (err: NodeJS.ErrnoException & { code?: number | string; stdout?: string; stderr?: string }) => {
         // exit 1 with no output: no filter configured
         if ((err.code as unknown) === 1 && !err.stdout && !err.stderr) return '';
@@ -159,9 +161,16 @@ function filterEnv(cwd: string): Promise<Record<string, string>> {
   return found;
 }
 
-/** Environment for every git process: no optional locks, C locale, filter drivers off. */
+/**
+ * Environment for every git process: no optional locks, C locale, no replace refs and no grafts
+ * (either could make a commit read as another one), and filter drivers off.
+ */
+const NO_GRAFTS = path.join(os.tmpdir(), `why-diff-no-grafts-${randomBytes(8).toString('hex')}`);
+function baseEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: NO_GRAFTS };
+}
 async function gitEnv(cwd: string): Promise<NodeJS.ProcessEnv> {
-  return { ...process.env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', ...(await filterEnv(cwd)) };
+  return { ...baseEnv(), ...(await filterEnv(cwd)) };
 }
 
 /**
@@ -430,7 +439,7 @@ function blobHeads(cwd: string, shas: string[], n: number): Promise<Map<string, 
   const heads = new Map<string, Buffer>();
   if (!shas.length) return Promise.resolve(heads);
   return new Promise((resolve, reject) => {
-    const child = spawn('git', [...SAFE_CONFIG, 'cat-file', '--batch'], { cwd, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' }, stdio: ['pipe', 'pipe', 'ignore'] });
+    const child = spawn('git', [...SAFE_CONFIG, 'cat-file', '--batch'], { cwd, env: baseEnv(), stdio: ['pipe', 'pipe', 'ignore'] });
     // cat-file --batch reads raw objects: no filters apply.
     let pending: Buffer = Buffer.alloc(0);
     let current: { sha: string; left: number; head: Buffer[]; kept: number } | null = null;

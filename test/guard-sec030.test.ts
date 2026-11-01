@@ -445,19 +445,66 @@ describe('sec030 #7: the session base does not trust committer dates', () => {
     expect(r.message).toContain('could not check');
   });
 
-  it('fails closed when the object alternates list changed during the session', async () => {
-    const { repo, home } = makeRepo();
-    const other = temp('wd-sec-alt-');
-    sh(other, ['init', '-q', '--bare']);
-    writeFileSync(path.join(repo, '.git', 'objects', 'info', 'alternates'), `${path.join(other, 'objects')}\n`);
+  it('does not trust a base commit found only in an alternate object store (fails closed)', async () => {
+    const { repo: origin, home } = makeRepo();
+    const repo = temp('wd-sec-shared-');
+    execFileSync('git', ['clone', '-q', '--shared', origin, repo], { stdio: 'pipe' });
+    const fp = path.join(repo, 'test', 'f.test.js');
     const t0 = Date.now() - 120_000;
     const transcript = writeSyntheticTranscript(home, repo, 's-alt', [{ prompt: 'tidy', at: iso(t0), calls: [
+      { tool: 'Edit', at: iso(t0 + 10_000), input: { file_path: fp, old_string: 'it("t5"', new_string: 'it("t5 renamed"' } },
+    ] }]);
+    writeFileSync(fp, readFileSync(fp, 'utf8').replace('it("t5"', 'it("t5 renamed"'));
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-alt' }, { blocking: BL, home, objectTime: oldObjects });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('could not check');
+  });
+
+  it('ignores git replace refs: a pre-session base replaced by the agent commit still shows the change', async () => {
+    const { repo, home } = makeRepo();
+    const t0 = Date.now() - 120_000;
+    const transcript = writeSyntheticTranscript(home, repo, 's-repl', [{ prompt: 'fix', at: iso(t0), calls: [
+      { tool: 'Edit', at: iso(t0 + 10_000), input: { file_path: tp(repo), old_string: 'it("t5"', new_string: 'it.skip("t5"' } },
+      bash(t0 + 20_000, 'git stash && git commit ... && git replace'),
+    ] }]);
+    const objectTime = setupCommitOld(repo);
+    const init = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    skipT5(repo);
+    sh(repo, ['commit', '-qam', 'wip']);
+    const wip = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    sh(repo, ['reset', '-q', '--soft', init]);
+    sh(repo, ['replace', init, wip]);
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-repl' }, { blocking: BL, home, objectTime });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('test-skip-added');
+  });
+
+  it('fails closed when .git/shallow changed during the session', async () => {
+    const { repo, home } = makeRepo();
+    const init = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    writeFileSync(path.join(repo, '.git', 'shallow'), `${init}\n`);
+    const t0 = Date.now() - 120_000;
+    const transcript = writeSyntheticTranscript(home, repo, 's-sh', [{ prompt: 'tidy', at: iso(t0), calls: [
       { tool: 'Edit', at: iso(t0 + 10_000), input: { file_path: path.join(repo, 'fix.js'), old_string: 'const fs', new_string: 'const fs2' } },
     ] }]);
-    const alt = path.join(repo, '.git', 'objects', 'info', 'alternates');
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-alt' }, { blocking: BL, home, objectTime: async (p) => (p === alt ? Date.now() : 0) });
+    const shallow = path.join(repo, '.git', 'shallow');
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sh' }, { blocking: BL, home, objectTime: async (p) => (p === shallow ? Date.now() : oldObjects(p)) });
     expect(r.block).toBe(true);
-    expect(r.message).toContain('alternates');
+    expect(r.message).toContain('shallow');
+  });
+
+  it('trusts a base commit inside a pack that predates the session', async () => {
+    const { repo, home } = makeRepo();
+    sh(repo, ['gc', '-q']);
+    const t0 = Date.now() - 120_000;
+    const transcript = writeSyntheticTranscript(home, repo, 's-oldpk', [{ prompt: 'fix', at: iso(t0), calls: [
+      { tool: 'Edit', at: iso(t0 + 10_000), input: { file_path: tp(repo), old_string: 'it("t5"', new_string: 'it.skip("t5"' } },
+    ] }]);
+    skipT5(repo);
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-oldpk' }, { blocking: BL, home, objectTime: oldObjects });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('test-skip-added');
+    expect(r.message).not.toContain('could not check');
   });
 
   it('does not trust a packed commit when a pack was written during the session', async () => {
