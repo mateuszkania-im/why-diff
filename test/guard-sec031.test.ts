@@ -394,3 +394,26 @@ describe('sec031 #7: inherited GIT_* variables do not steer the guard', () => {
 
 });
 
+
+describe('sec031 follow-up: an untracked file too big to read is a finding, not a silent pass', () => {
+  const big = (repo: string): string => {
+    const f = path.join(repo, 'test', 'huge.test.js');
+    writeFileSync(f, `it.skip("x", () => {});\n${'// pad\n'.repeat(400_000)}`);
+    return f;
+  };
+  it('the guard blocks on a session-written untracked file over 2 MB', async () => {
+    const { repo, home } = makeRepo();
+    const f = big(repo);
+    const r = await guardRun(repo, home, (t) => [{ tool: 'Write', at: iso(t), input: { file_path: f, content: 'x' } }]);
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('test/huge.test.js');
+    expect(r.message).toContain('unreviewed');
+  });
+  it('getDiffDetailed lists it as unreviewed with a hunk of its own', async () => {
+    const { repo } = makeRepo();
+    big(repo);
+    const { diff, unreviewed } = await getDiffDetailed(repo, { workingTree: true });
+    expect(unreviewed).toContain('test/huge.test.js');
+    expect(parseUnifiedDiff(diff).some((h) => h.file === 'test/huge.test.js')).toBe(true);
+  });
+});

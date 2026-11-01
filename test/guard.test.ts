@@ -298,17 +298,17 @@ describe('runGuard', () => {
     expect(readFileSync(path.join(repo, '.why-diff', 'guard-state.json'), 'utf8')).toBe('{"s1": null, "s2": 42, "s3": "abc"}');
   });
 
-  it('skips a huge untracked file the agent wrote (2 MB cap): cost does not grow with its size', async () => {
+  it('blocks on a huge untracked file the agent wrote (2 MB cap, unreviewed) without reading it: cost does not grow with its size', async () => {
     const { repo, home } = makeRepo();
     const big = path.join(repo, 'dump.log');
     const transcript = writeSyntheticTranscript(home, repo, 's-big', [{ prompt: 'write a dump', at: SESSION_AT, calls: [{ tool: 'Write', at: CALL_AT, input: { file_path: big, content: 'it.skip("x")\n' } }] }]);
     const timeWith = async (mb: number): Promise<number> => {
       writeFileSync(big, Buffer.alloc(mb * 1024 * 1024, 'a'));
-      let block = true;
+      let block = false;
       const ms = await bestOfAsync(async () => {
         block = (await runGuard({ transcript_path: transcript, cwd: repo, session_id: `s-big-${mb}` }, { blocking: BLOCKING, home, objectTime: oldObjects })).block;
       });
-      expect(block).toBe(false);
+      expect(block).toBe(true);
       return ms;
     };
     try {

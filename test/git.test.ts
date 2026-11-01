@@ -467,13 +467,15 @@ describe.skipIf(process.platform === 'win32')('untracked symlinks', () => {
 });
 
 describe('untracked size cap', () => {
-  it('skips untracked files over 2 MB but keeps small ones', async () => {
+  it('does not read untracked files over 2 MB: a binary stub, listed unreviewed; small ones in full', async () => {
     const dir = freshRepo();
     put(dir, 'big.txt', 'a'.repeat(3 * 1024 * 1024));
     put(dir, 'small.txt', 'hi\n');
-    const diff = await getDiff(dir, { workingTree: true });
-    expect(diff).toContain('small.txt');
-    expect(diff).not.toContain('big.txt');
+    const { diff, unreviewed } = await getDiffDetailed(dir, { workingTree: true });
+    expect(diff).toContain('+hi');
+    expect(diff).toContain('Binary files /dev/null and b/big.txt differ');
+    expect(diff).not.toContain('aaaa');
+    expect(unreviewed).toEqual(['big.txt']);
   });
 });
 

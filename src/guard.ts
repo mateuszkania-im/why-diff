@@ -166,11 +166,12 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
 
   const hits: string[] = [];
   for (const h of report.hunks) {
-    // Fail closed: git attributes show a file the session touched (the diff covers only files it
-    // edited, named in a command, or changed during one of its calls) as binary and its text could
-    // not be produced, so what changed in it is unknown. Blocks whatever the path.
+    // Fail closed: the text of a file the session touched (the diff covers only files it edited,
+    // named in a command, or changed during one of its calls) could not be produced (binary by git
+    // attributes and too big to re-diff, an untracked file over 2 MB or unreadable), so what changed
+    // in it is unknown. Blocks whatever the path.
     if (h.labels.some((l) => l.kind === 'unreviewed')) {
-      const detail = `could not be diffed as text (git attributes mark it binary): ${h.hunk.file}`;
+      const detail = `could not be diffed as text (git attributes mark it binary, or it is too big or unreadable): ${h.hunk.file}`;
       hits.push(`- ${h.hunk.file} unreviewed: ${detail}`);
       continue;
     }

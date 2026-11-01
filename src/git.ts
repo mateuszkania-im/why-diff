@@ -414,7 +414,13 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
     const untracked = match ? (await listUntracked(cwd)).filter(match) : await listUntracked(cwd, opts.paths);
     for (const rel of untracked) {
       const synthetic = await syntheticAddedFileDiff(root, rel);
-      if (synthetic) diff += synthetic;
+      if (synthetic === UNREADABLE) {
+        // Fail closed: a file too big (or unable) to read is shown as a stub and reported unreviewed.
+        diff += binaryAddedStub(rel);
+        unreviewed.push(rel);
+      } else if (synthetic) {
+        diff += synthetic;
+      }
     }
   }
   return { diff, unreviewed };
@@ -869,11 +875,21 @@ export async function isShallow(cwd: string): Promise<boolean> {
 
 export const SHALLOW_HINT = 'this is a shallow clone; fetch full history (actions/checkout: fetch-depth: 0)';
 
+/** {@link syntheticAddedFileDiff} result for a file over the size cap, or one that cannot be read. */
+const UNREADABLE = Symbol('unreadable');
+
+/** A "new file" section that only says the file is binary (no content). */
+function binaryAddedStub(rel: string): string {
+  const side = quotePathIfNeeded(`b/${rel}`);
+  return `diff --git ${quotePathIfNeeded(`a/${rel}`)} ${side}\nnew file mode 100644\nindex 0000000..0000000\nBinary files /dev/null and ${side} differ\n`;
+}
+
 /**
- * Build a `git diff`-shaped "new file" section for an untracked file. Returns
- * `null` for binary files, directories and files that cannot be read.
+ * Build a `git diff`-shaped "new file" section for an untracked file. Returns `null` for
+ * directories and other non-files, {@link UNREADABLE} for a file over the size cap or one that
+ * cannot be read (the caller fails closed on it).
  */
-async function syntheticAddedFileDiff(root: string, rel: string): Promise<string | null> {
+async function syntheticAddedFileDiff(root: string, rel: string): Promise<string | null | typeof UNREADABLE> {
   const abs = path.join(root, rel);
   let buf: Buffer;
   let mode = '100644';
@@ -885,16 +901,15 @@ async function syntheticAddedFileDiff(root: string, rel: string): Promise<string
       buf = Buffer.from(await readlink(abs, { encoding: 'buffer' }));
       mode = '120000';
     } else {
-      if (!st.isFile() || st.size > MAX_UNTRACKED_BYTES) return null;
+      if (!st.isFile()) return null;
+      if (st.size > MAX_UNTRACKED_BYTES) return UNREADABLE;
       buf = await readFile(abs);
     }
-  } catch {
-    return null;
+  } catch (err) {
+    // Gone since it was listed: nothing to show. Anything else (unreadable): fail closed.
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? null : UNREADABLE;
   }
-  if (looksBinary(buf)) {
-    const side = quotePathIfNeeded(`b/${rel}`);
-    return `diff --git ${quotePathIfNeeded(`a/${rel}`)} ${side}\nnew file mode 100644\nindex 0000000..0000000\nBinary files /dev/null and ${side} differ\n`;
-  }
+  if (looksBinary(buf)) return binaryAddedStub(rel);
   const content = buf.toString('utf8');
   // git quotes the whole prefixed path: `"a/weird \"name\".txt"`.
   const oldSide = quotePathIfNeeded(`a/${rel}`);

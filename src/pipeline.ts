@@ -193,7 +193,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   // Fail closed: a file git attributes show as binary, whose text could not be produced, is a finding.
   if (unreviewed.size) {
     attributed = attributed.map((h) => (unreviewed.has(h.hunk.file) || (h.hunk.oldFile !== undefined && unreviewed.has(h.hunk.oldFile))
-      ? { ...h, labels: [...h.labels, { kind: 'unreviewed', severity: 'risk', detail: `Shown as binary by git attributes and too big to diff as text: ${h.hunk.file}` }] }
+      ? { ...h, labels: [...h.labels, { kind: 'unreviewed', severity: 'risk', detail: `Content could not be shown as text (binary by git attributes and too big to re-diff, or an untracked file over 2 MB or unreadable): ${h.hunk.file}` }] }
       : h));
   }
 

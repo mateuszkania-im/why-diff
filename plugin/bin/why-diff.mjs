@@ -3031,7 +3031,7 @@ async function getDiffUnwrapped(cwd, target, opts) {
     let untracked = match ? (await listUntracked(cwd)).filter(match) : await listUntracked(cwd, opts.paths);
     for (let rel of untracked) {
       let synthetic = await syntheticAddedFileDiff(root, rel);
-      synthetic && (diff += synthetic);
+      synthetic === UNREADABLE ? (diff += binaryAddedStub(rel), unreviewed.push(rel)) : synthetic && (diff += synthetic);
     }
   }
   return { diff, unreviewed };
@@ -3312,7 +3312,15 @@ async function isShallow(cwd) {
     return !1;
   }
 }
-var SHALLOW_HINT = "this is a shallow clone; fetch full history (actions/checkout: fetch-depth: 0)";
+var SHALLOW_HINT = "this is a shallow clone; fetch full history (actions/checkout: fetch-depth: 0)", UNREADABLE = /* @__PURE__ */ Symbol("unreadable");
+function binaryAddedStub(rel) {
+  let side = quotePathIfNeeded(`b/${rel}`);
+  return `diff --git ${quotePathIfNeeded(`a/${rel}`)} ${side}
+new file mode 100644
+index 0000000..0000000
+Binary files /dev/null and ${side} differ
+`;
+}
 async function syntheticAddedFileDiff(root, rel) {
   let abs = path2.join(root, rel), buf, mode = "100644";
   try {
@@ -3320,20 +3328,14 @@ async function syntheticAddedFileDiff(root, rel) {
     if (st.isSymbolicLink())
       buf = Buffer.from(await readlink(abs, { encoding: "buffer" })), mode = "120000";
     else {
-      if (!st.isFile() || st.size > MAX_UNTRACKED_BYTES) return null;
+      if (!st.isFile()) return null;
+      if (st.size > MAX_UNTRACKED_BYTES) return UNREADABLE;
       buf = await readFile(abs);
     }
-  } catch {
-    return null;
+  } catch (err) {
+    return err.code === "ENOENT" ? null : UNREADABLE;
   }
-  if (looksBinary(buf)) {
-    let side = quotePathIfNeeded(`b/${rel}`);
-    return `diff --git ${quotePathIfNeeded(`a/${rel}`)} ${side}
-new file mode 100644
-index 0000000..0000000
-Binary files /dev/null and ${side} differ
-`;
-  }
+  if (looksBinary(buf)) return binaryAddedStub(rel);
   let content = buf.toString("utf8"), oldSide = quotePathIfNeeded(`a/${rel}`), newSide = quotePathIfNeeded(`b/${rel}`), header = `diff --git ${oldSide} ${newSide}
 new file mode ${mode}
 index 0000000..0000000
@@ -8776,7 +8778,7 @@ async function buildReport(opts = {}) {
     ignoredHunks = attributed.length - kept.length, attributed = kept;
   }
   let mode = sessions.length === 0 ? "risk-scan" : "provenance", texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== "deleted").map((h) => h.file))]), packages = await pythonPackageDirs(root, baseRev, hunks);
-  attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p), protectedGlob, riskScan: mode === "risk-scan", rulesFiles, pythonPackage: (d) => packages.has(d) }), mode === "risk-scan" && (attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== "unattributed") }))), unreviewed.size && (attributed = attributed.map((h) => unreviewed.has(h.hunk.file) || h.hunk.oldFile !== void 0 && unreviewed.has(h.hunk.oldFile) ? { ...h, labels: [...h.labels, { kind: "unreviewed", severity: "risk", detail: `Shown as binary by git attributes and too big to diff as text: ${h.hunk.file}` }] } : h));
+  attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p), protectedGlob, riskScan: mode === "risk-scan", rulesFiles, pythonPackage: (d) => packages.has(d) }), mode === "risk-scan" && (attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== "unattributed") }))), unreviewed.size && (attributed = attributed.map((h) => unreviewed.has(h.hunk.file) || h.hunk.oldFile !== void 0 && unreviewed.has(h.hunk.oldFile) ? { ...h, labels: [...h.labels, { kind: "unreviewed", severity: "risk", detail: `Content could not be shown as text (binary by git attributes and too big to re-diff, or an untracked file over 2 MB or unreadable): ${h.hunk.file}` }] } : h));
   let reportSessions = sessions, reportPrompts = prompts;
   if (mode === "risk-scan" && attributed.length) {
     let notes = await readNotes(root, target).catch(() => []);
@@ -10178,7 +10180,7 @@ async function guard(payload, opts, state) {
   }, hits = [];
   for (let h of report.hunks) {
     if (h.labels.some((l) => l.kind === "unreviewed")) {
-      let detail = `could not be diffed as text (git attributes mark it binary): ${h.hunk.file}`;
+      let detail = `could not be diffed as text (git attributes mark it binary, or it is too big or unreadable): ${h.hunk.file}`;
       hits.push(`- ${h.hunk.file} unreviewed: ${detail}`);
       continue;
     }
