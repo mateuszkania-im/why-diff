@@ -16,7 +16,7 @@
 import { execFile } from 'node:child_process';
 import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, dirname, join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { ClassifierCallError, ClassifierUnavailableError, type CompletionBackend, type CompletionRequest } from './llm.js';
 import { isRecord } from './prompt.js';
 
@@ -43,11 +43,16 @@ export interface ClaudeCliOptions {
   runner?: ProcessRunner;
 }
 
-/** Locate an executable on PATH without spawning anything. */
-export function findOnPath(name: string, envPath = process.env.PATH ?? ''): string | undefined {
+/**
+ * Locate an executable on PATH without spawning anything. On Windows only `.exe`, `.cmd` and `.bat`
+ * files count, in that order: npm puts an extensionless shell script (for Git Bash) next to
+ * `claude.cmd`, and that script cannot be started from Node.
+ */
+export function findOnPath(name: string, envPath = process.env.PATH ?? '', platform: NodeJS.Platform = process.platform): string | undefined {
   if (name.includes('/') || name.includes('\\')) return isExecutable(name) ? name : undefined;
-  const exts = process.platform === 'win32' ? ['', '.exe', '.cmd', '.bat'] : [''];
-  for (const dir of envPath.split(delimiter)) {
+  const win = platform === 'win32';
+  const exts = win ? (/\.(exe|cmd|bat)$/i.test(name) ? [''] : ['.exe', '.cmd', '.bat']) : [''];
+  for (const dir of envPath.split(win ? ';' : ':')) {
     if (!dir) continue;
     for (const ext of exts) {
       const candidate = join(dir, name + ext);

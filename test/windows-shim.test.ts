@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { resolveCommandShim } from '../src/classify/claude-cli.js';
+import { findOnPath, resolveCommandShim } from '../src/classify/claude-cli.js';
 import { tempDir } from './helpers/claude-fixture.js';
 
 // npm on Windows installs `claude` as a .cmd shim, which execFile cannot run without a shell.
@@ -50,3 +50,27 @@ describe('resolveCommandShim', () => {
     expect(() => resolveCommandShim(shim, ['-p'])).toThrow(/--classifier anthropic/);
   });
 });
+
+describe('findOnPath on Windows (sec030 #12)', () => {
+  function npmBinDir(files: string[]): string {
+    const dir = tempDir('why-diff-path-');
+    for (const f of files) writeFileSync(path.join(dir, f), '#!/bin/sh\n', { mode: 0o755 });
+    return dir;
+  }
+  it('prefers claude.cmd over the extensionless npm shell script', () => {
+    const dir = npmBinDir(['claude', 'claude.cmd', 'claude.ps1']);
+    expect(findOnPath('claude', dir, 'win32')).toBe(path.join(dir, 'claude.cmd'));
+  });
+  it('tries .exe before .cmd before .bat', () => {
+    const dir = npmBinDir(['claude.bat', 'claude.cmd', 'claude.exe']);
+    expect(findOnPath('claude', dir, 'win32')).toBe(path.join(dir, 'claude.exe'));
+  });
+  it('never picks an extensionless file', () => {
+    expect(findOnPath('claude', npmBinDir(['claude']), 'win32')).toBeUndefined();
+  });
+  it.skipIf(process.platform === 'win32')('keeps the bare name on POSIX', () => {
+    const dir = npmBinDir(['claude', 'claude.cmd']);
+    expect(findOnPath('claude', dir, 'linux')).toBe(path.join(dir, 'claude'));
+  });
+});
+
