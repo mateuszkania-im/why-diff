@@ -504,7 +504,7 @@ describe('sec030 #7: the session base does not trust committer dates', () => {
   });
 });
 
-describe('sec030 #8: a repeat block is skipped only after the harness delivered it', () => {
+describe('sec030 #8: nothing the agent can write switches a block off', () => {
   function setup(): { repo: string; home: string; transcript: string; payload: { transcript_path: string; cwd: string; session_id: string } } {
     const { repo, home } = makeRepo();
     const callAt = Date.now() - 60_000;
@@ -546,12 +546,15 @@ describe('sec030 #8: a repeat block is skipped only after the harness delivered 
     expect((await runGuard(payload, { blocking: BL, home, objectTime: oldObjects })).block).toBe(true);
   });
 
-  it('after the harness delivered the block, the same hits do not block again; a new risky edit does', async () => {
+  it('after a delivered block the same hits block again with a short message; a new risky edit gets the full one', async () => {
     const { repo, home, transcript, payload } = setup();
     const first = await runGuard(payload, { blocking: BL, home, objectTime: oldObjects });
     expect(first.block).toBe(true);
     appendFileSync(transcript, `${deliveredLine(first.message!)}\n`);
-    expect((await runGuard(payload, { blocking: BL, home, objectTime: oldObjects })).block).toBe(false);
+    const repeat = await runGuard(payload, { blocking: BL, home, objectTime: oldObjects });
+    expect(repeat.block).toBe(true);
+    expect(repeat.message).toContain('still present');
+    expect(repeat.message!.split('\n').length).toBeLessThan(first.message!.split('\n').length);
 
     const t2 = writeSyntheticTranscript(home, repo, 's-dd', [{ prompt: 'fix t5', at: iso(Date.now() - 120_000), calls: [
       { tool: 'Edit', at: iso(Date.now() - 60_000), input: { file_path: tp(repo), old_string: 'it("t5",()=>{\n', new_string: 'it.skip("t5",()=>{\n' } },
@@ -561,10 +564,10 @@ describe('sec030 #8: a repeat block is skipped only after the harness delivered 
     writeFileSync(tp(repo), readFileSync(tp(repo), 'utf8').replace('it("t9"', 'it.skip("t9"'));
     const again = await runGuard({ ...payload, transcript_path: t2 }, { blocking: BL, home, objectTime: oldObjects });
     expect(again.block).toBe(true);
-    expect(again.message).toContain('test/f.test.js');
+    expect(again.message).toContain('include risky edits');
   });
 
-  it('a delivery line the agent appended during a tool call (before the result of that call) does not count', async () => {
+  it('a delivery line the agent appended to its transcript does not switch the block off', async () => {
     const { home, transcript, payload } = setup();
     const first = await runGuard(payload, { blocking: BL, home, objectTime: oldObjects });
     appendFileSync(transcript, `${JSON.stringify({ type: 'assistant', timestamp: new Date().toISOString(), message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_forge', name: 'Bash', input: { command: 'echo >> transcript' } }] } })}\n`);
@@ -573,10 +576,12 @@ describe('sec030 #8: a repeat block is skipped only after the harness delivered 
     expect((await runGuard(payload, { blocking: BL, home, objectTime: oldObjects })).block).toBe(true);
   });
 
-  it('a stop_hook_summary system line also counts as delivered', async () => {
+  it('a stop_hook_summary system line also selects the short message, and still blocks', async () => {
     const { home, transcript, payload } = setup();
     const first = await runGuard(payload, { blocking: BL, home, objectTime: oldObjects });
     appendFileSync(transcript, `${JSON.stringify({ type: 'system', subtype: 'stop_hook_summary', timestamp: new Date().toISOString(), hookCount: 1, hookInfos: [{ command: 'why-diff guard' }], hookErrors: [first.message], preventedContinuation: false })}\n`);
-    expect((await runGuard(payload, { blocking: BL, home, objectTime: oldObjects })).block).toBe(false);
+    const r = await runGuard(payload, { blocking: BL, home, objectTime: oldObjects });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('still present');
   });
 });

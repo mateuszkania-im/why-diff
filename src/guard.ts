@@ -180,10 +180,17 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   }
 
   if (!hits.length) return NO_BLOCK;
-  // Block once per finding list: skip it only when Claude Code itself already delivered this exact
-  // list to the agent (its own record of a Stop hook block in the transcript). Nothing the agent
-  // can write from a tool call (a state file, a guard run of its own, tool output) counts.
-  if (await alreadyDelivered(payload.transcript_path, hits)) return { block: false, hits };
+  // Every Stop with risky hits blocks; only `stop_hook_active` (set by Claude Code, after a block in
+  // this same turn) lets the agent finish. Nothing on disk can switch a block off: the agent can write
+  // the repo, its home and its own transcript. The transcript only picks a shorter message when the
+  // same list was already shown.
+  if (await shownBefore(payload.transcript_path, hits).catch(() => false)) {
+    return {
+      block: true,
+      hits,
+      message: `why-diff guard: still present from an earlier block:\n${hits.join('\n')}\nTell the user about these changes, or revert them.\n`,
+    };
+  }
   return {
     block: true,
     hits,
@@ -345,43 +352,30 @@ function shellOnly(hunk: Hunk): boolean {
 const MESSAGE_HEAD = 'why-diff guard: your changes in this session include risky edits:\n';
 
 /**
- * Did Claude Code already deliver a block with exactly these hits? Only harness-written transcript
- * lines count: a `hook_blocking_error` attachment of the Stop event, or a `stop_hook_summary` system
- * line, carrying exactly this list. It must also come after the last tool call and tool result in
- * the transcript: a line the agent appends to its own transcript during a tool call lands before
- * the harness writes that call's result, so it never qualifies. Tool output, assistant text and
- * anything in the working tree never count.
+ * Was a block with exactly these hits already shown in this session (a Stop hook block that Claude
+ * Code recorded in the transcript)? Only chooses the short message; never skips a block.
  */
-async function alreadyDelivered(transcript: string, hits: string[]): Promise<boolean> {
+async function shownBefore(transcript: string, hits: string[]): Promise<boolean> {
   const needle = `${MESSAGE_HEAD}${hits.join('\n')}\n\n`;
   const stream = createReadStream(transcript, { encoding: 'utf8' });
   const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
-  let deliveredAfterLastTool = false;
   try {
     for await (const raw of lines) {
-      if (raw.includes('"tool_use"') || raw.includes('"tool_result"')) {
-        deliveredAfterLastTool = false;
-        continue;
-      }
       if (!raw.includes('why-diff guard') || !(raw.includes('hook_blocking_error') || raw.includes('stop_hook_summary'))) continue;
-      let line: { type?: unknown; subtype?: unknown; attachment?: { type?: unknown; hookEvent?: unknown } } & Record<string, unknown>;
+      let line: { type?: unknown; subtype?: unknown; attachment?: { type?: unknown } } & Record<string, unknown>;
       try {
         line = JSON.parse(raw) as typeof line;
       } catch {
         continue;
       }
-      const harnessLine =
-        (line.type === 'attachment' && line.attachment?.type === 'hook_blocking_error' && line.attachment.hookEvent === 'Stop') ||
-        (line.type === 'system' && line.subtype === 'stop_hook_summary');
-      if (!harnessLine) continue;
-      const source = line.type === 'attachment' ? line.attachment : line;
-      if (strings(source).some((t) => t.includes(needle))) deliveredAfterLastTool = true;
+      const harnessLine = (line.type === 'attachment' && line.attachment?.type === 'hook_blocking_error') || (line.type === 'system' && line.subtype === 'stop_hook_summary');
+      if (harnessLine && strings(line.type === 'attachment' ? line.attachment : line).some((t) => t.includes(needle))) return true;
     }
   } finally {
     lines.close();
     stream.destroy();
   }
-  return deliveredAfterLastTool;
+  return false;
 }
 
 function strings(v: unknown, depth = 0): string[] {

@@ -100,7 +100,7 @@ describe('runGuard', () => {
     expect(r.message).toContain('test-skip-added');
   });
 
-  it('does not block twice once Claude Code delivered the same hits; a new risky edit blocks again', async () => {
+  it('blocks again on every Stop while the hits remain (short message once shown); stop_hook_active lets the agent finish', async () => {
     const { repo, home } = makeRepo();
     const t1 = writeSyntheticTranscript(home, repo, 's-twice', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
@@ -109,7 +109,10 @@ describe('runGuard', () => {
     expect(first.block).toBe(true);
     const delivered = `${JSON.stringify({ type: 'attachment', timestamp: new Date().toISOString(), attachment: { type: 'hook_blocking_error', hookName: 'Stop', hookEvent: 'Stop', blockingError: { blockingError: first.message, command: 'why-diff guard' } } })}\n`;
     appendFileSync(t1, delivered);
-    expect((await runGuard(payload, { blocking: BLOCKING, home, objectTime: oldObjects })).block).toBe(false);
+    const repeat = await runGuard(payload, { blocking: BLOCKING, home, objectTime: oldObjects });
+    expect(repeat.block).toBe(true);
+    expect(repeat.message).toContain('still present');
+    expect((await runGuard({ ...payload, stop_hook_active: true }, { blocking: BLOCKING, home, objectTime: oldObjects })).block).toBe(false);
 
     const t2 = writeSyntheticTranscript(home, repo, 's-twice', [{
       prompt: 'fix t5 and t9',
@@ -495,10 +498,9 @@ describe('why-diff guard CLI', () => {
     const first = run({ transcript_path: transcript, cwd: repo, session_id: 's-cli' });
     expect(first.status).toBe(2);
     expect(first.stderr).toContain('test-skip-added');
-    // Not delivered yet (an agent running the guard itself looks like this): blocks again.
+    // Every Stop blocks again while the hits remain; only stop_hook_active (a block earlier this turn) lets it finish.
     expect(run({ transcript_path: transcript, cwd: repo, session_id: 's-cli' }).status).toBe(2);
-    appendFileSync(transcript, `${JSON.stringify({ type: 'attachment', attachment: { type: 'hook_blocking_error', hookEvent: 'Stop', blockingError: { blockingError: `Stop hook blocking error from command "why-diff guard": ${first.stderr}`, command: 'why-diff guard' } } })}\n`);
-    expect(run({ transcript_path: transcript, cwd: repo, session_id: 's-cli' }).status).toBe(0);
+    expect(run({ transcript_path: transcript, cwd: repo, session_id: 's-cli', stop_hook_active: true }).status).toBe(0);
     expect(run({ cwd: repo }).status).toBe(0);
   });
 });
