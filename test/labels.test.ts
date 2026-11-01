@@ -1168,3 +1168,57 @@ describe('secret-like: PGP private key blocks', () => {
     expect(kinds(h)).toContain('secret-like');
   });
 });
+
+describe('sec033 #6: label gaps', () => {
+  it.each([
+    ['it.skipIf(true)("t5", () => {', '.skipIf'],
+    ['test.skipIf(process.env.CI)("t5", () => {', '.skipIf'],
+    ['describe.skipIf(true)("suite", () => {', '.skipIf'],
+    ['it.runIf(false)("t5", () => {', '.runIf'],
+    ['test.runIf(false)("t5", () => {', '.runIf'],
+    ['it["skip"]("t5", () => {', '.skip'],
+    ["it['skip']('t5', () => {", '.skip'],
+    ['it[`skip`]("t5", () => {', '.skip'],
+  ])('flags %s as a skip', (line, name) => {
+    const h = hunk('test/a.test.js', ['-it("t5", () => {', `+${line}`]);
+    const l = find(h, 'test-skip-added');
+    expect(l?.severity).toBe('risk');
+    expect(l?.detail).toContain(name);
+  });
+
+  it('does not flag skipIf / bracket keys inside a string or outside a call', () => {
+    expect(kinds(hunk('test/a.test.js', ['+const msg = "use it.skipIf( to skip";']))).not.toContain('test-skip-added');
+    expect(kinds(hunk('test/a.test.js', ['+const k = opts["skip"];']))).not.toContain('test-skip-added');
+  });
+
+  it('flags a bare return added as the first statement of a test body', () => {
+    const h = hunk('test/a.test.js', [' it("t3",()=>{', '+  return;', '   expect(f(3)).toBe(3);', ' });']);
+    expect(find(h, 'test-skip-added')?.detail).toContain('early return');
+  });
+
+  it('flags a bare return added right after a newly written test opener', () => {
+    const h = hunk('test/a.test.js', ['-test("t3", async function () {', '+test("t3", async function () {', '+  return', '   expect(f(3)).toBe(3);']);
+    expect(find(h, 'test-skip-added')?.detail).toContain('early return');
+  });
+
+  it('does not flag a return that is not the first statement, or returns a value', () => {
+    expect(kinds(hunk('test/a.test.js', [' it("t3",()=>{', '   const x = f(3);', '+  return;']))).not.toContain('test-skip-added');
+    expect(kinds(hunk('test/a.test.js', [' it("t3",()=>{', '+  return run();']))).not.toContain('test-skip-added');
+    expect(kinds(hunk('src/a.js', [' it("t3",()=>{', '+  return;']))).not.toContain('test-skip-added');
+  });
+
+  it('flags an expect subject changed into a literal', () => {
+    const l = find(hunk('test/a.test.js', ['-  expect(f(3)).toBe(3);', '+  expect(3).toBe(3);']), 'assertion-removed');
+    expect(l?.detail).toContain('subject');
+  });
+
+  it('flags an expect subject changed into the previously expected value', () => {
+    const l = find(hunk('test/a.test.js', ['-  expect(total(cart)).toEqual(expected);', '+  expect(expected).toEqual(expected);']), 'assertion-removed');
+    expect(l?.detail).toContain('subject');
+  });
+
+  it('accepts a subject renamed to another computed value', () => {
+    expect(kinds(hunk('test/a.test.js', ['-  expect(f(3)).toBe(3);', '+  expect(g(3)).toBe(3);']))).not.toContain('assertion-removed');
+    expect(kinds(hunk('test/a.test.js', ['-  expect(out).toBe(3);', '+  expect(result).toBe(3);']))).not.toContain('assertion-removed');
+  });
+});
