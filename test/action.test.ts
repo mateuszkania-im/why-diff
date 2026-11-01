@@ -8,7 +8,7 @@ import { tempDir } from './helpers/claude-fixture.js';
 const root = path.resolve(__dirname, '..');
 const script = path.join(root, 'scripts', 'action-comment.sh');
 const MARKER = '<!-- why-diff:comment -->';
-const hasJq = spawnSync('sh', ['-c', 'command -v jq'], { encoding: 'utf8' }).status === 0;
+const hasJq = process.platform !== 'win32' && spawnSync('sh', ['-c', 'command -v jq'], { encoding: 'utf8' }).status === 0;
 
 /** Fake gh: `api user`, the paginated comment listing (filtered by the real jq, as gh --jq would), PATCH and POST. */
 const GH_STUB = `#!/usr/bin/env node
@@ -78,7 +78,8 @@ function run(env: NodeJS.ProcessEnv = {}): { status: number | null; stdout: stri
 const comments = (list: { id: number; login: string; body: string }[]) =>
   writeFileSync(path.join(stubDir, 'comments.json'), JSON.stringify(list.map((c) => ({ id: c.id, user: { login: c.login }, body: c.body }))));
 
-describe.skipIf(!hasJq)('action comment script', () => {
+// Windows: `bash` on the runner may be WSL's, and the stub `gh` is a shebang script; covered on Linux.
+describe.skipIf(!hasJq || process.platform === 'win32')('action comment script', () => {
   it('skips forks with a notice and calls no gh', () => {
     const r = run({ HEAD_REPO: 'mallory/app' });
     expect(r.status).toBe(0);

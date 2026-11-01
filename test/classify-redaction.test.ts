@@ -56,7 +56,8 @@ afterAll(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-describe('--classify input', () => {
+// The stub `claude` is a shebang script, which Windows cannot run without a shell.
+describe.skipIf(process.platform === 'win32')('--classify input', () => {
   it('never contains secrets from prompts or rationales', async () => {
     await buildReport({ cwd: repo, home, classify: 'claude-cli', workingTree: true }).catch(() => undefined);
     const calls = readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as { args: string[]; input: string });

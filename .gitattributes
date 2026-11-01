@@ -1,0 +1,4 @@
+# Keep LF everywhere (fixtures, the committed bundle, shell scripts), also on Windows checkouts.
+* text=auto eol=lf
+*.png binary
+*.db binary

@@ -437,7 +437,8 @@ describe('Python package detection', () => {
   });
 });
 
-describe('untracked symlinks', () => {
+// Creating symlinks on Windows needs developer mode or admin rights.
+describe.skipIf(process.platform === 'win32')('untracked symlinks', () => {
   it('shows an untracked symlink as git does (its target, mode 120000) and never reads what it points at', async () => {
     const repo = freshRepo();
     put(repo, 'base.txt', 'base\n');

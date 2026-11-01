@@ -4,10 +4,17 @@ on:
   pull_request:
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
-      matrix: { node: [20, 22] }
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        node: [20, 22]
+        include:
+          - { os: windows-latest, node: 22 }
     steps:
+      # Windows runners convert to CRLF on checkout; .gitattributes pins LF too, this covers git itself.
+      - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
@@ -19,7 +26,9 @@ jobs:
         run: npm run check:bundle
       - run: npm run build:lib
       - name: smoke (bundle has no runtime dependencies)
+        shell: bash
         run: |
-          mkdir -p /tmp/smoke && cp plugin/bin/why-diff.mjs /tmp/smoke/
-          node /tmp/smoke/why-diff.mjs --version
-          node /tmp/smoke/why-diff.mjs --help
+          smoke="$RUNNER_TEMP/smoke"
+          mkdir -p "$smoke" && cp plugin/bin/why-diff.mjs "$smoke/"
+          node "$smoke/why-diff.mjs" --version
+          node "$smoke/why-diff.mjs" --help

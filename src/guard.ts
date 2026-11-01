@@ -225,9 +225,11 @@ async function shellWindowFiles(root: string, rev: string | undefined, session: 
   const changed = await git(root, ['diff', '--name-only', '--no-renames', '-z', rev ?? (await emptyTree(root)), '--'], { trim: false }).catch(() => '');
   const files = [...new Set([...changed.split('\0').filter(Boolean), ...(await listUntracked(root).catch(() => []))])]
     .filter((f) => !f.startsWith('.why-diff/'));
+  // `git rev-parse --show-toplevel` prints `C:/x` on Windows: resolve it so the walk below compares like with like.
+  const top = path.resolve(root);
   for (let i = 0; i < files.length; i += LSTAT_BATCH) {
     await Promise.all(files.slice(i, i + LSTAT_BATCH).map(async (f) => {
-      const abs = path.join(root, ...f.split('/'));
+      const abs = path.join(top, ...f.split('/'));
       try {
         if (inWindow(await timeOf(abs))) written.add(f);
         return;
@@ -242,7 +244,7 @@ async function shellWindowFiles(root: string, rev: string | undefined, session: 
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return;
         }
-        if (dir === root || path.dirname(dir) === dir || !dir.startsWith(root)) return;
+        if (dir === top || path.dirname(dir) === dir || !dir.startsWith(top)) return;
       }
     }));
   }

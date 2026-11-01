@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
+import { shellPath, tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
+import { gitBinDir, windowsBaseEnv } from './helpers/which.js';
 
 const root = path.resolve(__dirname, '..');
 const tsxLoader = pathToFileURL(path.join(root, 'node_modules', 'tsx', 'dist', 'esm', 'index.mjs')).href;
@@ -24,15 +25,14 @@ function git(cwd: string, ...args: string[]): string {
 
 function cli(args: string[]): { status: number | null; stdout: string; stderr: string } {
   // The node bin dir can hold a global `claude` (npm i -g); point the classifier at a missing binary so no LLM is ever reached.
-  const env: NodeJS.ProcessEnv = { PATH: bareBin, HOME: home, GIT_CONFIG_NOSYSTEM: '1', WHY_DIFF_CLAUDE_BIN: NO_CLAUDE, ...GIT_ENV };
+  const env: NodeJS.ProcessEnv = { ...windowsBaseEnv(home), PATH: bareBin, HOME: home, GIT_CONFIG_NOSYSTEM: '1', WHY_DIFF_CLAUDE_BIN: NO_CLAUDE, ...GIT_ENV };
   const r = spawnSync(process.execPath, ['--import', tsxLoader, path.join(root, 'src', 'cli.ts'), ...args], { cwd: repo, encoding: 'utf8', env });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 
 beforeAll(() => {
-  const gitPath = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
-  bareBin = [path.dirname(process.execPath), path.dirname(gitPath)].join(path.delimiter);
-  repo = realpathSync(mkdtempSync(path.join(tmpdir(), 'why-diff-cli-')));
+  bareBin = [path.dirname(process.execPath), gitBinDir()].join(path.delimiter);
+  repo = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'why-diff-cli-')));
   home = realpathSync(tempDir('why-diff-cli-home-'));
   git(repo, 'init', '-q', '-b', 'main');
   mkdirSync(path.join(repo, 'src'));
@@ -151,7 +151,7 @@ describe('binary files', () => {
     writeFileSync(path.join(repo, 'icon.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 9, 9, 0, 255]));
     const now = Date.now();
     writeSyntheticTranscript(home, repo, 'eeeeeeee-1111-4222-8333-444444444444', [
-      { prompt: 'add the icon', at: new Date(now - 40_000).toISOString(), calls: [{ tool: 'Bash', at: new Date(now - 30_000).toISOString(), input: { command: `cp /tmp/icon.png ${path.join(repo, 'icon.png')}`, description: 'copy icon' } }] },
+      { prompt: 'add the icon', at: new Date(now - 40_000).toISOString(), calls: [{ tool: 'Bash', at: new Date(now - 30_000).toISOString(), input: { command: `cp /tmp/icon.png ${shellPath(path.join(repo, 'icon.png'))}`, description: 'copy icon' } }] },
     ]);
     try {
       const r = cli(['-w', '-f', 'json', '-q', '--fail-on', 'unattributed', '--', 'src/a.js', 'icon.png']);

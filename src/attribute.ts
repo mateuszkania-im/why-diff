@@ -470,6 +470,8 @@ export function rootVariants(p: string): string[] {
   const out = new Set<string>([normalised]);
   try {
     out.add(realpathSync(normalised));
+    // The native form also expands Windows 8.3 short names (C:\\Users\\RUNNER~1), which git never prints.
+    out.add(realpathSync.native(normalised));
   } catch {
     // path may not exist any more
   }

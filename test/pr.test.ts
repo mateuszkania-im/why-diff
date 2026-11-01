@@ -7,6 +7,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { buildReport } from '../src/pipeline.js';
 import { SECTION_END, SECTION_START, sectionBudget, upsertSection } from '../src/pr.js';
 import { tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
+import { gitBinDir, windowsBaseEnv } from './helpers/which.js';
 
 const root = path.resolve(__dirname, '..');
 const tsxLoader = pathToFileURL(path.join(root, 'node_modules', 'tsx', 'dist', 'esm', 'index.mjs')).href;
@@ -80,7 +81,7 @@ function git(cwd: string, ...args: string[]): string {
 function cli(args: string[], env: NodeJS.ProcessEnv = {}): { status: number | null; stdout: string; stderr: string } {
   // PATH holds the fake gh first, then node and git.
   // The node bin dir can hold a global `claude` (npm i -g); point the classifier at a missing binary so no LLM is ever reached.
-  const fullEnv: NodeJS.ProcessEnv = { PATH: [stubDir, bareBin].join(path.delimiter), HOME: emptyHome, GIT_CONFIG_NOSYSTEM: '1', WHY_DIFF_CLAUDE_BIN: NO_CLAUDE, ...GIT_ENV, ...env };
+  const fullEnv: NodeJS.ProcessEnv = { ...windowsBaseEnv(emptyHome), PATH: [stubDir, bareBin].join(path.delimiter), HOME: emptyHome, GIT_CONFIG_NOSYSTEM: '1', WHY_DIFF_CLAUDE_BIN: NO_CLAUDE, ...GIT_ENV, ...env };
   const r = spawnSync(process.execPath, ['--import', tsxLoader, path.join(root, 'src', 'cli.ts'), ...args], { cwd: repo, encoding: 'utf8', env: fullEnv });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
 }
@@ -105,8 +106,7 @@ if (args[0] === 'pr' && args[1] === 'view') {
 `;
 
 beforeAll(() => {
-  const gitPath = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
-  bareBin = [path.dirname(process.execPath), path.dirname(gitPath)].join(path.delimiter);
+  bareBin = [path.dirname(process.execPath), gitBinDir()].join(path.delimiter);
   repo = realpathSync(tempDir('why-diff-pr-'));
   emptyHome = realpathSync(tempDir('why-diff-pr-home-'));
   stubDir = realpathSync(tempDir('why-diff-pr-gh-'));
@@ -171,7 +171,8 @@ describe('risk-scan mode', () => {
   });
 });
 
-describe('why-diff pr', () => {
+// The stub `gh` is an extensionless script with a shebang; Windows can only spawn .exe files without a shell.
+describe.skipIf(process.platform === 'win32')('why-diff pr', () => {
   const calls = (): { args: string[]; input: string }[] => {
     const f = path.join(stubDir, 'calls.jsonl');
     return existsSync(f) ? readFileSync(f, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];

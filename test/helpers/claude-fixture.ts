@@ -8,7 +8,7 @@
  * the adapter unit tests and the end-to-end attribution test.
  */
 
-import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,9 +22,15 @@ export const FIXTURE_CWD = '/home/dev/acme-shop';
 export const FIXTURE_SESSION = '6f1d2c3b-9a8e-4f70-b1c2-d3e4f5a6b7c8';
 export const FIXTURE_SUBDIR_SESSION = '0c3d4e5f-aaaa-4bbb-8ccc-ddddeeeeffff';
 
+/** A path as a shell command on this OS would spell it: forward slashes (Git Bash on Windows takes `C:/x`, and `\\` is an escape). */
+export function shellPath(p: string): string {
+  return p.split(path.sep).join('/');
+}
+
 /** Fresh temp directory (realpath-resolved so macOS `/var` vs `/private/var` cannot bite). */
 export function tempDir(prefix: string): string {
-  return mkdtempSync(path.join(os.tmpdir(), prefix));
+  // native: also expands Windows 8.3 short names (C:\\Users\\RUNNER~1), which git never prints.
+  return realpathSync.native(mkdtempSync(path.join(os.tmpdir(), prefix)));
 }
 
 /** Copy the fixture home, re-pointing every transcript at `repoRoot`. Returns the new home. */

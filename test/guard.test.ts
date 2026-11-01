@@ -6,7 +6,7 @@ import { lstat } from 'node:fs/promises';
 import { afterEach, describe, expect, it } from 'vitest';
 import { acquireLock, releaseLock, runGuard } from '../src/guard.js';
 import type { LabelKind } from '../src/types.js';
-import { tempDir, writeSyntheticTranscript, type SyntheticCall } from './helpers/claude-fixture.js';
+import { shellPath, tempDir, writeSyntheticTranscript, type SyntheticCall } from './helpers/claude-fixture.js';
 import { bestOfAsync, expectSubQuadratic } from './helpers/perf.js';
 
 const BLOCKING = new Set<LabelKind>(['test-skip-added', 'assertion-removed', 'secret-like', 'ci-changed']);
@@ -126,7 +126,7 @@ describe('runGuard', () => {
       sh(repo, ['add', '-A']);
       sh(repo, ['commit', '-qm', 'more'], LONG_AGO);
       const calls: SyntheticCall[] = [{ tool: 'Edit', at: CALL_AT, input: { file_path: path.join(repo, 'src', 'x.js'), old_string: 'x = 1', new_string: 'x = 2' } }];
-      if (cmd) calls.push({ tool: 'Bash', at: CALL_AT, input: { command: cmd.replaceAll('$R', repo), description: 'x' } });
+      if (cmd) calls.push({ tool: 'Bash', at: CALL_AT, input: { command: cmd.replaceAll('$R', shellPath(repo)), description: 'x' } });
       const transcript = writeSyntheticTranscript(home, repo, 's-sh', [{ prompt: 'tidy up', at: SESSION_AT, calls }]);
       writeFileSync(path.join(repo, 'src', 'x.js'), 'export const x = 2;\n');
       act(repo);
@@ -274,7 +274,8 @@ describe('runGuard', () => {
       expect(Date.now() - t0).toBeLessThan(5000);
     }, 10_000);
 
-    it('a stale lock that cannot be removed: acquireLock gives up instead of looping', async () => {
+    // chmod 0o555 does not stop deleting files on Windows.
+    it.skipIf(process.platform === 'win32')('a stale lock that cannot be removed: acquireLock gives up instead of looping', async () => {
       const dir = temp('why-diff-guard-lockro-');
       const lock = path.join(dir, 'state.lock');
       writeFileSync(lock, '1');
@@ -426,7 +427,7 @@ describe('runGuard: shell changes whose path the command does not name (mtime wi
     const transcript = writeSyntheticTranscript(home, repo, 's-win', [{
       prompt: 'make the suite green',
       at: iso(opts.sessionAt ?? callAt - 60_000),
-      calls: [{ tool: 'Bash', at: iso(callAt), resultAt: iso(opts.resultAt ?? callAt + 4000), input: { command: `cd ${repo} && node fix.js`, description: 'run the fixer' } }],
+      calls: [{ tool: 'Bash', at: iso(callAt), resultAt: iso(opts.resultAt ?? callAt + 4000), input: { command: `cd ${shellPath(repo)} && node fix.js`, description: 'run the fixer' } }],
     }]);
     act(repo);
     return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-win' }, { blocking: BL, home, stateDir, statTime: 'statTime' in opts ? opts.statTime : byMtime });
@@ -528,7 +529,7 @@ describe('runGuard: shell changes whose path the command does not name (mtime wi
     sh(repo, ['commit', '-qm', 'rules'], LONG_AGO);
     const transcript = writeSyntheticTranscript(home, repo, 's-prot', [{
       prompt: 'bump it', at: iso(T - 60_000),
-      calls: [{ tool: 'Bash', at: iso(T), resultAt: iso(T + 3000), input: { command: `cd ${repo} && ./bump.sh`, description: 'x' } }],
+      calls: [{ tool: 'Bash', at: iso(T), resultAt: iso(T + 3000), input: { command: `cd ${shellPath(repo)} && ./bump.sh`, description: 'x' } }],
     }]);
     writeFileSync(path.join(repo, 'infra', 'main.tf'), 'a = 2\n');
     utimesSync(path.join(repo, 'infra', 'main.tf'), sec(T + 1000), sec(T + 1000));
