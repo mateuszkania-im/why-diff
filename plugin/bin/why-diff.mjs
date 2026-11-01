@@ -7623,9 +7623,9 @@ function isEntry(v) {
 
 // src/classify/claude-cli.ts
 import { execFile as execFile2 } from "node:child_process";
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, existsSync as existsSync2, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join as join2 } from "node:path";
+import { delimiter, dirname as dirname2, join as join2 } from "node:path";
 var DEFAULT_CLAUDE_CLI_MODEL = "haiku";
 function findOnPath(name, envPath = process.env.PATH ?? "") {
   if (name.includes("/") || name.includes("\\")) return isExecutable(name) ? name : void 0;
@@ -7644,12 +7644,32 @@ function isExecutable(path13) {
     return !1;
   }
 }
+function resolveCommandShim(file, args) {
+  if (!/\.(cmd|bat)$/i.test(file)) return { file, args };
+  let text2 = "";
+  try {
+    text2 = readFileSync(file, "utf8");
+  } catch {
+  }
+  let m = /"%dp0%\\([^"%]+\.[cm]?js)"\s+%\*/i.exec(text2), script = m?.[1] ? join2(dirname2(file), ...m[1].split("\\")) : void 0;
+  if (script && existsSync2(script)) return { file: process.execPath, args: [script, ...args] };
+  throw new ClassifierUnavailableError(
+    `Cannot run "${file}" without a shell. Install the native Claude Code binary (claude.exe), or pick another backend with --classifier anthropic|openai.`
+  );
+}
 function execFileRunner(timeoutMs) {
   return (file, args, input) => new Promise((resolve, reject) => {
+    let cmd;
+    try {
+      cmd = resolveCommandShim(file, args);
+    } catch (err) {
+      reject(err);
+      return;
+    }
     let child = execFile2(
-      file,
-      args,
-      { cwd: tmpdir(), timeout: timeoutMs, maxBuffer: 33554432, encoding: "utf8" },
+      cmd.file,
+      cmd.args,
+      { cwd: tmpdir(), timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, encoding: "utf8" },
       (err, stdout, stderr) => {
         if (err && "code" in err && err.code === "ENOENT") {
           reject(

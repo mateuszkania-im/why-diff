@@ -14,9 +14,9 @@
  * prepended to stdin.
  */
 import { execFile } from 'node:child_process';
-import { accessSync, constants } from 'node:fs';
+import { accessSync, constants, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { ClassifierCallError, ClassifierUnavailableError, type CompletionBackend, type CompletionRequest } from './llm.js';
 import { isRecord } from './prompt.js';
 
@@ -66,13 +66,41 @@ function isExecutable(path: string): boolean {
   }
 }
 
+/**
+ * Windows: npm installs `claude` as a `.cmd` shim, which `execFile` cannot start without a shell,
+ * and passing the system prompt through cmd.exe would need fragile quoting. Resolve an npm shim to
+ * `node <script>` instead; refuse any other `.cmd`/`.bat` rather than run it through a shell.
+ */
+export function resolveCommandShim(file: string, args: string[]): { file: string; args: string[] } {
+  if (!/\.(cmd|bat)$/i.test(file)) return { file, args };
+  let text = '';
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch {
+    // unreadable: fall through to the error below
+  }
+  const m = /"%dp0%\\([^"%]+\.[cm]?js)"\s+%\*/i.exec(text);
+  const script = m?.[1] ? join(dirname(file), ...m[1].split('\\')) : undefined;
+  if (script && existsSync(script)) return { file: process.execPath, args: [script, ...args] };
+  throw new ClassifierUnavailableError(
+    `Cannot run "${file}" without a shell. Install the native Claude Code binary (claude.exe), or pick another backend with --classifier anthropic|openai.`,
+  );
+}
+
 /** Default runner: `execFile` (no shell) in the OS temp dir, prompt on stdin. */
 export function execFileRunner(timeoutMs: number): ProcessRunner {
   return (file, args, input) =>
     new Promise((resolve, reject) => {
+      let cmd: { file: string; args: string[] };
+      try {
+        cmd = resolveCommandShim(file, args);
+      } catch (err) {
+        reject(err);
+        return;
+      }
       const child = execFile(
-        file,
-        args,
+        cmd.file,
+        cmd.args,
         { cwd: tmpdir(), timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, encoding: 'utf8' },
         (err, stdout, stderr) => {
           if (err && 'code' in err && err.code === 'ENOENT') {

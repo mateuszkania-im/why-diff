@@ -16,6 +16,10 @@
 - `--fail-on unattributed` applies only to transcript provenance, not to notes mode.
 - Repo roots also match in their native real path form (Windows 8.3 short names).
 
+### Fixed
+
+- Windows: `--classify` with the Claude Code CLI installed through npm (`claude.cmd`) now runs: the npm shim is resolved to `node <cli.js>`, so no argument passes through a shell. Any other `.cmd` or `.bat` gives a clear error instead.
+
 ## 0.2.2
 
 ### Changed
