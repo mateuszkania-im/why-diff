@@ -4,7 +4,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdtempSync, readFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -28,10 +28,12 @@ describe('standalone bundle', () => {
 
 describe('published package', () => {
   it('ships the CLI once: the bundle, not a second unbundled copy in dist/', () => {
-    const out = execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: root, encoding: 'utf8' });
+    // npm is npm.cmd on Windows, which needs a shell; the arguments are fixed.
+    const out = execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: root, encoding: 'utf8', shell: process.platform === 'win32' });
     const files = (JSON.parse(out) as Array<{ files: Array<{ path: string }> }>)[0]!.files.map((f) => f.path);
     expect(files).toContain('plugin/bin/why-diff.mjs');
-    expect(files).toContain('dist/index.js');
+    // dist/ exists only after `npm run build:lib` (CI runs the tests before it).
+    if (existsSync(path.join(root, 'dist', 'index.js'))) expect(files).toContain('dist/index.js');
     expect(files.filter((f) => /^dist\/cli\.(js|d\.ts)$/.test(f))).toEqual([]);
   });
 });
