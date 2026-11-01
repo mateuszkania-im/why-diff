@@ -10447,7 +10447,7 @@ function renderReport(report, format, opts = {}) {
 
 // src/guard.ts
 import { constants as fsConstants2, createReadStream as createReadStream4, realpath as realpathCb } from "node:fs";
-import { access, lstat as lstat4, open as open4, readdir as readdir4, readFile as readFile8, realpath as realpath7, stat as stat5, statfs } from "node:fs/promises";
+import { access, lstat as lstat4, open as open4, readdir as readdir4, readFile as readFile8, readlink as readlink2, realpath as realpath7, stat as stat5, statfs } from "node:fs/promises";
 import { execFile as execFile3 } from "node:child_process";
 import readline2 from "node:readline";
 import os9 from "node:os";
@@ -10654,7 +10654,10 @@ async function guard(payload, opts, state, notes) {
   let userMount = opts.userMount ?? userMountOf, gitDir = await absoluteGitDir(root);
   if (process.platform === "win32" && !opts.fsType && await prefetchWindowsTypes([root, commonDir, gitDir, ...record ? [record.file] : []]), record && (await trustedFileSystem(record.file, "the base record", fsType, userMount), await trustedFileSystem(path12.dirname(record.file), "the base record directory", fsType, userMount)), await trustedFileSystem(root, "the repository", fsType, userMount), await trustedFileSystem(commonDir, "the git dir", fsType, userMount), gitDir !== commonDir && await trustedFileSystem(gitDir, "the worktree git dir", fsType, userMount), !devicesRecorded) {
     let dirs = [["repository root", await real(root)], ["git dir", await real(commonDir)]];
-    gitDir !== commonDir && dirs.push(["worktree git dir", await real(gitDir)]);
+    if (gitDir !== commonDir) {
+      let [wt, common] = await Promise.all([deviceOf(await real(gitDir), pathStat), deviceOf(await real(commonDir), pathStat)]);
+      if (wt === void 0 || wt !== common) throw new FailClosedError(`unreviewed: the worktree git dir (${gitDir}) is on another device than the git common dir (${commonDir}), and no SessionStart record kept its device, so a volume mounted over it during the session cannot be ruled out`);
+    }
     for (let [what, dir] of dirs) {
       let [here, up] = await Promise.all([deviceOf(dir, pathStat), deviceOf(path12.dirname(dir), pathStat)]);
       if (here === void 0 || here !== up) throw new FailClosedError(`unreviewed: the ${what} (${dir}) is the root of its own volume, and no SessionStart record kept its device, so a volume mounted over it during the session cannot be ruled out`);
@@ -10814,9 +10817,9 @@ async function checkSubmodules(ctx, repo, layeredActive) {
     }
     let rec2 = ctx.recordedSubmodules?.[key];
     if (rec2?.rootDev === void 0 && rec2?.gitDev === void 0 && subGitDir !== subCommon) {
-      let realGitDir = await real(subGitDir), [here, up] = await Promise.all([deviceOf(realGitDir, ctx.pathStat), deviceOf(path12.dirname(realGitDir), ctx.pathStat)]);
-      if (here === void 0 || here !== up) {
-        unreviewed(p, "has its worktree git dir at the root of its own volume, and no SessionStart record kept its device");
+      let [here, common] = await Promise.all([deviceOf(await real(subGitDir), ctx.pathStat), deviceOf(await real(subCommon), ctx.pathStat)]);
+      if (here === void 0 || here !== common) {
+        unreviewed(p, "has its worktree git dir on another device than its git common dir, and no SessionStart record kept its device");
         continue;
       }
     }
@@ -11093,18 +11096,29 @@ function pickLinuxMount(entries, fdinfo, dev) {
   if (SINGLE_DEVICE_FS.has(entry.type) && entry.majorMinor !== linuxMajorMinor(dev)) throw new Error(`mount ${id} (${entry.mountPoint}) is device ${entry.majorMinor}, the path is ${linuxMajorMinor(dev)}`);
   return entry;
 }
-async function linuxFdinfo(real) {
-  let fh = await open4(real, "r");
+async function linuxMountProbe(real) {
+  let dir = (await lstat4(real)).isDirectory(), fh = await open4(real, fsConstants2.O_RDONLY | (dir ? fsConstants2.O_DIRECTORY : 0));
   try {
-    return await readFile8(`/proc/self/fdinfo/${fh.fd}`, "utf8");
+    let named = await readlink2(`/proc/self/fd/${fh.fd}`);
+    if (named !== real) throw new Error(`${real} opened as ${named}`);
+    let dev = (await fh.stat({ bigint: !0 })).dev;
+    return { fdinfo: await readFile8(`/proc/self/fdinfo/${fh.fd}`, "utf8"), dev };
   } finally {
     await fh.close();
   }
 }
 async function userMountOf(p) {
   if (process.platform !== "darwin" && process.platform !== "linux") return;
-  let real = await realpath7(p), dev = (await stat5(real, { bigint: !0 })).dev, best = process.platform === "linux" ? pickLinuxMount(await mounts(), await linuxFdinfo(real), dev) : await pickMount(await mounts(), real, dev, (mp) => stat5(mp, { bigint: !0 }).then((st) => st.dev, () => {
-  })), describe = `${best.source} on ${best.mountPoint} (${[best.type, ...best.options].join(", ")})`;
+  let real = await realpath7(p), best;
+  if (process.platform === "linux") {
+    let probe = await linuxMountProbe(real);
+    best = pickLinuxMount(await mounts(), probe.fdinfo, probe.dev);
+  } else {
+    let dev = (await stat5(real, { bigint: !0 })).dev;
+    best = await pickMount(await mounts(), real, dev, (mp) => stat5(mp, { bigint: !0 }).then((st) => st.dev, () => {
+    }));
+  }
+  let describe = `${best.source} on ${best.mountPoint} (${[best.type, ...best.options].join(", ")})`;
   if (process.platform === "darwin")
     return best.options.some((o) => o.startsWith("mounted by")) || best.options.includes("nobrowse") && !best.mountPoint.startsWith("/System/Volumes/") || /disk image/i.test(best.options.join(",")) ? describe : void 0;
   if (best.type.startsWith("fuse") || /^\/(run\/)?media\//.test(`${best.mountPoint}/`)) return describe;

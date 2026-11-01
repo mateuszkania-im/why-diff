@@ -10,7 +10,7 @@
  * the guard reads (a truncated index, an unreadable file), and that must not let it finish unchecked.
  */
 import { constants as fsConstants, createReadStream, realpath as realpathCb } from 'node:fs';
-import { access, lstat, open, readdir, readFile, realpath, stat, statfs } from 'node:fs/promises';
+import { access, lstat, open, readdir, readFile, readlink, realpath, stat, statfs } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import readline from 'node:readline';
 import os from 'node:os';
@@ -269,7 +269,12 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // differs from its parent directory's) could be a volume mounted over it during the session.
   if (!devicesRecorded) {
     const dirs: Array<readonly [string, string]> = [['repository root', await real(root)], ['git dir', await real(commonDir)]];
-    if (gitDir !== commonDir) dirs.push(['worktree git dir', await real(gitDir)]);
+    if (gitDir !== commonDir) {
+      // A linked worktree's own git dir lives in the common dir (`worktrees/<name>`): it must be on the
+      // common dir's device. Its parent is no reference: a volume mounted over `worktrees/` would match it.
+      const [wt, common] = await Promise.all([deviceOf(await real(gitDir), pathStat), deviceOf(await real(commonDir), pathStat)]);
+      if (wt === undefined || wt !== common) throw new FailClosedError(`unreviewed: the worktree git dir (${gitDir}) is on another device than the git common dir (${commonDir}), and no SessionStart record kept its device, so a volume mounted over it during the session cannot be ruled out`);
+    }
     for (const [what, dir] of dirs) {
       const [here, up] = await Promise.all([deviceOf(dir, pathStat), deviceOf(path.dirname(dir), pathStat)]);
       if (here === undefined || here !== up) throw new FailClosedError(`unreviewed: the ${what} (${dir}) is the root of its own volume, and no SessionStart record kept its device, so a volume mounted over it during the session cannot be ruled out`);
@@ -624,12 +629,13 @@ async function checkSubmodules(ctx: SessionCheck, repo: RepoUnderCheck, layeredA
     }
     const rec = ctx.recordedSubmodules?.[key];
     // Without devices recorded for it, a submodule's own worktree git dir (a linked worktree) on
-    // another device than its parent directory could be a volume mounted over it during the session.
+    // another device than its common dir could be a volume mounted over it during the session.
     if (rec?.rootDev === undefined && rec?.gitDev === undefined && subGitDir !== subCommon) {
-      const realGitDir = await real(subGitDir);
-      const [here, up] = await Promise.all([deviceOf(realGitDir, ctx.pathStat), deviceOf(path.dirname(realGitDir), ctx.pathStat)]);
-      if (here === undefined || here !== up) {
-        unreviewed(p, 'has its worktree git dir at the root of its own volume, and no SessionStart record kept its device');
+      // Its own worktree git dir must be on its common dir's device (its parent is no reference: a
+      // volume mounted over `worktrees/` would match it).
+      const [here, common] = await Promise.all([deviceOf(await real(subGitDir), ctx.pathStat), deviceOf(await real(subCommon), ctx.pathStat)]);
+      if (here === undefined || here !== common) {
+        unreviewed(p, 'has its worktree git dir on another device than its git common dir, and no SessionStart record kept its device');
         continue;
       }
     }
@@ -1080,11 +1086,19 @@ export function pickLinuxMount(entries: MountEntry[], fdinfo: string, dev: bigin
   if (SINGLE_DEVICE_FS.has(entry.type) && entry.majorMinor !== linuxMajorMinor(dev)) throw new Error(`mount ${id} (${entry.mountPoint}) is device ${entry.majorMinor}, the path is ${linuxMajorMinor(dev)}`);
   return entry;
 }
-/** Linux: `/proc/self/fdinfo` of `real`, opened read-only (a directory too) and closed again. */
-async function linuxFdinfo(real: string): Promise<string> {
-  const fh = await open(real, 'r');
+/**
+ * Linux: open `real` once, read-only (`O_DIRECTORY` for a directory), and from that one handle read
+ * its device (`fstat`) and its `/proc/self/fdinfo` (the mount ID); the handle must still name `real`
+ * (`/proc/self/fd/<fd>`), or a path swapped in between would be read instead. Closed again.
+ */
+async function linuxMountProbe(real: string): Promise<{ fdinfo: string; dev: bigint }> {
+  const dir = (await lstat(real)).isDirectory();
+  const fh = await open(real, fsConstants.O_RDONLY | (dir ? fsConstants.O_DIRECTORY : 0));
   try {
-    return await readFile(`/proc/self/fdinfo/${fh.fd}`, 'utf8');
+    const named = await readlink(`/proc/self/fd/${fh.fd}`);
+    if (named !== real) throw new Error(`${real} opened as ${named}`);
+    const dev = (await fh.stat({ bigint: true })).dev;
+    return { fdinfo: await readFile(`/proc/self/fdinfo/${fh.fd}`, 'utf8'), dev };
   } finally {
     await fh.close();
   }
@@ -1100,10 +1114,14 @@ async function linuxFdinfo(real: string): Promise<string> {
 async function userMountOf(p: string): Promise<string | undefined> {
   if (process.platform !== 'darwin' && process.platform !== 'linux') return undefined;
   const real = await realpath(p);
-  const dev = (await stat(real, { bigint: true })).dev;
-  const best = process.platform === 'linux'
-    ? pickLinuxMount(await mounts(), await linuxFdinfo(real), dev)
-    : await pickMount(await mounts(), real, dev, (mp) => stat(mp, { bigint: true }).then((st) => st.dev, () => undefined));
+  let best: MountEntry;
+  if (process.platform === 'linux') {
+    const probe = await linuxMountProbe(real);
+    best = pickLinuxMount(await mounts(), probe.fdinfo, probe.dev);
+  } else {
+    const dev = (await stat(real, { bigint: true })).dev;
+    best = await pickMount(await mounts(), real, dev, (mp) => stat(mp, { bigint: true }).then((st) => st.dev, () => undefined));
+  }
   const describe = `${best.source} on ${best.mountPoint} (${[best.type, ...best.options].join(', ')})`;
   if (process.platform === 'darwin') {
     if (best.options.some((o) => o.startsWith('mounted by'))) return describe;
