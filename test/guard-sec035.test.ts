@@ -6,7 +6,7 @@
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { lstat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -830,20 +830,20 @@ describe('sec035 fix round 1 (A, B, D): submodule file systems and index flags',
 describe('sec035 fix round 1 (E, F): the Windows file system type', () => {
   it('runs PowerShell by absolute path, in the temporary directory, without a shell, with the path as data only', () => {
     const nasty = "C:\\work\\a'b\u2018c\u2019d\u201ae\u201bf$(calc)`g;h\\repo";
-    const c = windowsVolumeCommand(nasty);
-    const other = windowsVolumeCommand('C:\\plain');
+    const c = windowsVolumeCommand([nasty, 'D:\\x']);
+    const other = windowsVolumeCommand(['C:\\plain']);
     expect(path.basename(c.file).toLowerCase()).toBe('powershell.exe');
     expect(path.isAbsolute(c.file) || /^[A-Za-z]:\\/.test(c.file)).toBe(true);
     expect(c.file.toLowerCase()).toContain('system32');
     expect(c.options.cwd).toBe(os.tmpdir());
     expect(c.options.shell).toBe(false);
     expect(c.options.windowsHide).toBe(true);
-    expect(c.options.env.WD_PATH).toBe(nasty);
+    expect(c.options.env.WD_PATHS).toBe(`${nasty}\nD:\\x`);
     // The script is a constant: nothing of the path is in it.
     expect(c.args).toEqual(other.args);
     const script = c.args.join(' ');
     for (const part of ['work', "a'b", '\u2018', '\u2019', '\u201a', '\u201b', '$(calc)', '`g', ';h']) expect(script).not.toContain(part);
-    expect(script).toContain('$env:WD_PATH');
+    expect(script).toContain('$env:WD_PATHS');
   });
 
   it.skipIf(posix)('a test directory replaced by a junction to a weakened copy blocks (junctions are never followed)', async () => {
@@ -858,4 +858,118 @@ describe('sec035 fix round 1 (E, F): the Windows file system type', () => {
     expect(res.block).toBe(true);
     expect(res.message).toContain(TEST);
   });
+});
+
+describe('sec035 fix round 2 (R1): user-mounted volumes and volume roots', () => {
+  const srcEdit = (r: string) => (t: number): SyntheticCall[] => [edit(t, path.join(r, 'src', 'f.js'), 'x;', 'x + 0;')];
+  /** A record written at session start that reads as written before the first call. */
+  async function recorded(): Promise<{ repo: string; home: string; tp: string; data: string; times: (callAt: () => number) => (p: string) => Promise<number> }> {
+    const data = temp('wd-s35-data-');
+    process.env.CLAUDE_PLUGIN_DATA = data;
+    const x = repo();
+    await recordSessionStart({ session_id: SID, cwd: x.repo });
+    const times = (callAt: () => number) => async (p: string): Promise<number> => {
+      const st = await lstat(p);
+      return path.resolve(p).startsWith(path.join(data, 'sessions')) ? callAt() - 5000 : st.ctimeMs;
+    };
+    return { ...x, data, times };
+  }
+
+  it('a repository on a volume a user mounted blocks, with or without a record', async () => {
+    const x = await recorded();
+    replaceIn(path.join(x.repo, 'src', 'f.js'), 'x;', 'x + 0;');
+    const userMount = async (p: string) => (path.resolve(p).startsWith(x.repo) ? `${x.repo} (hfs, local, mounted by alice)` : undefined);
+    let callAt = 0;
+    const withRecord = await guardRun(x.repo, x.home, (t) => { callAt = t; return srcEdit(x.repo)(t); }, { statTime: x.times(() => callAt), userMount } as Partial<GuardOptions>);
+    expect(withRecord.block).toBe(true);
+    expect(withRecord.message).toContain('mounted by alice');
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    const y = repo();
+    const noRecord = await guardRun(y.repo, y.home, srcEdit(y.repo), { userMount: async (p: string) => (path.resolve(p).startsWith(path.join(y.repo, '.git')) ? 'mounted by alice' : undefined) } as Partial<GuardOptions>);
+    expect(noRecord.block).toBe(true);
+  });
+
+  it('without a device record, a root or git dir on another device than its parent directory blocks; with one it does not', async () => {
+    const bumped = (dir: string) => async (p: string) => {
+      const st = await lstat(p);
+      const hit = path.resolve(p) === dir || path.resolve(p).startsWith(`${dir}${path.sep}`);
+      return { dev: hit ? Number(st.dev) + 1000 : Number(st.dev), ctimeMs: st.ctimeMs, symlink: st.isSymbolicLink() };
+    };
+    const y = repo();
+    replaceIn(path.join(y.repo, 'src', 'f.js'), 'x;', 'x + 0;');
+    const rootVol = await guardRun(y.repo, y.home, srcEdit(y.repo), { pathStat: bumped(y.repo) });
+    expect(rootVol.block).toBe(true);
+    expect(rootVol.message).toContain('volume');
+    const gitVol = await guardRun(y.repo, y.home, srcEdit(y.repo), { pathStat: bumped(path.join(y.repo, '.git')) });
+    expect(gitVol.block).toBe(true);
+    // A record from session start that saw the same devices: a repository on its own volume is fine.
+    const x = await recorded();
+    replaceIn(path.join(x.repo, 'src', 'f.js'), 'x;', 'x + 0;');
+    const realRecord = JSON.parse(readFileSync(path.join(x.data, 'sessions', `${hash(SID)}.json`), 'utf8')) as Record<string, number>;
+    writeFileSync(path.join(x.data, 'sessions', `${hash(SID)}.json`), JSON.stringify({ ...realRecord, rootDev: realRecord.rootDev! + 1000, gitDev: realRecord.gitDev! + 1000 }));
+    let callAt = 0;
+    const ok = await guardRun(x.repo, x.home, (t) => { callAt = t; return srcEdit(x.repo)(t); }, { statTime: x.times(() => callAt), pathStat: bumped(x.repo) });
+    expect(ok.message ?? '').toBe('');
+    expect(ok.block).toBe(false);
+  });
+});
+
+describe.skipIf(!posix)('sec035 fix round 2 (R2): a .git symlink does not turn off index and ref times', () => {
+  it('top level: the test file dropped from the index and HEAD behind a symlinked .git blocks', async () => {
+    const x = repo();
+    pause(20);
+    const mark = Date.now();
+    const away = path.join(temp('wd-s35-gd-'), 'gitdir');
+    renameSync(path.join(x.repo, '.git'), away);
+    symlinkSync(away, path.join(x.repo, '.git'));
+    git(x.repo, ['rm', '-q', '--cached', TEST]);
+    git(x.repo, ['commit', '-qm', 'tidy']);
+    const res = await guardRun(x.repo, x.home, (t) => [bash(t, 'bash /tmp/tidy.sh')], { objectTime: objectsAfter(() => mark) });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain(TEST);
+  });
+
+  it('submodule: a symlinked lib/.git is not a quiet submodule', async () => {
+    const lib = temp('wd-s35-r2-lib-');
+    mkdirSync(path.join(lib, 'test'));
+    writeFileSync(path.join(lib, 'test', 'b.test.js'), testFile());
+    git(lib, ['init', '-q', '-b', 'main']);
+    git(lib, ['add', '-A']);
+    git(lib, ['commit', '-qm', 'L'], PAST);
+    const x = repo('wd-s35-r2-');
+    git(x.repo, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'lib']);
+    git(x.repo, ['commit', '-qm', 'sub'], PAST);
+    pause(20);
+    const mark = Date.now();
+    const sub = path.join(x.repo, 'lib');
+    rmSync(path.join(sub, '.git'));
+    symlinkSync(path.join('..', '.git', 'modules', 'lib'), path.join(sub, '.git'));
+    git(sub, ['rm', '-q', '--cached', 'test/b.test.js']);
+    git(sub, ['commit', '-qm', 'tidy']);
+    const res = await guardRun(x.repo, x.home, (t) => [bash(t, 'bash /tmp/tidy.sh')], { objectTime: objectsAfter(() => mark) });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('lib/test/b.test.js');
+  });
+});
+
+describe.skipIf(posix)('sec035 fix round 2 (R4): can the owner set a file\'s NTFS change time on Windows?', () => {
+  it('SetFileInformationByHandle(FileBasicInfo) moves ChangeTime, which Node reads as ctime', () => {
+    const f = path.join(temp('wd-s35-ct-'), 'a.txt');
+    writeFileSync(f, 'x');
+    const target = Date.UTC(2020, 0, 1);
+    const src = [
+      'using System; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;',
+      'public static class WdCt {',
+      '  [StructLayout(LayoutKind.Sequential)] public struct FBI { public long CreationTime; public long LastAccessTime; public long LastWriteTime; public long ChangeTime; public uint FileAttributes; }',
+      '  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetFileInformationByHandle(SafeFileHandle h, int cls, ref FBI info, uint size);',
+      '  public static bool Set(string p, long ft) { using (var fs = System.IO.File.Open(p, System.IO.FileMode.Open, System.IO.FileAccess.ReadWrite)) { var i = new FBI(); i.ChangeTime = ft; return SetFileInformationByHandle(fs.SafeFileHandle, 0, ref i, (uint)Marshal.SizeOf(typeof(FBI))); } }',
+      '}',
+    ].join('\n');
+    const script = 'Add-Type -TypeDefinition $env:WD_SRC; [WdCt]::Set($env:WD_FILE, [DateTime]::Parse($env:WD_AT).ToUniversalTime().ToFileTimeUtc())';
+    const out = execFileSync(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: { ...process.env, WD_SRC: src, WD_FILE: f, WD_AT: new Date(target).toISOString() } });
+    const ctime = statSync(f).ctimeMs;
+    // Recorded outcome (documentation, see README Limitations): the call succeeds as the file's owner and ctime moves.
+    expect(out.trim()).toBe('True');
+    expect(Math.abs(ctime - target)).toBeLessThan(2000);
+  }, 60_000);
 });
