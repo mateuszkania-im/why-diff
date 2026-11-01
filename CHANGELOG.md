@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.1
+
+### Security
+
+Guard bypasses found in a security review of 0.3.0 (the agent is treated as the adversary):
+
+- Changes made by background or detached work are credited: a Bash call with `run_in_background` or a `backgroundTaskId`, a command that detaches a process (a single `&` outside quotes, `nohup`, `setsid`, `disown`, `at`, `crontab`, `systemd-run`, `launchctl`, `tmux`, `screen`, `coproc`, `docker run -d`, `docker compose up -d`, `systemctl start`, `pm2 start`, read with the shell lexer, by basename, behind wrappers and inside `sh -c` / `eval` / command substitutions), and a call with no result keep their time window open until the guard runs.
+- Time windows come from every tool call of the session (Edit, Write, MCP tools, WebFetch, subagents...), not only Bash, so a later edit or write cannot move a file's change time out of the windows. Claude Code sessions expose them as `toolWindows` (was `shellWindows`).
+- A deleted file whose parent was replaced by a file (ENOTDIR) or a symlink loop (ELOOP) is still dated by the nearest existing path.
+- Windows uses ctime too (the NTFS change time, which `utimes` cannot set).
+- Git cannot be configured to hide a change: every diff runs without textconv, external diff, fsmonitor, the user attributes file, replace refs, grafts, a changed `bigFileThreshold` or prefix settings, and with every filter driver switched off (through `GIT_CONFIG_*`, so any name works). Files that attributes mark binary are diffed again as text unless git's own content rule says binary; no file cap. A file whose text cannot be produced gets the new `unreviewed` risk label, and the guard blocks on it.
+- Edit paths are canonicalised: true case through `realpath.native` and case-insensitive matching on a case-insensitive file system (whatever `core.ignorecase` says); on Windows, `\\?\` and `\\.\` prefixes, `::$DATA` and trailing dots and spaces are dropped.
+- The session base no longer trusts committer dates: it comes from HEAD's reflog (then first-parent history), and only commits whose objects were provably written before the session (loose, or in a pre-session pack and index of the repository's own store) qualify. No such commit, a changed `.git/shallow` or pack index: the guard blocks and says it could not check. A base that is not an ancestor of HEAD becomes the merge base.
+- No dedupe across turns: the agent could pre-record the state (running `why-diff guard` itself, writing `.why-diff/guard-state.json`, or appending to its transcript). Every Stop with risky hits blocks; `stop_hook_active` still lets the agent finish within a turn, and a repeat block gets a short "still present" message. `.why-diff/guard-state.json` is no longer written.
+
+### Fixed
+
+- Markdown: quoted prompts have links, images and headings escaped; Markdown and JSON drop escape sequences with their payload (OSC 8 link targets), zero-width characters, bidi controls and the BOM.
+- Notes mode: noted hunks are indexed per file (it was quadratic: 50 notes of 13k hunks against 5k diff hunks took over 20 s) and capped at 50,000 across notes.
+- Windows: `--classify` finds `claude.exe`, `claude.cmd` or `claude.bat`, never the extensionless npm shell script.
+
 ## 0.3.0
 
 ### Added
