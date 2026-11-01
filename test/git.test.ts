@@ -511,3 +511,43 @@ describe('tests-disabled end to end', () => {
   });
 });
 
+describe('getDiff: attributes, textconv and fsmonitor cannot hide changes', () => {
+  function repoWithChange(): string {
+    const repo = freshRepo();
+    put(repo, 'a.test.js', 'it("a", () => {});\n');
+    put(repo, 'img.bin', Buffer.from([0x89, 0x50, 0, 1, 2, 3, 0, 4]));
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-qm', 'init');
+    put(repo, 'a.test.js', 'it.skip("a", () => {});\n');
+    put(repo, 'img.bin', Buffer.from([0x89, 0x50, 0, 9, 9, 9, 0, 4]));
+    return repo;
+  }
+  const added = (diff: string, file: string): string[] =>
+    parseUnifiedDiff(diff).filter((h) => h.file === file).flatMap((h) => h.lines.filter((l) => l.type === 'add').map((l) => l.text));
+
+  it('shows a text file marked -diff in .git/info/attributes as text; a real binary stays binary', async () => {
+    const repo = repoWithChange();
+    writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js -diff\n');
+    const diff = await getDiff(repo, { workingTree: true });
+    expect(added(diff, 'a.test.js')).toEqual(['it.skip("a", () => {});']);
+    expect(diff).not.toContain('\0');
+    expect(diff).toMatch(/Binary files a\/img\.bin and b\/img\.bin differ/);
+  });
+
+  it('ignores a textconv driver and core.fsmonitor', async () => {
+    const repo = repoWithChange();
+    writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js diff=hide\n');
+    sh(repo, 'config', 'diff.hide.textconv', 'sed s/it.skip/it/');
+    sh(repo, 'config', 'core.fsmonitor', 'false-hook-that-does-not-exist');
+    expect(added(await getDiff(repo, { workingTree: true }), 'a.test.js')).toEqual(['it.skip("a", () => {});']);
+  });
+
+  it('shows a file a committed .gitattributes marks binary as text in a range diff', async () => {
+    const repo = repoWithChange();
+    put(repo, '.gitattributes', '*.js binary\n');
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-qm', 'hide');
+    expect(added(await getDiff(repo, 'HEAD~1..HEAD'), 'a.test.js')).toEqual(['it.skip("a", () => {});']);
+  });
+});
+

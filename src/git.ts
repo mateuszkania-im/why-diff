@@ -10,6 +10,8 @@ import { execFile } from 'node:child_process';
 import { lstat, readFile, readlink, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { parseUnifiedDiff } from './diff-parse.js';
+import { BINARY_HUNK_HEADER } from './types.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -82,12 +84,28 @@ const BINARY_SNIFF_BYTES = 8000;
 const MAX_UNTRACKED_BYTES = 2 * 1024 * 1024;
 
 /**
+ * Config that must not change what git reports about the working tree or a diff, whatever the
+ * repository (or an agent working in it) set: no fsmonitor hook deciding which files changed, no
+ * user attributes file, no external diff program, fixed `a/` `b/` prefixes, repo-relative paths.
+ */
+const SAFE_CONFIG = [
+  'core.quotePath=false',
+  'core.fsmonitor=false',
+  'core.untrackedCache=false',
+  'core.attributesFile=',
+  'diff.external=',
+  'diff.noprefix=false',
+  'diff.mnemonicPrefix=false',
+  'diff.relative=false',
+].flatMap((c) => ['-c', c]);
+
+/**
  * Run git in `cwd` without a shell. Resolves with trimmed-right stdout.
- * `-c core.quotePath=false` keeps non-ASCII paths readable in diff headers.
+ * `-c core.quotePath=false` keeps non-ASCII paths readable in diff headers; see {@link SAFE_CONFIG}.
  */
 export async function git(cwd: string, args: string[], opts: { trim?: boolean } = {}): Promise<string> {
   try {
-    const { stdout } = await execFileAsync('git', ['-c', 'core.quotePath=false', ...args], {
+    const { stdout } = await execFileAsync('git', [...SAFE_CONFIG, ...args], {
       cwd,
       maxBuffer: MAX_BUFFER,
       encoding: 'utf8',
@@ -175,12 +193,13 @@ const MISSING_REVISION = /unknown revision|bad revision|no merge base|ambiguous 
 
 async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptions): Promise<string> {
   const unified = `--unified=${opts.unified ?? 3}`;
-  const common = ['diff', '--no-color', '--no-ext-diff', '-M', unified];
+  // No textconv and no external diff: the diff shows the bytes, not what a filter makes of them.
+  const common = ['diff', '--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/', '-M', unified];
 
   if (typeof target === 'string') {
     // A range is a revision, never an option (`--output=<file>` would make git write a file).
     if (target.startsWith('-')) throw new Error(`invalid range "${target}"`);
-    return git(cwd, [...common, target], { trim: false });
+    return revealTextMarkedBinary(cwd, [...common, target], await git(cwd, [...common, target], { trim: false }));
   }
 
   let baseRev: string;
@@ -192,7 +211,7 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
     baseRev = await emptyTree(cwd); // unborn branch: everything tracked is "added"
   }
   const pathspec = opts.paths?.length ? ['--', ...opts.paths] : [];
-  let diff = await git(cwd, [...common, baseRev, ...pathspec], { trim: false });
+  let diff = await revealTextMarkedBinary(cwd, [...common, baseRev], await git(cwd, [...common, baseRev, ...pathspec], { trim: false }));
 
   if (target.includeUntracked !== false) {
     const root = await repoRoot(cwd);
@@ -203,6 +222,72 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
     }
   }
   return diff;
+}
+
+/** Files git showed as binary above this size (either side) stay binary: never re-diffed as text. */
+const MAX_TEXT_REDIFF_BYTES = 2 * 1024 * 1024;
+const MAX_TEXT_REDIFF_FILES = 500;
+
+/**
+ * Git shows a file as binary when its content is (a NUL byte in the first 8000 bytes), but also
+ * when attributes say so (`*.js -diff` in `.gitattributes` or `.git/info/attributes`, a diff driver
+ * with `binary = true`). Attributes cannot be switched off for a diff, so every file shown as binary
+ * is diffed again with `--text`, and its text replaces the binary stub unless the text holds a NUL
+ * byte (a real binary) or either side is over {@link MAX_TEXT_REDIFF_BYTES}.
+ */
+async function revealTextMarkedBinary(cwd: string, args: string[], diff: string): Promise<string> {
+  if (!diff.includes('Binary files ') && !diff.includes('GIT binary patch')) return diff;
+  const sections = splitSections(diff);
+  const binary = new Map<number, string[]>();
+  for (const [i, section] of sections.entries()) {
+    const h = parseUnifiedDiff(section)[0];
+    if (h?.header !== BINARY_HUNK_HEADER) continue;
+    binary.set(i, [...new Set([h.file, ...(h.oldFile ? [h.oldFile] : [])])]);
+    if (binary.size >= MAX_TEXT_REDIFF_FILES) break;
+  }
+  if (!binary.size) return diff;
+  const files = [...new Set([...binary.values()].flat())];
+  const literal = files.map((f) => `:(literal)${f}`);
+  // Sizes first, from the raw diff's blob ids (all zeros: the working tree file).
+  const sizes = new Map<string, number>();
+  try {
+    const raw = (await git(cwd, [...args.filter((a) => !a.startsWith('--unified')), '--raw', '-z', '--no-abbrev', '--', ...literal], { trim: false })).split('\0');
+    const root = await repoRoot(cwd);
+    for (let i = 0; i + 1 < raw.length; ) {
+      const meta = raw[i]!;
+      if (!meta.startsWith(':')) { i++; continue; }
+      const [, , oldSha = '', newSha = '', status = ''] = meta.slice(1).split(' ');
+      const twoPaths = /^[RC]/.test(status);
+      const paths = twoPaths ? [raw[i + 1]!, raw[i + 2]!] : [raw[i + 1]!];
+      i += twoPaths ? 3 : 2;
+      let biggest = 0;
+      for (const sha of [oldSha, newSha]) {
+        if (/^0+$/.test(sha)) continue;
+        biggest = Math.max(biggest, Number(await git(cwd, ['cat-file', '-s', sha]).catch(() => 'Infinity')));
+      }
+      if (/^0+$/.test(newSha)) biggest = Math.max(biggest, await stat(path.join(root, paths[paths.length - 1]!)).then((st) => st.size, () => 0));
+      for (const p of paths) sizes.set(p, Math.max(sizes.get(p) ?? 0, biggest));
+    }
+  } catch {
+    return diff;
+  }
+  const small = literal.filter((_, i) => (sizes.get(files[i]!) ?? Infinity) <= MAX_TEXT_REDIFF_BYTES);
+  if (!small.length) return diff;
+  const text = await git(cwd, [...args, '--text', '--', ...small], { trim: false }).catch(() => '');
+  const byFile = new Map<string, string>();
+  for (const section of splitSections(text)) {
+    const h = parseUnifiedDiff(section)[0];
+    if (h && !section.includes('\0')) byFile.set(h.file, section);
+  }
+  return sections.map((section, i) => {
+    const names = binary.get(i);
+    return (names && byFile.get(names[0]!)) ?? section;
+  }).join('');
+}
+
+/** A diff split into its per-file sections (each starting with `diff --git`). */
+function splitSections(diff: string): string[] {
+  return diff.split(/(?=^diff --git )/m).filter(Boolean);
 }
 
 /**

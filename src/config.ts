@@ -32,7 +32,7 @@ async function readOptional(root: string, rel: string, rev?: string): Promise<st
   if (rev !== undefined) {
     if (rev.startsWith('-')) return undefined;
     try {
-      return await git(root, ['show', `${rev}:${rel}`], { trim: false });
+      return await git(root, ['show', '--no-textconv', `${rev}:${rel}`], { trim: false });
     } catch {
       return undefined;
     }

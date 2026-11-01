@@ -353,7 +353,7 @@ async function loadConfigTexts(root: string, target: DiffTarget, files: string[]
       // A symlink on disk is never followed (it may point outside the repo).
       const text = rev === null
         ? ((await lstat(path.join(root, rel))).isSymbolicLink() ? null : await readFile(path.join(root, rel), 'utf8'))
-        : await git(root, ['show', `${rev}:${rel}`], { trim: false });
+        : await git(root, ['show', '--no-textconv', `${rev}:${rel}`], { trim: false });
       if (text !== null && text.length <= FILE_TEXT_CAP) out.set(rel, text);
     } catch { /* absent on that side */ }
   }
