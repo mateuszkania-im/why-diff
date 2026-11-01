@@ -15,7 +15,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // Guard runs over real repositories (submodules, CLI children) take seconds on Windows runners.
 vi.setConfig({ testTimeout: 30_000 });
-import { parseDarwinMounts, parseLinuxMountinfo, pickMount, runGuard, windowsVolumeCommand, type GuardOptions } from '../src/guard.js';
+import { parseDarwinMounts, parseLinuxMountinfo, pickLinuxMount, pickMount, runGuard, windowsVolumeCommand, type GuardOptions } from '../src/guard.js';
 import * as gitModule from '../src/git.js';
 import { recordSessionStart } from '../src/session-start.js';
 import type { LabelKind } from '../src/types.js';
@@ -1027,5 +1027,54 @@ describe('sec035 fix round 2 (I, J, K): mount entries by device, and a linked wo
     });
     expect(moved.block).toBe(true);
     expect(moved.message).toContain('worktree git dir');
+  });
+});
+
+describe('sec035 fix round 3 (L1, L3): Linux mounts by mount ID; a submodule\'s worktree git dir', () => {
+  const mountinfo = [
+    '22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw',
+    '35 22 0:181 / /srv/btrfs rw,relatime shared:20 - btrfs /dev/loop0 rw,space_cache=v2,subvolid=5,subvol=/',
+    '40 22 0:50 / /run/media/u/img rw,nosuid shared:30 - ext4 /dev/loop1 rw',
+  ].join('\n');
+  const entries = parseLinuxMountinfo(mountinfo);
+  const fdinfo = (id: number): string => `pos:\t0\nflags:\t0100000\nmnt_id:\t${id}\nino:\t256\n`;
+
+  it('finds the entry by the mount ID in fdinfo: a btrfs subvolume\'s anonymous device is no obstacle', () => {
+    // btrfs: stat says 0:182, mountinfo says 0:181; the mount ID decides.
+    expect(pickLinuxMount(entries, fdinfo(35), (0n << 8n) | 182n).mountPoint).toBe('/srv/btrfs');
+    expect(pickLinuxMount(entries, fdinfo(22), (8n << 8n) | 1n).mountPoint).toBe('/');
+    expect(pickLinuxMount(entries, fdinfo(40), 50n).mountPoint).toBe('/run/media/u/img');
+  });
+
+  it('fails closed with no mount ID, an unknown one, or a device that contradicts a single-device file system', () => {
+    expect(() => pickLinuxMount(entries, 'pos:\t0\n', 1n)).toThrow(/mnt_id/);
+    expect(() => pickLinuxMount(entries, fdinfo(99), 1n)).toThrow(/mount ID 99/);
+    expect(() => pickLinuxMount(entries, fdinfo(22), 50n)).toThrow(/device/);
+    expect(() => parseLinuxMountinfo('x 1 8:1 / / rw - ext4 /dev/sda1 rw')).toThrow(/unreadable/);
+  });
+
+  it('L3: a submodule that is a linked worktree, whose own git dir is on another device than its parent, blocks without a record', async () => {
+    const upstream = temp('wd-s35-l3-up-');
+    mkdirSync(path.join(upstream, 'test'));
+    writeFileSync(path.join(upstream, 'test', 'a.test.js'), testFile());
+    git(upstream, ['init', '-q', '-b', 'main']);
+    git(upstream, ['add', '-A']);
+    git(upstream, ['commit', '-qm', 'L'], PAST);
+    const x = repo('wd-s35-l3-');
+    const sub = path.join(x.repo, 'lib');
+    git(upstream, ['worktree', 'add', '-q', '-b', 'wt', sub]);
+    git(x.repo, ['add', 'lib']);
+    git(x.repo, ['commit', '-qm', 'lib as a gitlink'], PAST);
+    const wtGit = realpathSync(path.join(upstream, '.git', 'worktrees', 'lib'));
+    const pathStat = async (p: string) => {
+      const st = await lstat(p);
+      const hit = path.resolve(p) === wtGit || path.resolve(p).startsWith(`${wtGit}${path.sep}`);
+      return { dev: hit ? Number(st.dev) + 1000 : Number(st.dev), ctimeMs: st.ctimeMs, symlink: st.isSymbolicLink() };
+    };
+    const control = await guardRun(x.repo, x.home, (t) => [bash(t, 'echo hi')]);
+    expect(control.message ?? '').toBe('');
+    const res = await guardRun(x.repo, x.home, (t) => [bash(t, 'echo hi')], { pathStat });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('worktree git dir');
   });
 });
