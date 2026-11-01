@@ -7,8 +7,8 @@
  */
 
 import { execFile, spawn } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
-import { lstat, mkdtemp, open, readFile, readlink, realpath, rm, stat } from 'node:fs/promises';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { lstat, mkdtemp, open, readFile, readlink, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -157,10 +157,11 @@ const DIFF_COMMANDS: ReadonlySet<string> = new Set(['diff', 'log', 'show']);
 
 /**
  * The argument list and the fixed environment of every git process why-diff starts (see {@link git}):
- * {@link safeConfig} first; `--no-ext-diff --no-textconv` (and `--ignore-submodules=dirty`, so no
- * `git status` runs inside a submodule with that submodule's own config, and no `submodule.<name>.ignore`
- * hides a moved gitlink) on diff and log commands; `--no-filters` on `hash-object`. The environment
- * is {@link baseEnv}: no system or global config, no pager, no prompt, no lazy fetch.
+ * {@link safeConfig} first; `--no-ext-diff --no-textconv` on diff, log, show and `reflog show`;
+ * `--ignore-submodules=dirty` on diff and status, so no `git status` runs inside a submodule with that
+ * submodule's own config (the guard checks submodules itself) and no `submodule.<name>.ignore` hides a
+ * moved gitlink; `--no-filters` on `hash-object`. The environment is {@link HARDENED_ENV}: no system
+ * config, the global one replaced by {@link globalConfigPath}, no pager, no prompt, no lazy fetch.
  */
 export function hardenedInvocation(args: string[]): { args: string[]; env: Record<string, string> } {
   const out = [...args];
@@ -169,6 +170,7 @@ export function hardenedInvocation(args: string[]): { args: string[]; env: Recor
   const sub = out[i];
   if (sub === 'reflog' && out[i + 1] === 'show') out.splice(i + 2, 0, '--no-ext-diff', '--no-textconv');
   else if (sub === 'diff') out.splice(i + 1, 0, '--no-ext-diff', '--no-textconv', '--ignore-submodules=dirty');
+  else if (sub === 'status') out.splice(i + 1, 0, '--ignore-submodules=dirty');
   else if (sub && DIFF_COMMANDS.has(sub)) out.splice(i + 1, 0, '--no-ext-diff', '--no-textconv');
   else if (sub === 'hash-object') out.splice(i + 1, 0, '--no-filters');
   return { args: [...safeConfig(), ...out], env: HARDENED_ENV };
@@ -179,7 +181,7 @@ export function hardenedInvocation(args: string[]): { args: string[]; env: Recor
  * is the agent's to write, and either could name a program: a filter, an fsmonitor hook, a pager),
  * no pager, no terminal prompt, and no fetch of missing objects from a promisor remote (whose URL
  * could run a transport program). Non-executable settings the user keeps there are passed on by
- * {@link userConfigPairs}.
+ * {@link globalConfigPath}.
  */
 const HARDENED_ENV: Record<string, string> = {
   GIT_CONFIG_NOSYSTEM: '1',
@@ -247,30 +249,77 @@ function filterPairs(cwd: string): Promise<Array<[string, string]>> {
 /**
  * Settings from the user's global and system config that change what git reads but can never run
  * anything (line endings, the global excludes file, case and Unicode handling, `safe.directory`,
- * the identity for `why-diff notes`): passed on as command line config, since those files are not
- * read (see {@link HARDENED_ENV}). Read once per process; nothing that fails here is fatal.
+ * the identity for `why-diff notes`). Those files are not read (see {@link HARDENED_ENV}): these keys
+ * alone are copied into a config file of why-diff's own, which git reads as the global config, so
+ * they keep global precedence (the repository's own config still wins). No key names a program,
+ * and `include` / `includeIf` are never copied.
  */
 const USER_KEYS = /^(core\.(autocrlf|eol|safecrlf|excludesfile|ignorecase|precomposeunicode|longpaths|symlinks|filemode|protectntfs|protecthfs)|safe\.directory|user\.(name|email))$/;
+/** The environment that finds the user's own global and system config (the hook's, which the agent does not control). */
 function userScopeEnv(): NodeJS.ProcessEnv {
   const env = baseEnv();
   delete env.GIT_CONFIG_NOSYSTEM;
   delete env.GIT_CONFIG_GLOBAL;
+  for (const k of ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM']) if (process.env[k] !== undefined) env[k] = process.env[k];
   return env;
 }
-let userPairs: Promise<Array<[string, string]>> | undefined;
-function userConfigPairs(): Promise<Array<[string, string]>> {
-  userPairs ??= execFileAsync('git', hardenedInvocation(['config', '-z', '--show-scope', '--get-regexp', USER_KEYS.source]).args, { cwd: os.tmpdir(), encoding: 'utf8', env: userScopeEnv() })
-    .then(({ stdout }) => {
-      const pairs: Array<[string, string]> = [];
-      for (const entry of stdout.split('\0')) {
-        // `<scope>\t<key>\n<value>`
-        const m = /^(\w+)\t([^\n]+)\n?([\s\S]*)$/.exec(entry);
-        if (!m || (m[1] !== 'system' && m[1] !== 'global')) continue;
-        if (USER_KEYS.test(m[2]!.toLowerCase())) pairs.push([m[2]!, m[3]!]);
-      }
-      return pairs;
-    }, () => []);
-  return userPairs;
+const userConfig = new Map<string, Promise<string>>();
+/** The text of the config file {@link globalConfigPath} writes (exported for tests). */
+export function forwardedGlobalConfig(): Promise<string> {
+  const key = JSON.stringify(['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM', 'HOME', 'XDG_CONFIG_HOME', 'USERPROFILE'].map((k) => process.env[k] ?? null));
+  let text = userConfig.get(key);
+  if (!text) {
+    text = execFileAsync('git', hardenedInvocation(['config', '-z', '--show-scope', '--get-regexp', USER_KEYS.source]).args, { cwd: os.tmpdir(), encoding: 'utf8', env: userScopeEnv() })
+      .then(({ stdout }) => configText(parseScoped(stdout).filter(([scope, k]) => (scope === 'system' || scope === 'global') && USER_KEYS.test(k.toLowerCase())).map(([, k, v]) => [k, v] as [string, string])), () => '');
+    userConfig.set(key, text);
+  }
+  return text;
+}
+
+/** `git config -z --show-scope --get-regexp` output: `<scope>\0<key>\n<value>\0` records (a bare `<key>` means true). */
+function parseScoped(out: string): Array<[string, string, string]> {
+  const tokens = out.split('\0');
+  const entries: Array<[string, string, string]> = [];
+  for (let i = 0; i + 1 < tokens.length; i += 2) {
+    const record = tokens[i + 1]!;
+    const nl = record.indexOf('\n');
+    entries.push([tokens[i]!, nl === -1 ? record : record.slice(0, nl), nl === -1 ? 'true' : record.slice(nl + 1)]);
+  }
+  return entries;
+}
+
+/** A config file holding `pairs` (`section.name` keys), every value quoted and escaped. */
+function configText(pairs: Array<[string, string]>): string {
+  const sections = new Map<string, string[]>();
+  for (const [key, value] of pairs) {
+    const dot = key.indexOf('.');
+    const section = key.slice(0, dot).toLowerCase();
+    const name = key.slice(dot + 1);
+    if (!/^[a-z]+$/.test(section) || !/^[A-Za-z][A-Za-z0-9-]*$/.test(name)) continue;
+    const quoted = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\t/g, '\\t');
+    if (!sections.has(section)) sections.set(section, []);
+    sections.get(section)!.push(`\t${name} = "${quoted}"`);
+  }
+  return [...sections].map(([section, lines]) => `[${section}]\n${lines.join('\n')}\n`).join('');
+}
+
+const globalFiles = new Map<string, Promise<string>>();
+/** A file (mode 0600, in the temporary directory, removed at exit) holding {@link forwardedGlobalConfig}; `/dev/null` when it is empty. */
+async function globalConfigPath(): Promise<string> {
+  const text = await forwardedGlobalConfig();
+  if (!text) return HARDENED_ENV.GIT_CONFIG_GLOBAL!;
+  let file = globalFiles.get(text);
+  if (!file) {
+    file = (async () => {
+      const dir = await mkdtemp(path.join(os.tmpdir(), 'why-diff-gitconfig-'));
+      const f = path.join(dir, 'config');
+      await writeFile(f, text, { mode: 0o600 });
+      process.once('exit', () => rmSync(dir, { recursive: true, force: true }));
+      return f;
+    })();
+    globalFiles.set(text, file);
+  }
+  return file;
 }
 
 /**
@@ -288,8 +337,8 @@ export function baseEnv(): NodeJS.ProcessEnv {
   return { ...env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: NO_GRAFTS, ...HARDENED_ENV };
 }
 async function gitEnv(cwd: string): Promise<NodeJS.ProcessEnv> {
-  const pairs = [...(await userConfigPairs()), ...(await filterPairs(cwd))];
-  const env: NodeJS.ProcessEnv = baseEnv();
+  const pairs = await filterPairs(cwd);
+  const env: NodeJS.ProcessEnv = { ...baseEnv(), GIT_CONFIG_GLOBAL: await globalConfigPath() };
   pairs.forEach(([k, v], n) => {
     env[`GIT_CONFIG_KEY_${n}`] = k;
     env[`GIT_CONFIG_VALUE_${n}`] = v;
