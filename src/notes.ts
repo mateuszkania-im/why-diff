@@ -5,7 +5,7 @@
  * and it never sets labels (those are always computed from the diff).
  */
 import { spawn } from 'node:child_process';
-import { git, mergeBase, type DiffTarget } from './git.js';
+import { git, hardenedInvocation, mergeBase, type DiffTarget } from './git.js';
 import { redactSecrets } from './redact.js';
 import { stripControls } from './report/shared.js';
 import type { AttributedHunk, Harness, LabelKind, MatchStrength, Prompt, Report, Session } from './types.js';
@@ -302,9 +302,14 @@ async function commitRange(root: string, target: DiffTarget): Promise<string[] |
   return null;
 }
 
+/**
+ * The one write why-diff makes (`why-diff notes`, run by the user): with the hardened arguments (no
+ * hooks, see {@link hardenedInvocation}), but the user's own environment and config, since the notes
+ * commit needs their identity.
+ */
 function gitWithInput(cwd: string, args: string[], input: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn('git', args, { cwd, stdio: ['pipe', 'ignore', 'pipe'], env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } });
+    const child = spawn('git', hardenedInvocation(args).args, { cwd, stdio: ['pipe', 'ignore', 'pipe'], env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } });
     let stderr = '';
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (d: string) => { stderr += d; });

@@ -9,17 +9,22 @@
  * cannot be read), any error while checking it blocks, with the reason: the agent can break what
  * the guard reads (a truncated index, an unreadable file), and that must not let it finish unchecked.
  */
-import { constants as fsConstants, createReadStream } from 'node:fs';
-import { access, lstat, readdir, readFile, realpath } from 'node:fs/promises';
+import { constants as fsConstants, createReadStream, realpath as realpathCb } from 'node:fs';
+import { access, lstat, open, readdir, readFile, readlink, realpath, stat, statfs } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
 import readline from 'node:readline';
+import os from 'node:os';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
-import { emptyTree, FailClosedError, git, hasHead, indexEntries, isCaseInsensitive, listUntracked, repoRoot, sparseExcluded, sparseMissing, worktreeRoots, type SparseTrust } from './git.js';
+import { emptyTree, FailClosedError, git, GitError, hasHead, indexEntries, isCaseInsensitive, listUntracked, repoRoot, sparseExcluded, sparseMissing, worktreeRoots, type SparseTrust } from './git.js';
 import { globToRegExp, repoRelativePath, rootVariants } from './attribute.js';
 import { compileGlobs, loadConfig, type WhyDiffConfig } from './config.js';
 import type { Hunk, LabelKind, Session } from './types.js';
-import { failedMarker, recordMarker, recordPath, type BaseRecord } from './session-start.js';
+import { isConfigFile, isTestFile } from './labels.js';
+import { dataDir, failedMarker, recordMarker, recordPath, type BaseRecord } from './session-start.js';
+
+const realpathNative = realpathCb.native;
 
 export const DEFAULT_BLOCK_ON: readonly LabelKind[] = ['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path', 'unreviewed'];
 
@@ -39,6 +44,12 @@ export interface GuardOptions {
   statTime?: (absPath: string) => Promise<number>;
   /** Change time of git object store files, for choosing the session base (tests); default: lstat ctime */
   objectTime?: (absPath: string) => Promise<number>;
+  /** lstat of a path: its device and whether it is a symlink (tests); default: lstat */
+  pathStat?: (absPath: string) => Promise<PathStat>;
+  /** Type of the file system holding a path (`apfs`, `ext4`, `msdos`...) (tests); default: statfs / mount */
+  fsType?: (absPath: string) => Promise<string>;
+  /** Why the file system holding a path was mounted by a user, or undefined (tests); default: the mount table */
+  userMount?: (absPath: string) => Promise<string | undefined>;
 }
 
 export interface GuardResult {
@@ -134,27 +145,216 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // config, a `.git` file pointing nowhere).
   const cwd = payload.cwd ?? process.cwd();
   const gitEntry = await findGitEntry(cwd);
-  if (!gitEntry) return NO_BLOCK;
+  if (!gitEntry) {
+    // No `.git` now, but the session may have started in a repository: the agent can move `.git`
+    // (or the repository) away. The SessionStart record and the transcript marker say so.
+    await startedInRepository(payload, cwd, opts.statTime ?? changeTime, opts.pathStat ?? lstatOf);
+    return NO_BLOCK;
+  }
   // From here on an error blocks: an unreadable transcript could hide what the session did.
   state.relevant = true;
   // Read before any git command runs (none of why-diff's own may move them, but stat first anyway):
   // when the index and refs last changed, and the session's base record.
   const statTime = opts.statTime ?? changeTime;
-  const metaTimes = await gitMetaTimes(gitEntry, statTime);
+  const pathStat = opts.pathStat ?? lstatOf;
+  const metaTimes = await gitMetaTimes(path.dirname(gitEntry), gitEntry, statTime, pathStat);
   const sessionId = payload.session_id;
-  const record = sessionId ? await readBaseRecord(sessionId, statTime) : undefined;
+  const record = sessionId ? await readBaseRecord(sessionId, statTime, pathStat) : undefined;
   const session = await claudeCodeAdapter.parse(payload.transcript_path);
   // A session with no edits and no tool calls cannot have touched the repository.
   state.relevant = session.edits.some((e) => !e.failed) || (session.toolWindows?.length ?? 0) > 0;
   if (!state.relevant) return NO_BLOCK;
   const root = await repoRoot(cwd);
   const real = (p: string): Promise<string> => realpath(p).catch(() => path.resolve(p));
+  // Object write times count only from the file system of the git common dir that holds them (see onDevice).
+  const commonDir = await gitCommonDir(root);
+  const objectTime = onDevice(opts.objectTime ?? changeTime, pathStat, await deviceOf(commonDir, pathStat));
   // The work tree git reports must be the one the `.git` entry sits in: `core.worktree` (or a gitfile
   // in another directory pointing back) would make git diff a clean copy instead of the files the
   // agent changed.
   if ((await real(root)) !== (await real(path.dirname(gitEntry)))) {
     throw new FailClosedError(`git reports the work tree at ${root}, not at ${path.dirname(gitEntry)} where the .git entry is (core.worktree or a .git file points elsewhere)`);
   }
+  const windows = windowCheck(session);
+  // The base record from SessionStart: trusted only if its file last changed before the session's
+  // first tool call (the agent cannot write it earlier, and rewriting it moves its ctime). A record
+  // the transcript says was written (the hook's marker) must still be there.
+  let recordedHead: string | undefined;
+  let indexBase: string | undefined;
+  let recordedSubmodules: Record<string, RecordedSubmodule> | undefined;
+  // Whether the SessionStart record kept (and matched) the devices of the root and the git dir.
+  let devicesRecorded = false;
+  const fsType = opts.fsType ?? fileSystemType;
+  const markers = sessionId ? await transcriptMarkers(payload.transcript_path, sessionId).catch(() => ({ ok: true, failed: true })) : { ok: false, failed: false };
+  if (markers.failed) throw new FailClosedError(`base record could not be written at session start (the SessionStart hook said so); the session's base cannot be trusted`);
+  if (record) {
+    if (!windows) throw new FailClosedError(`the session's base record cannot be dated: no tool call of this session has a readable time (${record.file})`);
+    if (record.ctime >= windows.firstStart) throw new FailClosedError(`base record modified during session (${record.file})`);
+    if (!record.data) throw new FailClosedError(`base record missing or unreadable (${record.file})`);
+    const recordRoot = await real(record.data.root);
+    if (recordRoot !== (await real(root))) {
+      const here = await real(cwd);
+      if (here === recordRoot || here.startsWith(recordRoot.endsWith(path.sep) ? recordRoot : `${recordRoot}${path.sep}`)) {
+        throw new FailClosedError(`the base record is for ${record.data.root}, and this session's directory is inside it, but git now finds the repository ${root}`);
+      }
+      notes.push(`base record is for another repository (${record.data.root}); this session now works in ${root}, so the base comes from the reflogs`);
+    } else {
+      // A file system mounted over the repository (or its git dir, or the record directory) after
+      // the session started reports any change time it likes: the devices must be the recorded ones.
+      const devs = record.data;
+      if (typeof devs.rootDev === 'number' && typeof devs.gitDev === 'number') {
+        const checks: Array<readonly [string, string, number]> = [['repository root', await real(root), devs.rootDev], ['git dir', commonDir, devs.gitDev]];
+        const wtGitDir = await absoluteGitDir(root);
+        if (wtGitDir !== commonDir) {
+          // A linked worktree's own git dir: its device kept at session start, else that of the common dir.
+          checks.push(['worktree git dir', wtGitDir, typeof devs.worktreeGitDev === 'number' ? devs.worktreeGitDev : devs.gitDev]);
+        }
+        for (const [what, p, was] of checks) {
+          const now = await deviceOf(p, pathStat);
+          if (now !== was) throw new FailClosedError(`the ${what} (${p}) is on another file system than at session start (device ${was} then, ${now ?? 'unreadable'} now): a file system mounted over it can report any change time`);
+        }
+        devicesRecorded = true;
+      }
+      if (typeof devs.dataDirDev === 'number') {
+        const now = await deviceOf(path.dirname(record.file), pathStat);
+        if (now !== devs.dataDirDev) throw new FailClosedError(`the base record directory (${path.dirname(record.file)}) is on another file system than at session start (device ${devs.dataDirDev} then, ${now ?? 'unreadable'} now)`);
+      }
+      if (devs.submodules && typeof devs.submodules === 'object') {
+        recordedSubmodules = {};
+        for (const [k, v] of Object.entries(devs.submodules as Record<string, unknown>)) {
+          const e = (typeof v === 'string' ? { head: v } : v) as Partial<RecordedSubmodule> | null;
+          if (!e || typeof e.head !== 'string' || !/^[0-9a-f]{40,64}$/.test(e.head)) continue;
+          recordedSubmodules[k] = { head: e.head, ...(typeof e.rootDev === 'number' ? { rootDev: e.rootDev } : {}), ...(typeof e.gitDev === 'number' ? { gitDev: e.gitDev } : {}), ...(typeof e.worktreeGitDev === 'number' ? { worktreeGitDev: e.worktreeGitDev } : {}) };
+        }
+      }
+      if (record.data.head) {
+        recordedHead = record.data.head;
+        notes.push(`base from the SessionStart record: ${record.data.head}`);
+      } else {
+        notes.push('base record names no commit (unborn branch at session start); the base comes from the reflogs');
+      }
+      // The index at session start: staged changes from before the session are not the agent's.
+      const tree = record.data.indexTree;
+      if (tree && (await git(root, ['cat-file', '-e', `${tree}^{tree}`]).then(() => true, () => false)) && (await writtenBefore(root, tree, windows.firstStart, objectTime))) {
+        indexBase = tree;
+        notes.push(`index compared against the index tree recorded at session start: ${tree}`);
+      }
+    }
+  } else if (markers.ok) {
+    throw new FailClosedError(`base record missing: the SessionStart hook recorded one for this session, and it is gone (${recordPath(sessionId!)})`);
+  } else {
+    // No record and no marker: the plugin may have been installed mid-session, or the hook's output
+    // lost. A record directory that exists but cannot be written was made so on purpose (no record
+    // can ever be kept there): fail closed rather than fall back to the reflogs.
+    const dir = path.dirname(sessionId ? recordPath(sessionId) : recordPath('-'));
+    const unwritable = await access(dir, fsConstants.W_OK).then(() => false, (err: NodeJS.ErrnoException) => !GONE.has(err.code ?? ''));
+    if (unwritable) throw new FailClosedError(`the base record directory cannot be written (${dir}), so the session's base cannot be trusted`);
+    notes.push('no SessionStart base record; the base comes from the reflogs');
+  }
+
+  // A record (once trusted by its time) only proves anything if its own file system cannot forge times.
+  const userMount = opts.userMount ?? userMountOf;
+  const gitDir = await absoluteGitDir(root);
+  if (process.platform === 'win32' && !opts.fsType) await prefetchWindowsTypes([root, commonDir, gitDir, ...(record ? [record.file] : [])]);
+  if (record) {
+    await trustedFileSystem(record.file, 'the base record', fsType, userMount);
+    await trustedFileSystem(path.dirname(record.file), 'the base record directory', fsType, userMount);
+  }
+  // The repository's file systems must be ones whose change times cannot be forged without root,
+  // whether or not the devices match the recorded ones (a remount can reuse the same device).
+  await trustedFileSystem(root, 'the repository', fsType, userMount);
+  await trustedFileSystem(commonDir, 'the git dir', fsType, userMount);
+  if (gitDir !== commonDir) await trustedFileSystem(gitDir, 'the worktree git dir', fsType, userMount);
+  // Without devices recorded at session start, a root or git dir on its own volume (its device
+  // differs from its parent directory's) could be a volume mounted over it during the session.
+  if (!devicesRecorded) {
+    const dirs: Array<readonly [string, string]> = [['repository root', await real(root)], ['git dir', await real(commonDir)]];
+    if (gitDir !== commonDir) {
+      // A linked worktree's own git dir lives in the common dir (`worktrees/<name>`): it must be on the
+      // common dir's device. Its parent is no reference: a volume mounted over `worktrees/` would match it.
+      const [wt, common] = await Promise.all([deviceOf(await real(gitDir), pathStat), deviceOf(await real(commonDir), pathStat)]);
+      if (wt === undefined || wt !== common) throw new FailClosedError(`unreviewed: the worktree git dir (${gitDir}) is on another device than the git common dir (${commonDir}), and no SessionStart record kept its device, so a volume mounted over it during the session cannot be ruled out`);
+    }
+    for (const [what, dir] of dirs) {
+      const [here, up] = await Promise.all([deviceOf(dir, pathStat), deviceOf(path.dirname(dir), pathStat)]);
+      if (here === undefined || here !== up) throw new FailClosedError(`unreviewed: the ${what} (${dir}) is the root of its own volume, and no SessionStart record kept its device, so a volume mounted over it during the session cannot be ruled out`);
+    }
+  }
+
+  let baseRev = 'HEAD';
+  const headed = await hasHead(root);
+  if (headed) baseRev = await sessionBase(root, Date.parse(session.startedAt), objectTime, recordedHead);
+
+  // The policy comes from the session-start commit, so the agent cannot loosen it mid-session.
+  // An invalid config must not break the session: fall back to defaults.
+  const config: WhyDiffConfig = await loadConfig(root, baseRev).catch(() => ({}));
+  const blocking = opts.blocking ?? new Set<LabelKind>([...DEFAULT_BLOCK_ON, ...(config.blockOn ?? [])]);
+  const protectedGlob = compileGlobs(config.protected);
+  const ctx: SessionCheck = { payload, opts, session, windows, statTime, pathStat, rawObjectTime: opts.objectTime ?? changeTime, config, blocking, protectedGlob, recordedSubmodules, fsType, userMount, gitDev: await deviceOf(commonDir, pathStat) };
+  const hits = await checkRepository(ctx, { root, baseRev, headed, indexBase, metaTimes, prefix: '', depth: 0 });
+  return hits.length ? blocked(payload.transcript_path, hits) : NO_BLOCK;
+}
+
+/** A submodule as the SessionStart record kept it: its HEAD and the devices of its root and git common dir. */
+interface RecordedSubmodule {
+  head: string;
+  rootDev?: number;
+  gitDev?: number;
+  worktreeGitDev?: number;
+}
+
+/** What one guard run knows about the session, shared by the repository and its submodules. */
+interface SessionCheck {
+  payload: GuardPayload;
+  opts: GuardOptions;
+  session: Session;
+  windows: ReturnType<typeof windowCheck>;
+  statTime: (p: string) => Promise<number>;
+  pathStat: (p: string) => Promise<PathStat>;
+  /** Object write times as read (each repository anchors them to its own git common dir, see onDevice) */
+  rawObjectTime: (p: string) => Promise<number>;
+  /** Submodule heads from the SessionStart record, by path from the session's repository */
+  recordedSubmodules?: Record<string, RecordedSubmodule>;
+  fsType: (p: string) => Promise<string>;
+  userMount: (p: string) => Promise<string | undefined>;
+  /** Device of the session repository's git common dir */
+  gitDev?: number;
+  config: WhyDiffConfig;
+  blocking: Set<LabelKind>;
+  protectedGlob: (file: string) => string | undefined;
+}
+
+/** One repository to check: the session's, or a submodule of it (`prefix` is its path, with a slash). */
+interface RepoUnderCheck {
+  root: string;
+  baseRev: string;
+  headed: boolean;
+  indexBase?: string;
+  /** See {@link gitMetaTimes} */
+  metaTimes: number[];
+  prefix: string;
+  depth: number;
+  /** Only these files are dated in the work tree (a submodule whose index and refs did not change: what `git status` lists) */
+  onlyFiles?: ReadonlySet<string>;
+}
+
+/** Submodules inside submodules are checked this many levels deep; deeper ones block as unreviewed. */
+const MAX_SUBMODULE_DEPTH = 3;
+
+/**
+ * The risky hunks this session is credited with in one repository (paths in the hits carry
+ * `repo.prefix`), then in each of its checked-out submodules, recursively.
+ */
+async function checkRepository(ctx: SessionCheck, repo: RepoUnderCheck): Promise<string[]> {
+  const { payload, opts, session, windows, statTime, pathStat, config, blocking, protectedGlob } = ctx;
+  const { root, baseRev, headed, indexBase, prefix } = repo;
+  // Refs are dated by the files of a backend this guard knows (see gitMetaTimes): any other one could
+  // move a branch without changing any of them.
+  const refStorage = (await git(root, ['config', '--get', 'extensions.refStorage']).catch((err: unknown) => {
+    if (err instanceof GitError && err.exitCode === 1 && !err.stderr.trim()) return 'files';
+    throw err;
+  })).trim().toLowerCase();
+  if (refStorage !== 'files' && refStorage !== 'reftable') throw new FailClosedError(`the repository ${prefix ? `${prefix.slice(0, -1)} ` : ''}keeps its refs in an unknown backend (extensions.refStorage = ${refStorage}), whose changes cannot be dated`);
   const roots = [root, ...(await worktreeRoots(root))].flatMap(rootVariants).sort((a, b) => b.length - a.length);
   const cwdVariants = rootVariants(session.cwd);
   const icase = await isCaseInsensitive(root);
@@ -172,62 +372,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
       return [...new Set([p, p.normalize('NFD')])].map((v) => `${magic}${v}`);
     })
     .flatMap((p) => p ?? []))];
-
-  const windows = windowCheck(session);
-  // The base record from SessionStart: trusted only if its file last changed before the session's
-  // first tool call (the agent cannot write it earlier, and rewriting it moves its ctime). A record
-  // the transcript says was written (the hook's marker) must still be there.
-  let recordedHead: string | undefined;
-  let indexBase: string | undefined;
-  const markers = sessionId ? await transcriptMarkers(payload.transcript_path, sessionId).catch(() => ({ ok: true, failed: true })) : { ok: false, failed: false };
-  if (markers.failed) throw new FailClosedError(`base record could not be written at session start (the SessionStart hook said so); the session's base cannot be trusted`);
-  if (record) {
-    if (!windows) throw new FailClosedError(`the session's base record cannot be dated: no tool call of this session has a readable time (${record.file})`);
-    if (record.ctime >= windows.firstStart) throw new FailClosedError(`base record modified during session (${record.file})`);
-    if (!record.data) throw new FailClosedError(`base record missing or unreadable (${record.file})`);
-    const recordRoot = await real(record.data.root);
-    if (recordRoot !== (await real(root))) {
-      const here = await real(cwd);
-      if (here === recordRoot || here.startsWith(recordRoot.endsWith(path.sep) ? recordRoot : `${recordRoot}${path.sep}`)) {
-        throw new FailClosedError(`the base record is for ${record.data.root}, and this session's directory is inside it, but git now finds the repository ${root}`);
-      }
-      notes.push(`base record is for another repository (${record.data.root}); this session now works in ${root}, so the base comes from the reflogs`);
-    } else {
-      if (record.data.head) {
-        recordedHead = record.data.head;
-        notes.push(`base from the SessionStart record: ${record.data.head}`);
-      } else {
-        notes.push('base record names no commit (unborn branch at session start); the base comes from the reflogs');
-      }
-      // The index at session start: staged changes from before the session are not the agent's.
-      const tree = record.data.indexTree;
-      if (tree && (await git(root, ['cat-file', '-e', `${tree}^{tree}`]).then(() => true, () => false)) && (await writtenBefore(root, tree, windows.firstStart, opts.objectTime ?? changeTime))) {
-        indexBase = tree;
-        notes.push(`index compared against the index tree recorded at session start: ${tree}`);
-      }
-    }
-  } else if (markers.ok) {
-    throw new FailClosedError(`base record missing: the SessionStart hook recorded one for this session, and it is gone (${recordPath(sessionId!)})`);
-  } else {
-    // No record and no marker: the plugin may have been installed mid-session, or the hook's output
-    // lost. A record directory that exists but cannot be written was made so on purpose (no record
-    // can ever be kept there): fail closed rather than fall back to the reflogs.
-    const dir = path.dirname(sessionId ? recordPath(sessionId) : recordPath('-'));
-    const unwritable = await access(dir, fsConstants.W_OK).then(() => false, (err: NodeJS.ErrnoException) => !GONE.has(err.code ?? ''));
-    if (unwritable) throw new FailClosedError(`the base record directory cannot be written (${dir}), so the session's base cannot be trusted`);
-    notes.push('no SessionStart base record; the base comes from the reflogs');
-  }
-
-  let baseRev = 'HEAD';
-  const headed = await hasHead(root);
-  if (headed) baseRev = await sessionBase(root, Date.parse(session.startedAt), opts.objectTime ?? changeTime, recordedHead);
-
-  // The policy comes from the session-start commit, so the agent cannot loosen it mid-session.
-  // An invalid config must not break the session: fall back to defaults.
-  const config: WhyDiffConfig = await loadConfig(root, baseRev).catch(() => ({}));
-  const blocking = opts.blocking ?? new Set<LabelKind>([...DEFAULT_BLOCK_ON, ...(config.blockOn ?? [])]);
-  const protectedGlob = compileGlobs(config.protected);
-  const sparseTrust: SparseTrust = { before: Date.parse(session.startedAt) - WINDOW_SLACK_MS, timeOf: opts.objectTime ?? changeTime };
+  const sparseTrust: SparseTrust = { before: Date.parse(session.startedAt) - WINDOW_SLACK_MS, timeOf: onDevice(ctx.rawObjectTime, pathStat, await deviceOf(await gitCommonDir(root), pathStat)) };
 
   // Paths the session's own shell commands targeted literally (or by a glob), by kind of operation:
   // removed or moved away (rm, git rm, mv, git mv), or rewritten in place (sed -i, perl -i, `>`,
@@ -278,7 +423,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
       // in it is unknown. Blocks whatever the path.
       if (h.labels.some((l) => l.kind === 'unreviewed')) {
         const detail = `could not be diffed as text (git attributes mark it binary, or it is too big or unreadable): ${h.hunk.file}`;
-        hits.push(`- ${h.hunk.file} unreviewed: ${detail}`);
+        hits.push(`- ${prefix}${h.hunk.file} unreviewed: ${detail}`);
         continue;
       }
       let timed = false;
@@ -315,7 +460,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
       }
       for (const l of labels) {
         if (!blocking.has(l.kind)) continue;
-        const hit = `- ${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`;
+        const hit = `- ${prefix}${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`;
         if (!hits.includes(hit)) hits.push(hit);
       }
     }
@@ -326,7 +471,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // blocks without walking the whole working tree.
   if (paths.length) {
     const first = await check(paths, NO_CREDIT);
-    if (first.length) return blocked(payload.transcript_path, first);
+    if (first.length) return first;
   }
 
   // Files a shell command changed without naming them (a script computing the path, `rsync --delete`,
@@ -335,9 +480,16 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // A skip-worktree file missing from the working tree is excused only when the sparse checkout,
   // as the repository's own config and patterns from before the session define it, leaves it out.
   const excluded = await sparseExcluded(root, sparseTrust);
-  const inWindow = windows?.inWindow ?? null;
-  const byWindow = await toolWindowFiles(root, headed ? baseRev : undefined, inWindow, statTime, excluded);
+  const byWindow = await toolWindowFiles(root, headed ? baseRev : undefined, windows, opts.statTime ? statTime : undefined, pathStat, excluded, repo.onlyFiles);
   const hits: string[] = [];
+  // Files on another file system mounted inside the repository: their times prove nothing (a FAT
+  // image takes any ctime), so one that differs from the base, or any test or config file there,
+  // blocks as unreviewed.
+  for (const [f, mount] of [...byWindow.foreign].sort(([a], [b]) => (a < b ? -1 : 1))) {
+    if (byWindow.differs.has(f) || isTestFile(f) || isConfigFile(f)) {
+      hits.push(`- ${prefix}${f} unreviewed: on another file system mounted inside the repository (at ${prefix}${mount}), whose change times cannot be trusted`);
+    }
+  }
   // Untracked files credited by time alone are capped: past the cap they are not read, only reported.
   // Both by count and by total size: reading and labelling them is synchronous work.
   const timedNew = [...byWindow.written].filter((f) => byWindow.untracked.has(f)).sort();
@@ -360,7 +512,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   if (over.length) {
     for (const f of over) byWindow.written.delete(f);
     over.sort();
-    hits.push(`- ${over[0]} unreviewed: ${over.length} more untracked files written during this session's tool calls were not reviewed (over the caps of ${MAX_TIMED_UNTRACKED} files and ${byteCap} bytes read), e.g. ${over.slice(0, 3).join(', ')}`);
+    hits.push(`- ${prefix}${over[0]} unreviewed: ${over.length} more untracked files written during this session's tool calls were not reviewed (over the caps of ${MAX_TIMED_UNTRACKED} files and ${byteCap} bytes read), e.g. ${over.slice(0, 3).map((f) => `${prefix}${f}`).join(', ')}`);
   }
   const credit = { written: byWindow.written, removed: byWindow.removed, detached: new Set<string>(), layered: new Set<string>() };
   const all = [...paths];
@@ -372,8 +524,9 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // be told apart from the agent's detached work). Among them, a file gone from the index or HEAD
   // but still on disk was untracked, and counts as deleted, even when the command that did it never
   // named it.
+  const layeredActive = Boolean(windows && repo.metaTimes.some((t) => windows.inWindow(t) || t > windows.lastEnd));
   if (headed && windows) {
-    if (metaTimes.some((t) => windows.inWindow(t) || t > windows.lastEnd)) {
+    if (layeredActive) {
       for (const [args, deletedOnly] of [[[baseRev, 'HEAD'], false], [['--cached', indexBase ?? baseRev], false], [['--diff-filter=D', baseRev, 'HEAD'], true], [['--diff-filter=D', '--cached', indexBase ?? baseRev], true]] as const) {
         const out = await git(root, ['diff', '--name-only', '--no-renames', '-z', ...args, '--'], { trim: false });
         for (const f of out.split('\0')) {
@@ -388,9 +541,202 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
       }
     }
   }
-  if (!all.length) return hits.length ? blocked(payload.transcript_path, hits) : NO_BLOCK;
-  for (const hit of await check(all, credit)) if (!hits.includes(hit)) hits.push(hit);
-  return hits.length ? blocked(payload.transcript_path, hits) : NO_BLOCK;
+  if (all.length) for (const hit of await check(all, credit)) if (!hits.includes(hit)) hits.push(hit);
+  for (const hit of await checkSubmodules(ctx, repo, layeredActive)) if (!hits.includes(hit)) hits.push(hit);
+  return hits;
+}
+
+/**
+ * Every submodule of `repo` (a gitlink in its base, HEAD or index): checked out, it is checked like
+ * the repository itself ({@link checkRepository}), from the commit the base records for it, dated by
+ * its own work tree, index and ref times against the same session windows. It blocks as unreviewed
+ * when it cannot be read: not checked out while its gitlink changed during the session, a directory
+ * holding files but no repository, a symlink or a mount in its place, the recorded commit missing,
+ * or more than {@link MAX_SUBMODULE_DEPTH} levels deep. A clean, unchanged submodule finds nothing.
+ */
+async function checkSubmodules(ctx: SessionCheck, repo: RepoUnderCheck, layeredActive: boolean): Promise<string[]> {
+  const { root, baseRev, headed, indexBase, prefix, depth } = repo;
+  const links = new Map<string, { base?: string; head?: string; index?: string }>();
+  const link = (p: string): { base?: string; head?: string; index?: string } => {
+    let l = links.get(p);
+    if (!l) links.set(p, (l = {}));
+    return l;
+  };
+  for (const e of await indexEntries(root)) if (e.mode === GITLINK) link(e.path).index = e.oid;
+  if (headed) {
+    // Gitlinks gone from the index (removed, or replaced by a directory of files) but in the base or HEAD.
+    for (const revs of [[baseRev, 'HEAD'], ['--cached', indexBase ?? baseRev]]) {
+      const raw = (await git(root, ['diff', '--raw', '-z', '--no-renames', '--no-abbrev', ...revs, '--'], { trim: false })).split('\0');
+      for (let i = 0; i + 1 < raw.length; i += 2) {
+        const [oldMode, newMode] = raw[i]!.replace(/^:/, '').split(' ');
+        if (oldMode === GITLINK || newMode === GITLINK) link(raw[i + 1]!);
+      }
+    }
+  }
+  if (!links.size) return [];
+  const treeLink = async (rev: string, p: string): Promise<string | undefined> => {
+    const out = await git(root, ['ls-tree', '-z', rev, '--', `:(literal)${p}`], { trim: false });
+    const m = /^(\d+) \w+ ([0-9a-f]+)\t/.exec(out);
+    return m && m[1] === GITLINK ? m[2] : undefined;
+  };
+  const rootDev = await deviceOf(root, ctx.pathStat);
+  const real = (p: string): Promise<string> => realpath(p).catch(() => path.resolve(p));
+  const hits: string[] = [];
+  const unreviewed = (p: string, why: string): void => {
+    hits.push(`- ${prefix}${p} unreviewed: submodule ${why}, so its changes were not reviewed`);
+  };
+  for (const [p, l] of [...links].sort(([a], [b]) => (a < b ? -1 : 1))) {
+    if (headed) {
+      l.base = await treeLink(baseRev, p);
+      l.head = await treeLink('HEAD', p);
+    }
+    const changed = headed && new Set([l.base, l.head, l.index].map((x) => x ?? '-')).size > 1;
+    const abs = path.join(root, ...p.split('/'));
+    const st = await lstat(abs).catch(() => undefined);
+    if (!st) {
+      if (changed && layeredActive) unreviewed(p, 'is not checked out, and its recorded commit changed during the session');
+      continue;
+    }
+    if (st.isSymbolicLink() || !st.isDirectory() || (await ctx.pathStat(abs).then((x) => x.dev, () => rootDev)) !== rootDev) {
+      unreviewed(p, 'is a symlink, a file or a mount point in the place of the submodule directory');
+      continue;
+    }
+    const gitEntry = path.join(abs, '.git');
+    const hasGit = await lstat(gitEntry).then(() => true, () => false);
+    const subRoot = hasGit ? await repoRoot(abs).catch(() => undefined) : undefined;
+    if (!subRoot || (await real(subRoot)) !== (await real(abs))) {
+      if (hasGit || (await readdir(abs).catch(() => [] as string[])).length) unreviewed(p, 'holds files but no repository of its own (its .git is missing or points elsewhere)');
+      else if (changed && layeredActive) unreviewed(p, 'is not checked out, and its recorded commit changed during the session');
+      continue;
+    }
+    if (depth + 1 > MAX_SUBMODULE_DEPTH) {
+      unreviewed(p, `is nested more than ${MAX_SUBMODULE_DEPTH} levels deep`);
+      continue;
+    }
+    const subHeaded = await hasHead(subRoot);
+    const prefixed = `${prefix}${p}/`;
+    const key = `${prefix}${p}`;
+    // Its times prove something only on a trusted file system, on the devices it had at session start.
+    const subCommon = await gitCommonDir(subRoot);
+    const subGitDir = await absoluteGitDir(subRoot);
+    try {
+      await trustedFileSystem(subRoot, `submodule ${key}`, ctx.fsType, ctx.userMount);
+      await trustedFileSystem(subCommon, `the git dir of submodule ${key}`, ctx.fsType, ctx.userMount);
+      if (subGitDir !== subCommon) await trustedFileSystem(subGitDir, `the worktree git dir of submodule ${key}`, ctx.fsType, ctx.userMount);
+    } catch (err) {
+      unreviewed(p, `is on an untrusted file system (${(err as Error).message.replace(/^unreviewed: /, '')})`);
+      continue;
+    }
+    const rec = ctx.recordedSubmodules?.[key];
+    // Without devices recorded for it, a submodule's own worktree git dir (a linked worktree) on
+    // another device than its common dir could be a volume mounted over it during the session.
+    if (rec?.rootDev === undefined && rec?.gitDev === undefined && subGitDir !== subCommon) {
+      // Its own worktree git dir must be on its common dir's device (its parent is no reference: a
+      // volume mounted over `worktrees/` would match it).
+      const [here, common] = await Promise.all([deviceOf(await real(subGitDir), ctx.pathStat), deviceOf(await real(subCommon), ctx.pathStat)]);
+      if (here === undefined || here !== common) {
+        unreviewed(p, 'has its worktree git dir on another device than its git common dir, and no SessionStart record kept its device');
+        continue;
+      }
+    }
+    const subGitDev = await deviceOf(subCommon, ctx.pathStat);
+    if (rec?.rootDev !== undefined || rec?.gitDev !== undefined) {
+      const rootNow = await deviceOf(await real(subRoot), ctx.pathStat);
+      const wtNow = subGitDir !== subCommon ? await deviceOf(subGitDir, ctx.pathStat) : undefined;
+      const wtWas = rec.worktreeGitDev ?? rec.gitDev;
+      if ((rec.rootDev !== undefined && rec.rootDev !== rootNow) || (rec.gitDev !== undefined && rec.gitDev !== subGitDev) || (wtNow !== undefined && wtWas !== undefined && wtNow !== wtWas)) {
+        unreviewed(p, 'or its git dir is on another file system than at session start');
+        continue;
+      }
+    }
+    const subRoots = rootVariants(subRoot);
+    const named = ctx.session.edits.some((e) => !e.failed && repoRelativePath(e.filePath, subRoots, ctx.session.cwd) !== null);
+    // `git status` lists changed files from the index's stat data; entries flagged assume-unchanged or
+    // skip-worktree are never compared, so they are always candidates.
+    const candidatePaths = async (): Promise<Set<string>> => {
+      const set = statusPaths(await git(subRoot, ['status', '--porcelain=v2', '-z', '--untracked-files=all'], { trim: false }));
+      for (const e of await indexEntries(subRoot)) if (e.tag === 'S' || e.tag === 's' || (e.tag >= 'a' && e.tag <= 'z')) set.add(e.path);
+      return set;
+    };
+    if (rec?.gitDev === undefined && subGitDev !== ctx.gitDev) {
+      // Its git dir (index, refs, objects) on another device than the repository's, with no device
+      // recorded for it: none of its times can be trusted. Unchanged and clean (by `git status`, the
+      // flagged entries and every tracked file's own change time in its work tree) costs nothing;
+      // anything else is unreviewed.
+      const walk = await toolWindowFiles(subRoot, undefined, ctx.windows, ctx.opts.statTime ? ctx.statTime : undefined, ctx.pathStat, null);
+      if (changed || named || (await candidatePaths()).size || walk.written.size || walk.removed.size || walk.foreign.size) {
+        unreviewed(p, 'has its git dir on another file system than the repository\'s, with no device recorded at session start, and it changed');
+        continue;
+      }
+      const unchanged: RepoUnderCheck = { root: subRoot, baseRev: subHeaded ? 'HEAD' : await emptyTree(subRoot), headed: subHeaded, metaTimes: [], prefix: prefixed, depth: depth + 1 };
+      for (const hit of await checkSubmodules(ctx, unchanged, false)) if (!hits.includes(hit)) hits.push(hit);
+      continue;
+    }
+    const metaTimes = await gitMetaTimes(subRoot, gitEntry, ctx.statTime, ctx.pathStat);
+    // Its index and refs unchanged during the session: HEAD is where it was at session start, and the
+    // index's stat data can be trusted (change times compared, which a command cannot set on a
+    // trusted file system), so `git status` lists every changed file and only those are dated. None,
+    // and no path the session named in it: nothing to check there but its own submodules.
+    const w = ctx.windows;
+    const quiet = !(w && metaTimes.some((t) => w.inWindow(t) || t > w.lastEnd));
+    let candidates: Set<string> | undefined;
+    if (quiet) {
+      candidates = await candidatePaths();
+      if (!candidates.size && !named) {
+        const unchanged: RepoUnderCheck = { root: subRoot, baseRev: subHeaded ? 'HEAD' : await emptyTree(subRoot), headed: subHeaded, metaTimes, prefix: prefixed, depth: depth + 1 };
+        for (const hit of await checkSubmodules(ctx, unchanged, false)) if (!hits.includes(hit)) hits.push(hit);
+        continue;
+      }
+    }
+    // The submodule's own base: the head the SessionStart record kept for it, else its own trusted
+    // pre-session commit (reflogs and first-parent history, by object write times), as for the
+    // repository itself. Not the superproject's gitlink: a checkout behind it (a pull without
+    // `git submodule update`) would otherwise read as the agent's change.
+    const objectTime = onDevice(ctx.rawObjectTime, ctx.pathStat, subGitDev);
+    let subBase: string;
+    try {
+      subBase = subHeaded ? await sessionBase(subRoot, Date.parse(ctx.session.startedAt), objectTime, ctx.recordedSubmodules?.[`${prefix}${p}`]?.head) : await emptyTree(subRoot);
+    } catch (err) {
+      if (!(err instanceof FailClosedError)) throw err;
+      if (l.base || l.index !== l.head) {
+        unreviewed(p, `has no commit from before the session to compare against (${err.message})`);
+        continue;
+      }
+      subBase = await emptyTree(subRoot); // added during the session: every file in it is new
+    }
+    const sub: RepoUnderCheck = { root: subRoot, baseRev: subBase, headed: subHeaded, metaTimes, prefix: prefixed, depth: depth + 1 };
+    if (candidates && (!subHeaded || (await git(subRoot, ['rev-parse', 'HEAD'])) === subBase)) sub.onlyFiles = candidates;
+    for (const hit of await checkRepository(ctx, sub)) if (!hits.includes(hit)) hits.push(hit);
+  }
+  return hits;
+}
+
+const GITLINK = '160000';
+
+/** The paths `git status --porcelain=v2 -z` lists: changed, renamed (both names), unmerged and untracked. */
+function statusPaths(out: string): Set<string> {
+  const paths = new Set<string>();
+  const tokens = out.split('\0');
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!;
+    const fields = (n: number): string | undefined => {
+      let at = 0;
+      for (let k = 0; k < n; k++) {
+        at = t.indexOf(' ', at) + 1;
+        if (at === 0) return undefined;
+      }
+      return t.slice(at);
+    };
+    let p: string | undefined;
+    if (t.startsWith('1 ')) p = fields(8);
+    else if (t.startsWith('2 ')) {
+      p = fields(9);
+      if (tokens[i + 1]) paths.add(tokens[++i]!);
+    } else if (t.startsWith('u ')) p = fields(10);
+    else if (t.startsWith('? ')) p = t.slice(2);
+    if (p) paths.add(p);
+  }
+  return paths;
 }
 
 interface Credit {
@@ -431,6 +777,51 @@ async function blocked(transcript: string | undefined, hits: string[]): Promise<
   };
 }
 
+/**
+ * Outside any repository: throw {@link FailClosedError} when this session started in one, so a `.git`
+ * moved away during the session (or the repository renamed under the session's directory) cannot
+ * make the guard skip it. The record's content is not trusted here (the agent can rewrite it):
+ * - the transcript carries the SessionStart record or failed marker (the hook ran in a repository
+ *   for this session): always blocks, whatever the record says or whether it still exists. A
+ *   transcript that exists but cannot be read counts as a marker;
+ * - no marker, but a record file for this session: blocks when its change time is unknown, inside a
+ *   tool call window, or after the session started (the agent may have written it), and otherwise
+ *   when the root it names is the cwd or contains it (or cannot be read).
+ * No marker and no record: not a repository session.
+ */
+async function startedInRepository(payload: GuardPayload, cwd: string, statTime: (p: string) => Promise<number>, pathStat: (p: string) => Promise<PathStat>): Promise<void> {
+  const sessionId = payload.session_id;
+  if (!sessionId) return;
+  const gone = (why: string): FailClosedError => new FailClosedError(`no .git is found at or above ${cwd}, but ${why}: the repository (or its .git) was moved or removed during the session`);
+  // A transcript that does not exist carries no marker; one that cannot be read may hide one.
+  const markers = await transcriptMarkers(payload.transcript_path, sessionId).catch((err: NodeJS.ErrnoException) => (err.code === 'ENOENT' ? { ok: false, failed: false } : { ok: true, failed: true }));
+  if (markers.ok || markers.failed) throw gone('the SessionStart hook ran in a repository for this session (its marker is in the transcript)');
+  const record = await readBaseRecord(sessionId, statTime, pathStat).catch(() => {
+    throw gone('this session has a SessionStart base record that cannot be read');
+  });
+  if (!record) return;
+  let windows: ReturnType<typeof windowCheck> = null;
+  let started = NaN;
+  try {
+    const session = await claudeCodeAdapter.parse(payload.transcript_path!);
+    windows = windowCheck(session);
+    started = Date.parse(session.startedAt);
+  } catch {
+    // unknown: the record cannot be dated
+  }
+  const t = record.ctime;
+  if (!Number.isFinite(t) || !Number.isFinite(started) || t >= started || (windows && (windows.inWindow(t) || t > windows.lastEnd))) {
+    throw gone(`this session has a SessionStart base record whose change time cannot be trusted (${record.file})`);
+  }
+  if (!record.data) throw gone(`this session has a SessionStart base record that cannot be read (${record.file})`);
+  const real = (p: string): Promise<string> => realpath(p).catch(() => path.resolve(p));
+  const root = await real(record.data.root);
+  const here = await real(cwd);
+  if (here === root || here.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`)) {
+    throw gone(`this session started in the repository ${record.data.root} (SessionStart record)`);
+  }
+}
+
 /** The nearest `.git` entry (directory, file or link) in `dir` or any directory above it, or null. */
 async function findGitEntry(dir: string): Promise<string | null> {
   for (let d = path.resolve(dir); ; d = path.dirname(d)) {
@@ -448,34 +839,54 @@ async function findGitEntry(dir: string): Promise<string | null> {
 /**
  * Change times of the files git rewrites when the index or a ref moves: the index, HEAD's reflog,
  * the ref HEAD points at (its loose file, or `packed-refs` when it has none) and `packed-refs`
- * when present; the HEAD file itself when detached. Read from the file system alone, so no git
+ * when present; the HEAD file itself when detached; with the reftable backend, `reftable/` and every
+ * file in it. Read from the file system alone, so no git
  * process can touch them first. A missing index is dated by the directory that held it. Nothing
  * that cannot be read fails: the times only add credit.
  */
-async function gitMetaTimes(gitEntry: string, timeOf: (p: string) => Promise<number>): Promise<number[]> {
-  let gitDir = gitEntry;
+async function gitMetaTimes(workTree: string, gitEntry: string, statTime: (p: string) => Promise<number>, pathStat: (p: string) => Promise<PathStat>): Promise<number[]> {
+  // Fail closed: times that cannot be read count as changed now (after every call), never as quiet.
+  const UNKNOWN = [Infinity];
+  const linkTimes: number[] = [];
+  // A `.git` that is a symlink: credited by the link's own change time (it cannot be backdated).
+  const entry = await lstat(gitEntry).catch(() => undefined);
+  if (entry?.isSymbolicLink()) linkTimes.push(await statTime(gitEntry).catch(() => Infinity));
+  let gitDir: string;
+  let common: string;
   try {
-    const st = await lstat(gitEntry);
-    if (!st.isDirectory()) {
-      const m = /^gitdir:\s*(.+?)\s*$/m.exec(await readFile(gitEntry, 'utf8'));
-      if (!m) return [];
-      gitDir = path.resolve(path.dirname(gitEntry), m[1]!);
-    }
+    const [g = '', c = ''] = (await git(workTree, ['rev-parse', '--absolute-git-dir', '--git-common-dir'])).split('\n');
+    gitDir = await realpath(path.resolve(workTree, g));
+    common = await realpath(path.resolve(workTree, c));
   } catch {
-    return [];
+    return UNKNOWN;
   }
-  const common = await readFile(path.join(gitDir, 'commondir'), 'utf8').then((c) => path.resolve(gitDir, c.trim()), () => gitDir);
-  const time = (p: string): Promise<number | undefined> => timeOf(p).then((t) => t, () => undefined);
+  // A file on another device than the git dir it belongs to (the worktree's own git dir for the
+  // index, HEAD and its reflog; the common dir for refs) sits on a mount: its time reads as changed
+  // after every call (see onDevice). A mount over the git dir itself is caught by the devices the
+  // SessionStart record keeps, or by the file system type check.
+  const anchored = async (dir: string): Promise<(p: string) => Promise<number | undefined>> => {
+    const timeOf = onDevice(statTime, pathStat, await deviceOf(dir, pathStat));
+    return (p) => timeOf(p).then((t) => t, () => undefined);
+  };
+  const time = await anchored(gitDir);
+  const commonTime = await anchored(common);
   const files: Array<Promise<number | undefined>> = [
     time(path.join(gitDir, 'index')).then((t) => t ?? time(gitDir)),
     time(path.join(gitDir, 'logs', 'HEAD')),
-    time(path.join(common, 'packed-refs')),
+    commonTime(path.join(common, 'packed-refs')),
   ];
   const head = await readFile(path.join(gitDir, 'HEAD'), 'utf8').catch(() => '');
   const ref = /^ref:\s*(refs\/\S+)\s*$/.exec(head)?.[1];
-  if (ref && !ref.split('/').includes('..')) files.push(time(path.join(common, ...ref.split('/'))));
+  if (ref && !ref.split('/').includes('..')) files.push(commonTime(path.join(common, ...ref.split('/'))));
   else files.push(time(path.join(gitDir, 'HEAD')));
-  return (await Promise.all(files)).filter((t): t is number => t !== undefined);
+  // The reftable backend (`extensions.refStorage = reftable`, or `git refs migrate`) keeps every ref
+  // and reflog in `reftable/` (tables.list and the *.ref tables), of the common dir and of a worktree.
+  for (const [dir, t] of [[path.join(common, 'reftable'), commonTime], ...(gitDir === common ? [] : [[path.join(gitDir, 'reftable'), time] as const])] as const) {
+    files.push(t(dir));
+    for (const f of await readdir(dir).catch(() => [] as string[])) files.push(t(path.join(dir, f)));
+  }
+  const times = (await Promise.all(files)).filter((t): t is number => t !== undefined);
+  return times.length ? [...linkTimes, ...times] : UNKNOWN;
 }
 
 /**
@@ -530,8 +941,10 @@ async function writtenBefore(root: string, sha: string, cutoff: number, timeOf: 
 }
 
 /** The session's base record (see `why-diff session-start`) with its file's change time, if there is one. */
-async function readBaseRecord(sessionId: string, timeOf: (p: string) => Promise<number>): Promise<{ file: string; ctime: number; data?: BaseRecord } | undefined> {
+async function readBaseRecord(sessionId: string, statTime: (p: string) => Promise<number>, pathStat: (p: string) => Promise<PathStat> = lstatOf): Promise<{ file: string; ctime: number; data?: BaseRecord } | undefined> {
   const file = recordPath(sessionId);
+  // A record on another file system than the directory holding the data directory (a mount over it) has no trusted time.
+  const timeOf = onDevice(statTime, pathStat, await deviceOf(path.dirname(dataDir()), pathStat));
   let ctime: number;
   try {
     ctime = await timeOf(file);
@@ -564,6 +977,314 @@ async function changeTime(p: string): Promise<number> {
   return (await lstat(p)).ctimeMs;
 }
 
+/** The git common dir of the repository at `root` (the main repository's `.git` for a linked worktree), absolute. */
+async function gitCommonDir(root: string): Promise<string> {
+  return path.resolve(root, await git(root, ['rev-parse', '--git-common-dir']));
+}
+
+/** The git dir of the work tree at `root` (a linked worktree's own one), absolute. */
+async function absoluteGitDir(root: string): Promise<string> {
+  return path.resolve(root, await git(root, ['rev-parse', '--absolute-git-dir']));
+}
+
+/**
+ * File system types whose change times a user without root cannot set: local disk file systems and
+ * the kernel's own. Not: FAT and exFAT (ctime is the stored mtime, `touch` sets it), FUSE, network
+ * file systems (the server reports times), and anything unknown.
+ */
+const TRUSTED_FS: ReadonlySet<string> = new Set(['apfs', 'hfs', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'zfs', 'ntfs', 'refs', 'tmpfs', 'overlay']);
+/** Linux `statfs` `f_type` magic numbers, by name (ext2/3/4 share one). */
+const LINUX_FS: ReadonlyMap<number, string> = new Map([
+  [0xef53, 'ext4'], [0x58465342, 'xfs'], [0x9123683e, 'btrfs'], [0x2fc12fc1, 'zfs'], [0x5346544e, 'ntfs'], [0x01021994, 'tmpfs'], [0x794c7630, 'overlay'],
+  [0x4244, 'hfs'], [0x482b, 'hfs'], [0x4d44, 'msdos'], [0x2011bab0, 'exfat'], [0x65735546, 'fuse'], [0x6969, 'nfs'], [0x517b, 'smbfs'], [0xff534d42, 'cifs'], [0xfe534d42, 'smb2'],
+]);
+/** One mounted file system: its source, mount point, type, options and (Linux) device. */
+export interface MountEntry {
+  source: string;
+  mountPoint: string;
+  type: string;
+  options: string[];
+  /** Linux mountinfo `major:minor` */
+  majorMinor?: string;
+  /** Linux mountinfo mount ID (first field) */
+  mountId?: string;
+}
+// eslint-disable-next-line no-control-regex
+const CONTROL = /[\x00-\x1f\x7f]/;
+/** macOS `mount` output as entries; throws on any line it cannot read or a mount point with a control character. */
+export function parseDarwinMounts(out: string): MountEntry[] {
+  return out.split('\n').filter((line) => line.length).map((line) => {
+    const m = /^(.+?) on (\/.*) \(([^()]*)\)$/.exec(line);
+    if (!m) throw new Error(`unreadable mount table line ${JSON.stringify(line.slice(0, 120))}`);
+    if (CONTROL.test(m[2]!)) throw new Error(`mount point with a control character ${JSON.stringify(m[2])}`);
+    const options = m[3]!.split(',').map((o) => o.trim());
+    return { source: m[1]!, mountPoint: m[2]!, type: options[0] ?? '', options: options.slice(1) };
+  });
+}
+/** Linux `/proc/self/mountinfo` as entries; throws on any line it cannot read or a mount point with a control character. */
+export function parseLinuxMountinfo(text: string): MountEntry[] {
+  const unescape = (v: string): string => v.replace(/\\([0-7]{3})/g, (_, o: string) => String.fromCharCode(parseInt(o, 8)));
+  return text.split('\n').filter((line) => line.length).map((line) => {
+    const sep = line.indexOf(' - ');
+    const f = sep === -1 ? [] : line.slice(0, sep).split(' ');
+    const r = sep === -1 ? [] : line.slice(sep + 3).split(' ');
+    if (f.length < 6 || r.length < 3 || !/^\d+:\d+$/.test(f[2]!)) throw new Error(`unreadable mountinfo line ${JSON.stringify(line.slice(0, 120))}`);
+    const mountPoint = unescape(f[4]!);
+    if (CONTROL.test(mountPoint)) throw new Error(`mount point with a control character ${JSON.stringify(mountPoint)}`);
+    if (!/^\d+$/.test(f[0]!)) throw new Error(`unreadable mountinfo line ${JSON.stringify(line.slice(0, 120))}`);
+    return { source: unescape(r[1]!), mountPoint, type: r[0]!, options: [...f[5]!.split(','), ...r[2]!.split(',')], majorMinor: f[2]!, mountId: f[0]! };
+  });
+}
+let mountTable: Promise<MountEntry[]> | undefined;
+/** The mounted file systems, read once per run: macOS `/sbin/mount` (by absolute path, in the temporary directory), Linux `/proc/self/mountinfo`. */
+function mounts(): Promise<MountEntry[]> {
+  mountTable ??= (async (): Promise<MountEntry[]> => {
+    if (process.platform === 'darwin') {
+      return parseDarwinMounts(await new Promise<string>((resolve, reject) => execFile('/sbin/mount', [], { encoding: 'utf8', cwd: os.tmpdir(), shell: false }, (err, o) => (err ? reject(err) : resolve(o)))));
+    }
+    if (process.platform === 'linux') return parseLinuxMountinfo(await readFile('/proc/self/mountinfo', 'utf8'));
+    return [];
+  })();
+  const table = mountTable;
+  setTimeout(() => { if (mountTable === table) mountTable = undefined; }, 2000).unref();
+  return table;
+}
+/** Linux `major:minor` of a `st_dev` (glibc encoding). */
+function linuxMajorMinor(dev: bigint): string {
+  const major = ((dev >> 8n) & 0xfffn) | ((dev >> 32n) & ~0xfffn);
+  const minor = (dev & 0xffn) | ((dev >> 12n) & ~0xffn);
+  return `${major}:${minor}`;
+}
+/**
+ * The mount entry holding a path of device `dev` at `real`: the entries whose device is that device
+ * (Linux: mountinfo's major:minor; macOS: `stat` of each mount point), the longest mount point that
+ * is a prefix of `real` breaking a tie. Throws when no entry has that device (exported for tests).
+ */
+export async function pickMount(entries: MountEntry[], real: string, dev: bigint, deviceOfMountPoint: (mp: string) => Promise<bigint | undefined>): Promise<MountEntry> {
+  const same: MountEntry[] = [];
+  for (const m of entries) {
+    const match = m.majorMinor !== undefined ? m.majorMinor === linuxMajorMinor(dev) : (await deviceOfMountPoint(m.mountPoint)) === dev;
+    if (match) same.push(m);
+  }
+  if (!same.length) throw new Error(`no mount entry has the device of ${real}`);
+  const prefix = (mp: string): boolean => real === mp || real.startsWith(mp.endsWith('/') ? mp : `${mp}/`);
+  return same.sort((a, b) => Number(prefix(b.mountPoint)) - Number(prefix(a.mountPoint)) || b.mountPoint.length - a.mountPoint.length)[0]!;
+}
+/** File system types whose files report the mount's own device, so mountinfo's major:minor cross-checks the mount ID. */
+const SINGLE_DEVICE_FS: ReadonlySet<string> = new Set(['ext2', 'ext3', 'ext4', 'xfs', 'tmpfs']);
+/**
+ * Linux: the mountinfo entry of the mount an open file belongs to, by the `mnt_id` its
+ * `/proc/self/fdinfo/<fd>` names (exact for btrfs subvolumes, whose `st_dev` is an anonymous device
+ * that never equals mountinfo's major:minor, and for bind mounts). On file systems that report the
+ * mount's own device, the device must match too. Throws when nothing matches (exported for tests).
+ */
+export function pickLinuxMount(entries: MountEntry[], fdinfo: string, dev: bigint): MountEntry {
+  const id = /^mnt_id:\s*(\d+)\s*$/m.exec(fdinfo)?.[1];
+  if (!id) throw new Error('no mnt_id in fdinfo');
+  const entry = entries.find((m) => m.mountId === id);
+  if (!entry) throw new Error(`no mountinfo entry has mount ID ${id}`);
+  if (SINGLE_DEVICE_FS.has(entry.type) && entry.majorMinor !== linuxMajorMinor(dev)) throw new Error(`mount ${id} (${entry.mountPoint}) is device ${entry.majorMinor}, the path is ${linuxMajorMinor(dev)}`);
+  return entry;
+}
+/**
+ * Linux: open `real` once, read-only (`O_DIRECTORY` for a directory), and from that one handle read
+ * its device (`fstat`) and its `/proc/self/fdinfo` (the mount ID); the handle must still name `real`
+ * (`/proc/self/fd/<fd>`), or a path swapped in between would be read instead. Closed again.
+ */
+async function linuxMountProbe(real: string): Promise<{ fdinfo: string; dev: bigint }> {
+  const dir = (await lstat(real)).isDirectory();
+  const fh = await open(real, fsConstants.O_RDONLY | (dir ? fsConstants.O_DIRECTORY : 0));
+  try {
+    const named = await readlink(`/proc/self/fd/${fh.fd}`);
+    if (named !== real) throw new Error(`${real} opened as ${named}`);
+    const dev = (await fh.stat({ bigint: true })).dev;
+    return { fdinfo: await readFile(`/proc/self/fdinfo/${fh.fd}`, 'utf8'), dev };
+  } finally {
+    await fh.close();
+  }
+}
+
+/**
+ * Why the file system holding `p` was mounted by a user (who can then write any time into it: an
+ * HFS+ or ext4 image with crafted dates), or undefined. The entry is found by device ({@link pickMount});
+ * untrusted: `mounted by <user>`, `nobrowse` outside `/System/Volumes`, or a disk image (macOS); FUSE,
+ * or under `/media` or `/run/media` (Linux). On Linux the entry is found by mount ID ({@link pickLinuxMount}).
+ * A mount table that cannot be read throws.
+ */
+async function userMountOf(p: string): Promise<string | undefined> {
+  if (process.platform !== 'darwin' && process.platform !== 'linux') return undefined;
+  const real = await realpath(p);
+  let best: MountEntry;
+  if (process.platform === 'linux') {
+    const probe = await linuxMountProbe(real);
+    best = pickLinuxMount(await mounts(), probe.fdinfo, probe.dev);
+  } else {
+    const dev = (await stat(real, { bigint: true })).dev;
+    best = await pickMount(await mounts(), real, dev, (mp) => stat(mp, { bigint: true }).then((st) => st.dev, () => undefined));
+  }
+  const describe = `${best.source} on ${best.mountPoint} (${[best.type, ...best.options].join(', ')})`;
+  if (process.platform === 'darwin') {
+    if (best.options.some((o) => o.startsWith('mounted by'))) return describe;
+    // The system's own nobrowse volumes (VM, Preboot, Update, Data...) live under /System/Volumes.
+    if (best.options.includes('nobrowse') && !best.mountPoint.startsWith('/System/Volumes/')) return describe;
+    if (/disk image/i.test(best.options.join(','))) return describe;
+    return undefined;
+  }
+  // udisks2 mounts what a user plugs in or attaches under /media or /run/media (its mount option
+  // `uhelper=udisks2` lives in /run/mount/utab, not in mountinfo).
+  if (best.type.startsWith('fuse') || /^\/(run\/)?media\//.test(`${best.mountPoint}/`)) return describe;
+  return undefined;
+}
+
+let darwinMounts: Promise<Map<number, string>> | undefined;
+/** macOS: file system type by device, from the mount table (each `/dev/...` source's `st_rdev` is the `st_dev` of files on it). */
+function darwinMountTypes(): Promise<Map<number, string>> {
+  darwinMounts ??= mounts().then(async (table) => {
+    const types = new Map<number, string>();
+    for (const m of table) {
+      if (!m.source.startsWith('/dev/')) continue;
+      const rdev = await stat(m.source).then((st) => Number(st.rdev), () => undefined);
+      if (rdev !== undefined && !types.has(rdev)) types.set(rdev, m.type);
+    }
+    return types;
+  });
+  const table = darwinMounts;
+  setTimeout(() => { if (darwinMounts === table) darwinMounts = undefined; }, 2000).unref();
+  return table;
+}
+const fsTypes = new Map<string, Promise<string>>();
+/** The type of the file system holding `p` (`apfs`, `ext4`, `msdos`...), once per path; throws when it cannot be told. */
+function fileSystemType(p: string): Promise<string> {
+  let t = fsTypes.get(p);
+  if (!t) {
+    t = readFileSystemType(p);
+    fsTypes.set(p, t);
+    // One guard run is short; a long-lived process (the library) must see a later mount.
+    setTimeout(() => fsTypes.delete(p), 2000).unref();
+  }
+  return t;
+}
+async function readFileSystemType(p: string): Promise<string> {
+  if (process.platform === 'win32') return windowsFileSystemType(p);
+  if (process.platform === 'darwin') {
+    const dev = Number((await lstat(p)).dev);
+    const type = (await darwinMountTypes()).get(dev);
+    if (!type) throw new Error(`no mounted device ${dev} found for ${p}`);
+    return type;
+  }
+  const { type } = await statfs(p);
+  return LINUX_FS.get(type) ?? `unknown (0x${type.toString(16)})`;
+}
+/**
+ * The command that reads the Windows volumes holding `realPaths`: PowerShell's `Get-Volume -FilePath`
+ * for each, by absolute path under `%SystemRoot%` (the hook's own environment, not the agent's), run
+ * in the temporary directory without a shell. The paths travel as data (`WD_PATHS` in the
+ * environment, one per line), never in the script text, so no character in them (a quote of any
+ * kind, `$`, a backtick) can change the script. It prints `<FileSystemType>|<DriveType>` per path,
+ * `ERROR|` for one it cannot read (exported for tests).
+ */
+export function windowsVolumeCommand(realPaths: string[]): { file: string; args: string[]; options: { cwd: string; windowsHide: true; shell: false; encoding: 'utf8'; timeout: number; env: NodeJS.ProcessEnv } } {
+  const system32 = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32');
+  return {
+    file: path.join(system32, 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    args: ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_VOLUME_SCRIPT],
+    options: { cwd: os.tmpdir(), windowsHide: true, shell: false, encoding: 'utf8', timeout: 30_000, env: { ...process.env, WD_PATHS: realPaths.join('\n') } },
+  };
+}
+const WINDOWS_VOLUME_SCRIPT = '$env:WD_PATHS -split "`n" | ForEach-Object { try { $v = Get-Volume -FilePath $_ -ErrorAction Stop; "$($v.FileSystemType)|$($v.DriveType)" } catch { "ERROR|" } }';
+/** Windows volume type by the real path of what was asked (not by volume serial, which an image's maker chooses). */
+const windowsVolumes = new Map<string, Promise<string>>();
+async function windowsRealPath(p: string): Promise<string> {
+  const real = await new Promise<string>((resolve, reject) => realpathNative(p, (err, out) => (err ? reject(err) : resolve(out))));
+  if (/^\\\\/.test(real)) throw new Error(`${real} is a UNC or network path`);
+  if (!/^[A-Za-z]:[\\/]/.test(real)) throw new Error(`${real} is not on a local drive`);
+  return real;
+}
+/** Read the volume types of the real paths of `paths` not read yet, in one PowerShell start. */
+async function prefetchWindowsTypes(paths: string[]): Promise<void> {
+  const reals = [...new Set(await Promise.all(paths.map((p) => windowsRealPath(p).catch(() => undefined))))].filter((r): r is string => r !== undefined && !windowsVolumes.has(r));
+  if (!reals.length) return;
+  const c = windowsVolumeCommand(reals);
+  const run = new Promise<string[]>((resolve, reject) => execFile(c.file, c.args, c.options, (err, out) => (err ? reject(err) : resolve(String(out).split(/\r?\n/).filter((l) => l.includes('|'))))));
+  reals.forEach((r, i) => {
+    const t = run.then((lines) => windowsTypeOf(lines[i]));
+    windowsVolumes.set(r, t);
+    t.catch(() => windowsVolumes.delete(r));
+    // One guard run is short; a long-lived process (the library) must see a later mount.
+    setTimeout(() => { if (windowsVolumes.get(r) === t) windowsVolumes.delete(r); }, 5000).unref();
+  });
+  await run.catch(() => undefined);
+}
+/** `<FileSystemType>|<DriveType>`: trusted only as NTFS or ReFS on a Fixed or Removable drive. */
+function windowsTypeOf(line: string | undefined): string {
+  const m = /^(\w+)\|(\w*)\s*$/.exec((line ?? '').trim());
+  if (!m || m[1] === 'ERROR') throw new Error('Get-Volume could not read the volume');
+  if (!/^(fixed|removable)$/i.test(m[2]!)) throw new Error(`drive type ${m[2] || 'unknown'}`);
+  const fs = m[1]!.toLowerCase();
+  return fs === 'ntfs' || fs === 'refs' ? fs : `${fs} (Windows)`;
+}
+/**
+ * Windows: the file system of the volume that actually holds `p` (junctions and folder mount points
+ * followed with `realpath`), from `Get-Volume -FilePath` ({@link windowsVolumeCommand}). A UNC path, a
+ * remote or unknown drive type, any file system but NTFS and ReFS, or a failure is not trusted.
+ */
+async function windowsFileSystemType(p: string): Promise<string> {
+  const real = await windowsRealPath(p);
+  if (!windowsVolumes.has(real)) await prefetchWindowsTypes([real]);
+  const t = windowsVolumes.get(real);
+  if (!t) throw new Error(`Get-Volume could not read the volume of ${real}`);
+  return t;
+}
+
+/** Throw {@link FailClosedError} unless `p` sits on a file system type from {@link TRUSTED_FS}. */
+async function trustedFileSystem(p: string, what: string, fsType: (p: string) => Promise<string>, userMount: (p: string) => Promise<string | undefined> = userMountOf): Promise<void> {
+  let type: string;
+  try {
+    type = await fsType(p);
+  } catch (err) {
+    throw new FailClosedError(`unreviewed: cannot tell which file system ${what} is on (${p}: ${(err as Error).message}), so its change times cannot be trusted`);
+  }
+  if (!TRUSTED_FS.has(type.toLowerCase())) throw new FailClosedError(`unreviewed: ${what} (${p}) is on a ${type} file system, whose change times can be set without root, so its changes cannot be dated`);
+  let mounted: string | undefined;
+  try {
+    mounted = await userMount(p);
+  } catch (err) {
+    throw new FailClosedError(`unreviewed: cannot tell who mounted the file system ${what} is on (${p}: ${(err as Error).message}), so its change times cannot be trusted`);
+  }
+  if (mounted) throw new FailClosedError(`unreviewed: ${what} (${p}) is on a volume a user mounted (${mounted}), whose change times can be written by that user, so its changes cannot be dated`);
+}
+
+/** What the guard reads of a path (lstat: a symlink is never followed). */
+export interface PathStat {
+  dev: number;
+  ctimeMs: number;
+  symlink: boolean;
+}
+
+async function lstatOf(p: string): Promise<PathStat> {
+  const st = await lstat(p);
+  return { dev: Number(st.dev), ctimeMs: st.ctimeMs, symlink: st.isSymbolicLink() };
+}
+
+/** The device of `p` (its file system), or undefined when it cannot be read. */
+async function deviceOf(p: string, pathStat: (p: string) => Promise<PathStat>): Promise<number | undefined> {
+  return pathStat(p).then((st) => st.dev, () => undefined);
+}
+
+/**
+ * `timeOf`, except that a path on another device than `dev` (a file system mounted inside the
+ * repository or the data directory) reads as changed now and forever (Infinity): ctime proves
+ * nothing there, since a user-mounted FAT image or FUSE file system reports any time it likes.
+ */
+function onDevice(timeOf: (p: string) => Promise<number>, pathStat: (p: string) => Promise<PathStat>, dev: number | undefined): (p: string) => Promise<number> {
+  if (dev === undefined) return timeOf;
+  return async (p) => {
+    const t = await timeOf(p);
+    const d = await deviceOf(p, pathStat);
+    return d !== undefined && d !== dev ? Infinity : t;
+  };
+}
+
 /**
  * Changed files (against `rev`, working tree and untracked) and every tracked file, whose change
  * time lies inside one of the session's tool call windows (`written`), and deleted ones whose
@@ -572,25 +1293,66 @@ async function changeTime(p: string): Promise<number> {
  * change from git, not from the file's ctime. A human edit after the call moves the time out of
  * every window, so it is never credited; a human edit while an agent tool call is running is (the
  * one edge; long calls, subagents and background processes widen it).
+ *
+ * No symlink is followed: each directory above a file inside the repository is read with lstat. A
+ * symlink there (git sees every file under it as deleted, while a path lookup would find the moved
+ * originals through it) makes the file deleted, dated by the symlink's own change time, and credited
+ * when that lies in a window or after the last one. A directory or file on another device than the
+ * repository root (a mount) is not dated at all: it is returned in `foreign`, with its mount point.
  */
-async function toolWindowFiles(root: string, rev: string | undefined, inWindow: ((ms: number) => boolean) | null, timeOf: (p: string) => Promise<number>, excluded: ((file: string) => boolean) | null): Promise<{ written: Set<string>; removed: Set<string>; untracked: Set<string> }> {
+async function toolWindowFiles(root: string, rev: string | undefined, windows: { inWindow: (ms: number) => boolean; lastEnd: number } | null, statTime: ((p: string) => Promise<number>) | undefined, pathStat: (p: string) => Promise<PathStat>, excluded: ((file: string) => boolean) | null, onlyFiles?: ReadonlySet<string>): Promise<{ written: Set<string>; removed: Set<string>; untracked: Set<string>; foreign: Map<string, string>; differs: Set<string> }> {
   const written = new Set<string>();
   const removed = new Set<string>();
   const untracked = new Set<string>();
-  if (!inWindow) return { written, removed, untracked };
+  const foreign = new Map<string, string>();
+  const differs = new Set<string>();
+  if (!windows) return { written, removed, untracked, foreign, differs };
+  const { inWindow, lastEnd } = windows;
+  const timeOf = statTime ?? changeTime;
 
   const changed = await git(root, ['diff', '--name-only', '--no-renames', '-z', rev ?? (await emptyTree(root)), '--'], { trim: false });
   const entries = await indexEntries(root);
   // Skip-worktree files the sparse checkout leaves out are expected to be missing.
   const sparse = await sparseMissing(root, entries, excluded);
   for (const f of await listUntracked(root)) untracked.add(f);
-  const files = [...new Set([...changed.split('\0').filter(Boolean), ...entries.map((e) => e.path), ...untracked])]
-    .filter((f) => !f.startsWith('.why-diff/') && !sparse.has(f));
+  for (const f of changed.split('\0')) if (f) differs.add(f);
+  for (const f of untracked) differs.add(f);
+  // Gitlinks are submodules: checked on their own (see checkSubmodules).
+  const gitlinks = new Set(entries.filter((e) => e.mode === GITLINK).map((e) => e.path));
+  const files = [...new Set([...differs, ...entries.map((e) => e.path)])]
+    .filter((f) => !f.startsWith('.why-diff/') && !sparse.has(f) && !gitlinks.has(f) && (!onlyFiles || onlyFiles.has(f)));
   // `git rev-parse --show-toplevel` prints `C:/x` on Windows: resolve it so the walk below compares like with like.
   const top = path.resolve(root);
+  const rootDev = await deviceOf(top, pathStat);
   const gone = (err: unknown): boolean => {
     if (GONE.has((err as NodeJS.ErrnoException).code ?? '')) return true;
     throw err;
+  };
+  // Each directory inside the repository, read once: fine, missing (or not a directory), a symlink,
+  // or on another device. A directory under a symlink or a mount takes that state from it.
+  type DirState = { kind: 'ok' | 'gone' } | { kind: 'symlink' | 'foreign'; at: string };
+  const dirStates = new Map<string, Promise<DirState>>();
+  const dirState = (rel: string): Promise<DirState> => {
+    if (!rel || rel === '.') return Promise.resolve({ kind: 'ok' });
+    let st = dirStates.get(rel);
+    if (!st) {
+      st = dirState(path.posix.dirname(rel)).then(async (up) => {
+        if (up.kind !== 'ok') return up;
+        const abs = path.join(top, ...rel.split('/'));
+        let ps: PathStat;
+        try {
+          ps = await pathStat(abs);
+        } catch (err) {
+          gone(err);
+          return { kind: 'gone' };
+        }
+        if (ps.symlink) return { kind: 'symlink', at: rel };
+        if (rootDev !== undefined && ps.dev !== rootDev) return { kind: 'foreign', at: rel };
+        return { kind: 'ok' };
+      });
+      dirStates.set(rel, st);
+    }
+    return st;
   };
   // Deleted: date it by the nearest path above it that still exists (up to the repo root). A parent
   // replaced by a file (ENOTDIR) or a symlink loop (ELOOP) is gone as a directory too. One lookup per directory.
@@ -609,12 +1371,35 @@ async function toolWindowFiles(root: string, rev: string | undefined, inWindow: 
   };
   for (let i = 0; i < files.length; i += LSTAT_BATCH) {
     await Promise.all(files.slice(i, i + LSTAT_BATCH).map(async (f) => {
+      const up = await dirState(path.posix.dirname(f));
+      if (up.kind === 'symlink') {
+        // Never followed: the file is gone from the repository, removed when the symlink appeared.
+        // Whatever git makes of it (git for Windows reads through a junction), every change to the
+        // file is credited by the link's own time.
+        const t = await timeOf(path.join(top, ...up.at.split('/'))).catch(() => Infinity);
+        if (inWindow(t) || t > lastEnd) {
+          removed.add(f);
+          written.add(f);
+        }
+        return;
+      }
+      if (up.kind === 'foreign') {
+        foreign.set(f, up.at);
+        return;
+      }
       const abs = path.join(top, ...f.split('/'));
       let t: number | undefined;
-      try {
-        t = await timeOf(abs);
-      } catch (err) {
-        gone(err);
+      if (up.kind === 'ok') {
+        try {
+          const ps = await pathStat(abs);
+          if (rootDev !== undefined && ps.dev !== rootDev) {
+            foreign.set(f, f);
+            return;
+          }
+          t = statTime ? await statTime(abs) : ps.ctimeMs;
+        } catch (err) {
+          gone(err);
+        }
       }
       if (t !== undefined) {
         if (inWindow(t)) written.add(f);
@@ -624,7 +1409,7 @@ async function toolWindowFiles(root: string, rev: string | undefined, inWindow: 
       if (d !== undefined && inWindow(d)) removed.add(f);
     }));
   }
-  return { written, removed, untracked };
+  return { written, removed, untracked, foreign, differs };
 }
 
 /**

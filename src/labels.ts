@@ -262,6 +262,17 @@ export function isCiFile(path: string): boolean {
   return CI_PATTERNS.some((re) => re.test(path));
 }
 
+/**
+ * True for files that configure how tests, builds or CI run: CI files, tool configs by name
+ * (`vitest.config.ts`, `tsconfig.json`...), and the manifests that can embed such config
+ * (`package.json`, `pyproject.toml`, why-diff's own `.why-diff.json`).
+ */
+export function isConfigFile(path: string): boolean {
+  const p = normalisePath(path);
+  const base = posix.basename(p);
+  return isCiFile(p) || CONFIG_BASENAMES.some((re) => re.test(base)) || base === 'package.json' || base === 'pyproject.toml' || base === '.why-diff.json';
+}
+
 /** Basename patterns of tool/build configuration files. */
 const CONFIG_BASENAMES: readonly RegExp[] = [
   /^[jt]sconfig(?:\.[\w-]+)*\.json$/,

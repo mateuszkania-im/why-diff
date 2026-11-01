@@ -7,7 +7,8 @@
  */
 
 import { execFile, spawn } from 'node:child_process';
-import { lstat, mkdtemp, open, readFile, readlink, realpath, rm, stat } from 'node:fs/promises';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { lstat, mkdtemp, open, readFile, readlink, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -115,21 +116,81 @@ const BINARY_SNIFF_BYTES = 8000;
 const MAX_UNTRACKED_BYTES = 2 * 1024 * 1024;
 
 /**
- * Config that must not change what git reports about the working tree or a diff, whatever the
- * repository (or an agent working in it) set: no fsmonitor hook deciding which files changed, no
- * user attributes file, no external diff program, fixed `a/` `b/` prefixes, repo-relative paths.
+ * Where git looks for hooks: nowhere. `/dev/null` is not a directory, so no hook is ever found (a
+ * `post-index-change` hook would otherwise run while the guard builds its temporary index); on
+ * Windows an empty directory of why-diff's own.
  */
-const SAFE_CONFIG = [
-  'core.quotePath=false',
-  'core.fsmonitor=false',
-  'core.untrackedCache=false',
-  'core.attributesFile=',
-  'diff.external=',
-  'diff.noprefix=false',
-  'diff.mnemonicPrefix=false',
-  'diff.relative=false',
-  'core.bigFileThreshold=512m',
-].flatMap((c) => ['-c', c]);
+let hooksOff: string | undefined;
+function noHooksPath(): string {
+  if (process.platform !== 'win32') return '/dev/null';
+  hooksOff ??= mkdtempSync(path.join(os.tmpdir(), 'why-diff-no-hooks-'));
+  return hooksOff;
+}
+
+/**
+ * Config that must not change what git reports about the working tree or a diff, and that must not
+ * run anything, whatever the repository (or an agent working in it) set: no hooks, no fsmonitor hook
+ * deciding which files changed, no untracked cache, no user attributes file, no external diff
+ * program, no signature check (gpg) in `git log`, change times always compared, fixed `a/` `b/`
+ * prefixes, repo-relative paths. Command line config wins over every config file.
+ */
+function safeConfig(): string[] {
+  return [
+    `core.hooksPath=${noHooksPath()}`,
+    'core.quotePath=false',
+    'core.fsmonitor=false',
+    'core.untrackedCache=false',
+    'core.attributesFile=',
+    'core.trustctime=true',
+    'core.checkStat=default',
+    'diff.external=',
+    'diff.noprefix=false',
+    'diff.mnemonicPrefix=false',
+    'diff.relative=false',
+    'log.showSignature=false',
+    'core.bigFileThreshold=512m',
+  ].flatMap((c) => ['-c', c]);
+}
+
+/** Subcommands that may run a diff driver: always with `--no-ext-diff --no-textconv`. */
+const DIFF_COMMANDS: ReadonlySet<string> = new Set(['diff', 'log', 'show']);
+
+/**
+ * The argument list and the fixed environment of every git process why-diff starts (see {@link git}):
+ * {@link safeConfig} first; `--no-ext-diff --no-textconv` on diff, log, show and `reflog show`;
+ * `--ignore-submodules=dirty` on diff and status, so no `git status` runs inside a submodule with that
+ * submodule's own config (the guard checks submodules itself) and no `submodule.<name>.ignore` hides a
+ * moved gitlink; `--no-filters` on `hash-object`. The environment is {@link HARDENED_ENV}: no system
+ * config, the global one replaced by {@link globalConfigPath}, no pager, no prompt, no lazy fetch.
+ */
+export function hardenedInvocation(args: string[]): { args: string[]; env: Record<string, string> } {
+  const out = [...args];
+  let i = 0;
+  while (out[i] === '-c' && i + 1 < out.length) i += 2;
+  const sub = out[i];
+  if (sub === 'reflog' && out[i + 1] === 'show') out.splice(i + 2, 0, '--no-ext-diff', '--no-textconv');
+  else if (sub === 'diff') out.splice(i + 1, 0, '--no-ext-diff', '--no-textconv', '--ignore-submodules=dirty');
+  else if (sub === 'status') out.splice(i + 1, 0, '--ignore-submodules=dirty');
+  else if (sub && DIFF_COMMANDS.has(sub)) out.splice(i + 1, 0, '--no-ext-diff', '--no-textconv');
+  else if (sub === 'hash-object') out.splice(i + 1, 0, '--no-filters');
+  return { args: [...safeConfig(), ...out], env: HARDENED_ENV };
+}
+
+/**
+ * Fixed environment of every git process: no system or global config file is read (the global one
+ * is the agent's to write, and either could name a program: a filter, an fsmonitor hook, a pager),
+ * no pager, no terminal prompt, and no fetch of missing objects from a promisor remote (whose URL
+ * could run a transport program). Non-executable settings the user keeps there are passed on by
+ * {@link globalConfigPath}.
+ */
+const HARDENED_ENV: Record<string, string> = {
+  GIT_CONFIG_NOSYSTEM: '1',
+  GIT_CONFIG_GLOBAL: '/dev/null',
+  GIT_TERMINAL_PROMPT: '0',
+  GIT_PAGER: 'cat',
+  GIT_NO_LAZY_FETCH: '1',
+  GIT_ALLOW_PROTOCOL: 'why-diff-none',
+};
 
 /**
  * Raised when why-diff cannot make git show the true content (a filter driver it cannot switch off,
@@ -142,20 +203,22 @@ export class FailClosedError extends Error {
   }
 }
 
-const filterOverrides = new Map<string, Promise<Record<string, string>>>();
+const filterOverrides = new Map<string, Promise<Array<[string, string]>>>();
 
 /**
- * Environment that switches off every filter driver configured for the repository at `cwd`
+ * Overrides that switch off every filter driver configured for the repository at `cwd`
  * (`filter.<name>.clean` / `process` / `smudge` / `required`): a clean filter rewrites working tree
  * content before git compares it, so `*.js filter=x` plus `filter.x.clean = sed s/it.skip/it/`
- * would hide a change. The overrides travel as `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`, which
- * take any name (`-c` cannot carry one holding `=`); inherited `GIT_CONFIG_*` entries are dropped
- * (see {@link baseEnv}). If the config cannot be listed, this throws {@link FailClosedError}.
+ * would hide a change, and it runs a program. The overrides travel as `GIT_CONFIG_KEY_<n>` /
+ * `GIT_CONFIG_VALUE_<n>`, which take any name (`-c` cannot carry one holding `=`); inherited
+ * `GIT_CONFIG_*` entries are dropped (see {@link baseEnv}). If the config cannot be listed, this
+ * throws {@link FailClosedError}.
  */
-function filterEnv(cwd: string): Promise<Record<string, string>> {
+function filterPairs(cwd: string): Promise<Array<[string, string]>> {
   let found = filterOverrides.get(cwd);
   if (!found) {
-    found = execFileAsync('git', ['config', '-z', '--name-only', '--get-regexp', '^filter\\.'], { cwd, encoding: 'utf8', env: baseEnv() })
+    const inv = hardenedInvocation(['config', '-z', '--name-only', '--get-regexp', '^filter\\.']);
+    found = execFileAsync('git', inv.args, { cwd, encoding: 'utf8', env: baseEnv() })
       .then(({ stdout }) => stdout, (err: NodeJS.ErrnoException & { code?: number | string; stdout?: string; stderr?: string }) => {
         // exit 1 with no output: no filter configured
         if ((err.code as unknown) === 1 && !err.stdout && !err.stderr) return '';
@@ -170,17 +233,11 @@ function filterEnv(cwd: string): Promise<Record<string, string>> {
           if (!m) throw new FailClosedError(`cannot switch off git filter config ${JSON.stringify(key)}`);
           names.add(m[1]!);
         }
-        const env: Record<string, string> = {};
-        let n = 0;
+        const pairs: Array<[string, string]> = [];
         for (const name of names) {
-          for (const [k, v] of [['clean', ''], ['process', ''], ['smudge', ''], ['required', 'false']] as const) {
-            env[`GIT_CONFIG_KEY_${n}`] = `filter.${name}.${k}`;
-            env[`GIT_CONFIG_VALUE_${n}`] = v;
-            n++;
-          }
+          for (const [k, v] of [['clean', ''], ['process', ''], ['smudge', ''], ['required', 'false']] as const) pairs.push([`filter.${name}.${k}`, v]);
         }
-        if (names.size) env.GIT_CONFIG_COUNT = String(n);
-        return env;
+        return pairs;
       });
     filterOverrides.set(cwd, found);
     // Config can change between runs in one process (tests); a guard run is short.
@@ -190,32 +247,115 @@ function filterEnv(cwd: string): Promise<Record<string, string>> {
 }
 
 /**
+ * Settings from the user's global and system config that change what git reads but can never run
+ * anything (line endings, the global excludes file, case and Unicode handling, `safe.directory`,
+ * the identity for `why-diff notes`). Those files are not read (see {@link HARDENED_ENV}): these keys
+ * alone are copied into a config file of why-diff's own, which git reads as the global config, so
+ * they keep global precedence (the repository's own config still wins). No key names a program,
+ * and `include` / `includeIf` are never copied.
+ */
+const USER_KEYS = /^(core\.(autocrlf|eol|safecrlf|excludesfile|ignorecase|precomposeunicode|longpaths|symlinks|filemode|protectntfs|protecthfs)|safe\.directory|user\.(name|email))$/;
+/** The environment that finds the user's own global and system config (the hook's, which the agent does not control). */
+function userScopeEnv(): NodeJS.ProcessEnv {
+  const env = baseEnv();
+  delete env.GIT_CONFIG_NOSYSTEM;
+  delete env.GIT_CONFIG_GLOBAL;
+  for (const k of ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM']) if (process.env[k] !== undefined) env[k] = process.env[k];
+  return env;
+}
+const userConfig = new Map<string, Promise<string>>();
+/** The text of the config file {@link globalConfigPath} writes (exported for tests). */
+export function forwardedGlobalConfig(): Promise<string> {
+  const key = JSON.stringify(['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM', 'HOME', 'XDG_CONFIG_HOME', 'USERPROFILE'].map((k) => process.env[k] ?? null));
+  let text = userConfig.get(key);
+  if (!text) {
+    text = execFileAsync('git', hardenedInvocation(['config', '-z', '--show-scope', '--get-regexp', USER_KEYS.source]).args, { cwd: os.tmpdir(), encoding: 'utf8', env: userScopeEnv() })
+      .then(({ stdout }) => configText(parseScoped(stdout).filter(([scope, k]) => (scope === 'system' || scope === 'global') && USER_KEYS.test(k.toLowerCase())).map(([, k, v]) => [k, v] as [string, string])), () => '');
+    userConfig.set(key, text);
+  }
+  return text;
+}
+
+/** `git config -z --show-scope --get-regexp` output: `<scope>\0<key>\n<value>\0` records (a bare `<key>` means true). */
+function parseScoped(out: string): Array<[string, string, string]> {
+  const tokens = out.split('\0');
+  const entries: Array<[string, string, string]> = [];
+  for (let i = 0; i + 1 < tokens.length; i += 2) {
+    const record = tokens[i + 1]!;
+    const nl = record.indexOf('\n');
+    entries.push([tokens[i]!, nl === -1 ? record : record.slice(0, nl), nl === -1 ? 'true' : record.slice(nl + 1)]);
+  }
+  return entries;
+}
+
+/** A config file holding `pairs` (`section.name` keys), every value quoted and escaped. */
+function configText(pairs: Array<[string, string]>): string {
+  const sections = new Map<string, string[]>();
+  for (const [key, value] of pairs) {
+    const dot = key.indexOf('.');
+    const section = key.slice(0, dot).toLowerCase();
+    const name = key.slice(dot + 1);
+    if (!/^[a-z]+$/.test(section) || !/^[A-Za-z][A-Za-z0-9-]*$/.test(name)) continue;
+    const quoted = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\t/g, '\\t');
+    if (!sections.has(section)) sections.set(section, []);
+    sections.get(section)!.push(`\t${name} = "${quoted}"`);
+  }
+  return [...sections].map(([section, lines]) => `[${section}]\n${lines.join('\n')}\n`).join('');
+}
+
+const globalFiles = new Map<string, Promise<string>>();
+/** A file (mode 0600, in the temporary directory, removed at exit) holding {@link forwardedGlobalConfig}; `/dev/null` when it is empty. */
+async function globalConfigPath(): Promise<string> {
+  const text = await forwardedGlobalConfig();
+  if (!text) return HARDENED_ENV.GIT_CONFIG_GLOBAL!;
+  let file = globalFiles.get(text);
+  if (!file) {
+    file = (async () => {
+      const dir = await mkdtemp(path.join(os.tmpdir(), 'why-diff-gitconfig-'));
+      const f = path.join(dir, 'config');
+      await writeFile(f, text, { mode: 0o600 });
+      process.once('exit', () => rmSync(dir, { recursive: true, force: true }));
+      return f;
+    })();
+    globalFiles.set(text, file);
+  }
+  return file;
+}
+
+/**
  * Environment for every git process: no optional locks, C locale, no replace refs and no grafts
- * (either could make a commit read as another one), and filter drivers off. Every inherited `GIT_*`
+ * (either could make a commit read as another one), and {@link HARDENED_ENV}. Every inherited `GIT_*`
  * variable is dropped first: `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
- * `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`... would point git at another
- * repository, index or config than the one in the working directory. Only the ones set here (and
- * per call by why-diff itself) reach git.
+ * `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_EXTERNAL_DIFF`, `GIT_SSH`...
+ * would point git at another repository, index, config or program than the ones in the working
+ * directory. Only the ones set here (and per call by why-diff itself) reach git.
  */
 const NO_GRAFTS = path.join(os.tmpdir(), `why-diff-no-grafts-${randomBytes(8).toString('hex')}`);
 export function baseEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) if (!/^GIT_/i.test(k)) env[k] = v;
-  return { ...env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: NO_GRAFTS };
+  return { ...env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: NO_GRAFTS, ...HARDENED_ENV };
 }
 async function gitEnv(cwd: string): Promise<NodeJS.ProcessEnv> {
-  return { ...baseEnv(), ...(await filterEnv(cwd)) };
+  const pairs = await filterPairs(cwd);
+  const env: NodeJS.ProcessEnv = { ...baseEnv(), GIT_CONFIG_GLOBAL: await globalConfigPath() };
+  pairs.forEach(([k, v], n) => {
+    env[`GIT_CONFIG_KEY_${n}`] = k;
+    env[`GIT_CONFIG_VALUE_${n}`] = v;
+  });
+  if (pairs.length) env.GIT_CONFIG_COUNT = String(pairs.length);
+  return env;
 }
 
 /**
  * Run git in `cwd` without a shell. Resolves with trimmed-right stdout.
- * `-c core.quotePath=false` keeps non-ASCII paths readable in diff headers; see {@link SAFE_CONFIG}.
+ * `-c core.quotePath=false` keeps non-ASCII paths readable in diff headers; see {@link hardenedInvocation}.
  * `input` is written to git's standard input.
  */
 export async function git(cwd: string, args: string[], opts: { trim?: boolean; maxBuffer?: number; env?: Record<string, string>; input?: string } = {}): Promise<string> {
   const env = { ...(await gitEnv(cwd)), ...opts.env };
   const stdout = await new Promise<string>((resolve, reject) => {
-    const child = execFile('git', [...SAFE_CONFIG, ...args], { cwd, maxBuffer: opts.maxBuffer ?? MAX_BUFFER, encoding: 'utf8', env }, (err, out, stderr) => {
+    const child = execFile('git', hardenedInvocation(args).args, { cwd, maxBuffer: opts.maxBuffer ?? MAX_BUFFER, encoding: 'utf8', env }, (err, out, stderr) => {
       if (!err) return resolve(out);
       const e = err as NodeJS.ErrnoException & { code?: number | string };
       if (e.code === 'ENOENT') return reject(new Error('git executable not found on PATH'));
@@ -823,11 +963,12 @@ async function readHead(file: string, n: number): Promise<Buffer | undefined> {
 }
 
 /** The first `n` bytes of each blob, read through one `git cat-file --batch` (contents streamed, not kept). */
-function blobHeads(cwd: string, shas: string[], n: number): Promise<Map<string, Buffer>> {
+async function blobHeads(cwd: string, shas: string[], n: number): Promise<Map<string, Buffer>> {
   const heads = new Map<string, Buffer>();
-  if (!shas.length) return Promise.resolve(heads);
+  if (!shas.length) return heads;
+  const env = await gitEnv(cwd);
   return new Promise((resolve, reject) => {
-    const child = spawn('git', [...SAFE_CONFIG, 'cat-file', '--batch'], { cwd, env: baseEnv(), stdio: ['pipe', 'pipe', 'ignore'] });
+    const child = spawn('git', hardenedInvocation(['cat-file', '--batch']).args, { cwd, env, stdio: ['pipe', 'pipe', 'ignore'] });
     // cat-file --batch reads raw objects: no filters apply.
     let pending: Buffer = Buffer.alloc(0);
     let current: { sha: string; left: number; head: Buffer[]; kept: number } | null = null;
