@@ -10496,7 +10496,8 @@ async function writeRecord(id, root) {
     await mkdir2(path11.dirname(file), { recursive: !0, mode: 448 });
     let dev = (p) => lstat3(p).then((st) => Number(st.dev), () => {
     }), common = await git(root, ["rev-parse", "--git-common-dir"]).then((d) => path11.resolve(root, d), () => {
-    }), devs = { rootDev: await dev(root), gitDev: common ? await dev(common) : void 0, dataDirDev: await dev(path11.dirname(file)) }, submodules = await submoduleHeads(root, "", 1).catch(() => ({})), record = {
+    }), own = await git(root, ["rev-parse", "--absolute-git-dir"]).then((d) => path11.resolve(root, d), () => {
+    }), devs = { rootDev: await dev(root), gitDev: common ? await dev(common) : void 0, ...own && common && own !== common ? { worktreeGitDev: await dev(own) } : {}, dataDirDev: await dev(path11.dirname(file)) }, submodules = await submoduleHeads(root, "", 1).catch(() => ({})), record = {
       session_id: id,
       root,
       head,
@@ -10527,8 +10528,9 @@ async function submoduleHeads(root, prefix, depth) {
     let head = await git(sub, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]).catch(() => "");
     if (/^[0-9a-f]{40,64}$/.test(head)) {
       let common = await git(sub, ["rev-parse", "--git-common-dir"]).then((d) => path11.resolve(sub, d), () => {
-      }), rootDev = await dev(sub), gitDev = common ? await dev(common) : void 0;
-      out[`${prefix}${e.path}`] = { head, ...rootDev !== void 0 ? { rootDev } : {}, ...gitDev !== void 0 ? { gitDev } : {} };
+      }), rootDev = await dev(sub), gitDev = common ? await dev(common) : void 0, own = await git(sub, ["rev-parse", "--absolute-git-dir"]).then((d) => path11.resolve(sub, d), () => {
+      }), worktreeGitDev = own && common && own !== common ? await dev(own) : void 0;
+      out[`${prefix}${e.path}`] = { head, ...rootDev !== void 0 ? { rootDev } : {}, ...gitDev !== void 0 ? { gitDev } : {}, ...worktreeGitDev !== void 0 ? { worktreeGitDev } : {} };
     }
     Object.assign(out, await submoduleHeads(sub, `${prefix}${e.path}/`, depth + 1).catch(() => ({})));
   }
@@ -10617,7 +10619,9 @@ async function guard(payload, opts, state, notes) {
     } else {
       let devs = record.data;
       if (typeof devs.rootDev == "number" && typeof devs.gitDev == "number") {
-        for (let [what, p, was] of [["repository root", await real(root), devs.rootDev], ["git dir", commonDir, devs.gitDev]]) {
+        let checks = [["repository root", await real(root), devs.rootDev], ["git dir", commonDir, devs.gitDev]], wtGitDir = await absoluteGitDir(root);
+        wtGitDir !== commonDir && checks.push(["worktree git dir", wtGitDir, typeof devs.worktreeGitDev == "number" ? devs.worktreeGitDev : devs.gitDev]);
+        for (let [what, p, was] of checks) {
           let now = await deviceOf(p, pathStat);
           if (now !== was) throw new FailClosedError(`the ${what} (${p}) is on another file system than at session start (device ${was} then, ${now ?? "unreadable"} now): a file system mounted over it can report any change time`);
         }
@@ -10631,7 +10635,7 @@ async function guard(payload, opts, state, notes) {
         recordedSubmodules = {};
         for (let [k, v] of Object.entries(devs.submodules)) {
           let e = typeof v == "string" ? { head: v } : v;
-          !e || typeof e.head != "string" || !/^[0-9a-f]{40,64}$/.test(e.head) || (recordedSubmodules[k] = { head: e.head, ...typeof e.rootDev == "number" ? { rootDev: e.rootDev } : {}, ...typeof e.gitDev == "number" ? { gitDev: e.gitDev } : {} });
+          !e || typeof e.head != "string" || !/^[0-9a-f]{40,64}$/.test(e.head) || (recordedSubmodules[k] = { head: e.head, ...typeof e.rootDev == "number" ? { rootDev: e.rootDev } : {}, ...typeof e.gitDev == "number" ? { gitDev: e.gitDev } : {}, ...typeof e.worktreeGitDev == "number" ? { worktreeGitDev: e.worktreeGitDev } : {} });
         }
       }
       record.data.head ? (recordedHead = record.data.head, notes.push(`base from the SessionStart record: ${record.data.head}`)) : notes.push("base record names no commit (unborn branch at session start); the base comes from the reflogs");
@@ -10648,11 +10652,14 @@ async function guard(payload, opts, state, notes) {
     }
   }
   let userMount = opts.userMount ?? userMountOf, gitDir = await absoluteGitDir(root);
-  if (process.platform === "win32" && !opts.fsType && await prefetchWindowsTypes([root, commonDir, gitDir, ...record ? [record.file] : []]), record && (await trustedFileSystem(record.file, "the base record", fsType, userMount), await trustedFileSystem(path12.dirname(record.file), "the base record directory", fsType, userMount)), await trustedFileSystem(root, "the repository", fsType, userMount), await trustedFileSystem(commonDir, "the git dir", fsType, userMount), gitDir !== commonDir && await trustedFileSystem(gitDir, "the worktree git dir", fsType, userMount), !devicesRecorded)
-    for (let [what, dir] of [["repository root", await real(root)], ["git dir", await real(commonDir)]]) {
+  if (process.platform === "win32" && !opts.fsType && await prefetchWindowsTypes([root, commonDir, gitDir, ...record ? [record.file] : []]), record && (await trustedFileSystem(record.file, "the base record", fsType, userMount), await trustedFileSystem(path12.dirname(record.file), "the base record directory", fsType, userMount)), await trustedFileSystem(root, "the repository", fsType, userMount), await trustedFileSystem(commonDir, "the git dir", fsType, userMount), gitDir !== commonDir && await trustedFileSystem(gitDir, "the worktree git dir", fsType, userMount), !devicesRecorded) {
+    let dirs = [["repository root", await real(root)], ["git dir", await real(commonDir)]];
+    gitDir !== commonDir && dirs.push(["worktree git dir", await real(gitDir)]);
+    for (let [what, dir] of dirs) {
       let [here, up] = await Promise.all([deviceOf(dir, pathStat), deviceOf(path12.dirname(dir), pathStat)]);
       if (here === void 0 || here !== up) throw new FailClosedError(`unreviewed: the ${what} (${dir}) is the root of its own volume, and no SessionStart record kept its device, so a volume mounted over it during the session cannot be ruled out`);
     }
+  }
   let baseRev = "HEAD", headed = await hasHead(root);
   headed && (baseRev = await sessionBase(root, Date.parse(session.startedAt), objectTime, recordedHead));
   let config = await loadConfig(root, baseRev).catch(() => ({})), blocking = opts.blocking ?? /* @__PURE__ */ new Set([...DEFAULT_BLOCK_ON, ...config.blockOn ?? []]), protectedGlob = compileGlobs(config.protected), ctx = { payload, opts, session, windows, statTime, pathStat, rawObjectTime: opts.objectTime ?? changeTime, config, blocking, protectedGlob, recordedSubmodules, fsType, userMount, gitDev: await deviceOf(commonDir, pathStat) }, hits = await checkRepository(ctx, { root, baseRev, headed, indexBase, metaTimes, prefix: "", depth: 0 });
@@ -10798,17 +10805,17 @@ async function checkSubmodules(ctx, repo, layeredActive) {
       unreviewed(p, `is nested more than ${MAX_SUBMODULE_DEPTH} levels deep`);
       continue;
     }
-    let subHeaded = await hasHead(subRoot), prefixed = `${prefix}${p}/`, key = `${prefix}${p}`, subCommon = await gitCommonDir(subRoot);
+    let subHeaded = await hasHead(subRoot), prefixed = `${prefix}${p}/`, key = `${prefix}${p}`, subCommon = await gitCommonDir(subRoot), subGitDir = await absoluteGitDir(subRoot);
     try {
-      await trustedFileSystem(subRoot, `submodule ${key}`, ctx.fsType, ctx.userMount), await trustedFileSystem(subCommon, `the git dir of submodule ${key}`, ctx.fsType, ctx.userMount);
+      await trustedFileSystem(subRoot, `submodule ${key}`, ctx.fsType, ctx.userMount), await trustedFileSystem(subCommon, `the git dir of submodule ${key}`, ctx.fsType, ctx.userMount), subGitDir !== subCommon && await trustedFileSystem(subGitDir, `the worktree git dir of submodule ${key}`, ctx.fsType, ctx.userMount);
     } catch (err) {
       unreviewed(p, `is on an untrusted file system (${err.message.replace(/^unreviewed: /, "")})`);
       continue;
     }
     let rec2 = ctx.recordedSubmodules?.[key], subGitDev = await deviceOf(subCommon, ctx.pathStat);
     if (rec2?.rootDev !== void 0 || rec2?.gitDev !== void 0) {
-      let rootNow = await deviceOf(await real(subRoot), ctx.pathStat);
-      if (rec2.rootDev !== void 0 && rec2.rootDev !== rootNow || rec2.gitDev !== void 0 && rec2.gitDev !== subGitDev) {
+      let rootNow = await deviceOf(await real(subRoot), ctx.pathStat), wtNow = subGitDir !== subCommon ? await deviceOf(subGitDir, ctx.pathStat) : void 0, wtWas = rec2.worktreeGitDev ?? rec2.gitDev;
+      if (rec2.rootDev !== void 0 && rec2.rootDev !== rootNow || rec2.gitDev !== void 0 && rec2.gitDev !== subGitDev || wtNow !== void 0 && wtWas !== void 0 && wtNow !== wtWas) {
         unreviewed(p, "or its git dir is on another file system than at session start");
         continue;
       }
@@ -11026,39 +11033,52 @@ var TRUSTED_FS = /* @__PURE__ */ new Set(["apfs", "hfs", "ext2", "ext3", "ext4",
   [20859, "smbfs"],
   [4283649346, "cifs"],
   [4266872130, "smb2"]
-]), mountTable;
+]), CONTROL = /[\x00-\x1f\x7f]/;
+function parseDarwinMounts(out) {
+  return out.split(`
+`).filter((line) => line.length).map((line) => {
+    let m = /^(.+?) on (\/.*) \(([^()]*)\)$/.exec(line);
+    if (!m) throw new Error(`unreadable mount table line ${JSON.stringify(line.slice(0, 120))}`);
+    if (CONTROL.test(m[2])) throw new Error(`mount point with a control character ${JSON.stringify(m[2])}`);
+    let options = m[3].split(",").map((o) => o.trim());
+    return { source: m[1], mountPoint: m[2], type: options[0] ?? "", options: options.slice(1) };
+  });
+}
+function parseLinuxMountinfo(text2) {
+  let unescape = (v) => v.replace(/\\([0-7]{3})/g, (_, o) => String.fromCharCode(parseInt(o, 8)));
+  return text2.split(`
+`).filter((line) => line.length).map((line) => {
+    let sep = line.indexOf(" - "), f = sep === -1 ? [] : line.slice(0, sep).split(" "), r = sep === -1 ? [] : line.slice(sep + 3).split(" ");
+    if (f.length < 6 || r.length < 3 || !/^\d+:\d+$/.test(f[2])) throw new Error(`unreadable mountinfo line ${JSON.stringify(line.slice(0, 120))}`);
+    let mountPoint = unescape(f[4]);
+    if (CONTROL.test(mountPoint)) throw new Error(`mount point with a control character ${JSON.stringify(mountPoint)}`);
+    return { source: unescape(r[1]), mountPoint, type: r[0], options: [...f[5].split(","), ...r[2].split(",")], majorMinor: f[2] };
+  });
+}
+var mountTable;
 function mounts() {
-  mountTable ??= (async () => {
-    if (process.platform === "darwin")
-      return (await new Promise((resolve, reject) => execFile3("/sbin/mount", [], { encoding: "utf8", cwd: os9.tmpdir(), shell: !1 }, (err, o) => err ? reject(err) : resolve(o)))).split(`
-`).map((line) => /^(.+?) on (.+) \(([^)]*)\)\s*$/.exec(line)).filter((m) => m !== null).map((m) => {
-        let options = m[3].split(",").map((o) => o.trim());
-        return { source: m[1], mountPoint: m[2], type: options[0] ?? "", options: options.slice(1) };
-      });
-    if (process.platform === "linux") {
-      let unescape = (v) => v.replace(/\\([0-7]{3})/g, (_, o) => String.fromCharCode(parseInt(o, 8)));
-      return (await readFile8("/proc/self/mountinfo", "utf8")).split(`
-`).filter(Boolean).map((line) => {
-        let [left = "", right = ""] = line.split(" - "), f = left.split(" "), [type = "", source = "", superOptions = ""] = right.split(" ");
-        return { source: unescape(source), mountPoint: unescape(f[4] ?? ""), type, options: [...(f[5] ?? "").split(","), ...superOptions.split(",")] };
-      });
-    }
-    return [];
-  })();
+  mountTable ??= (async () => process.platform === "darwin" ? parseDarwinMounts(await new Promise((resolve, reject) => execFile3("/sbin/mount", [], { encoding: "utf8", cwd: os9.tmpdir(), shell: !1 }, (err, o) => err ? reject(err) : resolve(o)))) : process.platform === "linux" ? parseLinuxMountinfo(await readFile8("/proc/self/mountinfo", "utf8")) : [])();
   let table = mountTable;
   return setTimeout(() => {
     mountTable === table && (mountTable = void 0);
   }, 2e3).unref(), table;
 }
+function linuxMajorMinor(dev) {
+  let major = dev >> 8n & 0xfffn | dev >> 32n & ~0xfffn, minor = dev & 0xffn | dev >> 12n & ~0xffn;
+  return `${major}:${minor}`;
+}
+async function pickMount(entries, real, dev, deviceOfMountPoint) {
+  let same = [];
+  for (let m of entries)
+    (m.majorMinor !== void 0 ? m.majorMinor === linuxMajorMinor(dev) : await deviceOfMountPoint(m.mountPoint) === dev) && same.push(m);
+  if (!same.length) throw new Error(`no mount entry has the device of ${real}`);
+  let prefix = (mp) => real === mp || real.startsWith(mp.endsWith("/") ? mp : `${mp}/`);
+  return same.sort((a, b) => Number(prefix(b.mountPoint)) - Number(prefix(a.mountPoint)) || b.mountPoint.length - a.mountPoint.length)[0];
+}
 async function userMountOf(p) {
   if (process.platform !== "darwin" && process.platform !== "linux") return;
-  let real = await realpath7(p), best;
-  for (let m of await mounts()) {
-    let mp = m.mountPoint;
-    (real === mp || real.startsWith(mp.endsWith("/") ? mp : `${mp}/`)) && (!best || mp.length > best.mountPoint.length) && (best = m);
-  }
-  if (!best) throw new Error(`no mount found for ${real}`);
-  let describe = `${best.source} on ${best.mountPoint} (${[best.type, ...best.options].join(", ")})`;
+  let real = await realpath7(p), dev = (await stat5(real, { bigint: !0 })).dev, best = await pickMount(await mounts(), real, dev, (mp) => stat5(mp, { bigint: !0 }).then((st) => st.dev, () => {
+  })), describe = `${best.source} on ${best.mountPoint} (${[best.type, ...best.options].join(", ")})`;
   if (process.platform === "darwin")
     return best.options.some((o) => o.startsWith("mounted by")) || best.options.includes("nobrowse") && !best.mountPoint.startsWith("/System/Volumes/") || /disk image/i.test(best.options.join(",")) ? describe : void 0;
   if (best.type.startsWith("fuse") || best.options.includes("uhelper=udisks2") || /^\/(run\/)?media\//.test(`${best.mountPoint}/`)) return describe;

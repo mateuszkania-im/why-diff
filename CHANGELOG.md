@@ -16,6 +16,7 @@ Guard bypasses found in a security review of 0.3.4 (the agent is treated as the 
 
 ### Documentation
 
+- README Limitations: on Windows a file's owner can set its change time (`SetFileInformationByHandle`, verified in CI), so time-based crediting there is best-effort; paths the agent names are always checked.
 - README: the threat model now says that file ctime cannot be forged without root on the repository's own file system and that paths on other mounts inside the repository are not trusted; the Guard and Limitations text covers submodules, symlinked directories, the reftable backend, a moved `.git`, and git hooks, filters and global config being off.
 
 ## 0.3.4
