@@ -597,7 +597,7 @@ describe('getDiff: attributes, textconv and fsmonitor cannot hide changes', () =
     expect(added(await getDiff(repo, { workingTree: true }), 'a.test.js')).toEqual(['it.skip("a", () => {});']);
   });
 
-  it('keeps GIT_CONFIG_COUNT entries from the environment', async () => {
+  it('ignores GIT_CONFIG_COUNT entries from the environment, and still switches off the filters', async () => {
     const repo = repoWithChange();
     writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js filter=hide\n');
     sh(repo, 'config', 'filter.hide.clean', 'sed s/it.skip/it/');
@@ -605,7 +605,7 @@ describe('getDiff: attributes, textconv and fsmonitor cannot hide changes', () =
     Object.assign(process.env, { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'from-env' });
     try {
       expect(added(await getDiff(repo, { workingTree: true }), 'a.test.js')).toEqual(['it.skip("a", () => {});']);
-      expect(await git(repo, ['config', 'user.name'])).toBe('from-env');
+      expect(await git(repo, ['config', 'user.name']).catch(() => '')).not.toBe('from-env');
     } finally {
       for (const k of ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0']) {
         if (saved[k] === undefined) delete process.env[k];

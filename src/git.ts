@@ -125,8 +125,8 @@ const filterOverrides = new Map<string, Promise<Record<string, string>>>();
  * (`filter.<name>.clean` / `process` / `smudge` / `required`): a clean filter rewrites working tree
  * content before git compares it, so `*.js filter=x` plus `filter.x.clean = sed s/it.skip/it/`
  * would hide a change. The overrides travel as `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`, which
- * take any name (`-c` cannot carry one holding `=`), after the caller's own `GIT_CONFIG_COUNT`
- * entries. If the config cannot be listed, this throws {@link FailClosedError}.
+ * take any name (`-c` cannot carry one holding `=`); inherited `GIT_CONFIG_*` entries are dropped
+ * (see {@link baseEnv}). If the config cannot be listed, this throws {@link FailClosedError}.
  */
 function filterEnv(cwd: string): Promise<Record<string, string>> {
   let found = filterOverrides.get(cwd);
@@ -147,8 +147,7 @@ function filterEnv(cwd: string): Promise<Record<string, string>> {
           names.add(m[1]!);
         }
         const env: Record<string, string> = {};
-        let n = Number(process.env.GIT_CONFIG_COUNT ?? 0);
-        if (!Number.isInteger(n) || n < 0) n = 0;
+        let n = 0;
         for (const name of names) {
           for (const [k, v] of [['clean', ''], ['process', ''], ['smudge', ''], ['required', 'false']] as const) {
             env[`GIT_CONFIG_KEY_${n}`] = `filter.${name}.${k}`;
@@ -168,11 +167,17 @@ function filterEnv(cwd: string): Promise<Record<string, string>> {
 
 /**
  * Environment for every git process: no optional locks, C locale, no replace refs and no grafts
- * (either could make a commit read as another one), and filter drivers off.
+ * (either could make a commit read as another one), and filter drivers off. Every inherited `GIT_*`
+ * variable is dropped first: `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+ * `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`... would point git at another
+ * repository, index or config than the one in the working directory. Only the ones set here (and
+ * per call by why-diff itself) reach git.
  */
 const NO_GRAFTS = path.join(os.tmpdir(), `why-diff-no-grafts-${randomBytes(8).toString('hex')}`);
-function baseEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: NO_GRAFTS };
+export function baseEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) if (!/^GIT_/i.test(k)) env[k] = v;
+  return { ...env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C', GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: NO_GRAFTS };
 }
 async function gitEnv(cwd: string): Promise<NodeJS.ProcessEnv> {
   return { ...baseEnv(), ...(await filterEnv(cwd)) };
