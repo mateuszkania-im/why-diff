@@ -580,29 +580,46 @@ async function blocked(transcript: string | undefined, hits: string[]): Promise<
 /**
  * Outside any repository: throw {@link FailClosedError} when this session started in one, so a `.git`
  * moved away during the session (or the repository renamed under the session's directory) cannot
- * make the guard skip it. Proof: this session's SessionStart record names a root that is the cwd or
- * contains it (a record that cannot be read proves a repository too); or the transcript carries the
- * SessionStart failed marker, or the record marker while the record is gone. A transcript that
- * exists but cannot be read counts as a marker. No record and no marker: not a repository session.
+ * make the guard skip it. The record's content is not trusted here (the agent can rewrite it):
+ * - the transcript carries the SessionStart record or failed marker (the hook ran in a repository
+ *   for this session): always blocks, whatever the record says or whether it still exists. A
+ *   transcript that exists but cannot be read counts as a marker;
+ * - no marker, but a record file for this session: blocks when its change time is unknown, inside a
+ *   tool call window, or after the session started (the agent may have written it), and otherwise
+ *   when the root it names is the cwd or contains it (or cannot be read).
+ * No marker and no record: not a repository session.
  */
 async function startedInRepository(payload: GuardPayload, cwd: string, statTime: (p: string) => Promise<number>, pathStat: (p: string) => Promise<PathStat>): Promise<void> {
   const sessionId = payload.session_id;
   if (!sessionId) return;
-  const real = (p: string): Promise<string> => realpath(p).catch(() => path.resolve(p));
   const gone = (why: string): FailClosedError => new FailClosedError(`no .git is found at or above ${cwd}, but ${why}: the repository (or its .git) was moved or removed during the session`);
-  const record = await readBaseRecord(sessionId, statTime, pathStat);
-  if (record) {
-    if (!record.data) throw gone(`this session has a SessionStart base record that cannot be read (${record.file})`);
-    const root = await real(record.data.root);
-    const here = await real(cwd);
-    if (here === root || here.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`)) {
-      throw gone(`this session started in the repository ${record.data.root} (SessionStart record)`);
-    }
-  }
   // A transcript that does not exist carries no marker; one that cannot be read may hide one.
   const markers = await transcriptMarkers(payload.transcript_path, sessionId).catch((err: NodeJS.ErrnoException) => (err.code === 'ENOENT' ? { ok: false, failed: false } : { ok: true, failed: true }));
-  if (markers.failed) throw gone('the SessionStart hook ran in a repository for this session (and could not record its base)');
-  if (markers.ok && !record) throw gone('the SessionStart hook recorded a base for this session, and the record is gone');
+  if (markers.ok || markers.failed) throw gone('the SessionStart hook ran in a repository for this session (its marker is in the transcript)');
+  const record = await readBaseRecord(sessionId, statTime, pathStat).catch(() => {
+    throw gone('this session has a SessionStart base record that cannot be read');
+  });
+  if (!record) return;
+  let windows: ReturnType<typeof windowCheck> = null;
+  let started = NaN;
+  try {
+    const session = await claudeCodeAdapter.parse(payload.transcript_path!);
+    windows = windowCheck(session);
+    started = Date.parse(session.startedAt);
+  } catch {
+    // unknown: the record cannot be dated
+  }
+  const t = record.ctime;
+  if (!Number.isFinite(t) || !Number.isFinite(started) || t >= started || (windows && (windows.inWindow(t) || t > windows.lastEnd))) {
+    throw gone(`this session has a SessionStart base record whose change time cannot be trusted (${record.file})`);
+  }
+  if (!record.data) throw gone(`this session has a SessionStart base record that cannot be read (${record.file})`);
+  const real = (p: string): Promise<string> => realpath(p).catch(() => path.resolve(p));
+  const root = await real(record.data.root);
+  const here = await real(cwd);
+  if (here === root || here.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`)) {
+    throw gone(`this session started in the repository ${record.data.root} (SessionStart record)`);
+  }
 }
 
 /** The nearest `.git` entry (directory, file or link) in `dir` or any directory above it, or null. */

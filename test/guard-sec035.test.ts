@@ -153,13 +153,52 @@ describe('sec035 #1: a .git moved away does not turn the session into "not a rep
     expect(res.block).toBe(false);
   });
 
-  it('a record for another directory does not block a session outside any repository', async () => {
-    process.env.CLAUDE_PLUGIN_DATA = temp('wd-s35-data-');
+  /** The record file reads as changed at `at(callAt)`; everything else by its real ctime. */
+  const recordAt = (data: string, callAt: () => number, at: (t: number) => number) => async (p: string): Promise<number> => {
+    const st = await lstat(p);
+    return path.resolve(p).startsWith(path.join(data, 'sessions')) ? at(callAt()) : st.ctimeMs;
+  };
+
+  it('a record for another directory, written before the session, does not block a session outside any repository', async () => {
+    const data = temp('wd-s35-data-');
+    process.env.CLAUDE_PLUGIN_DATA = data;
     const x = repo();
     await recordSessionStart({ session_id: SID, cwd: x.repo });
     const plain = temp('wd-s35-plain-');
-    const res = await guardRun(plain, x.home, (t) => [bash(t, 'echo hi')], { cwd: plain });
+    let callAt = 0;
+    const res = await guardRun(plain, x.home, (t) => {
+      callAt = t;
+      return [bash(t, 'echo hi')];
+    }, { cwd: plain, statTime: recordAt(data, () => callAt, (t) => t - 3600_000) });
     expect(res.block).toBe(false);
+  });
+
+  it('a record forged during a call (no marker) blocks, whatever root it names', async () => {
+    const data = temp('wd-s35-data-');
+    process.env.CLAUDE_PLUGIN_DATA = data;
+    const other = repo();
+    await recordSessionStart({ session_id: SID, cwd: other.repo });
+    const x = moved();
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => {
+      callAt = t;
+      return calls(x.tp)(t);
+    }, { statTime: recordAt(data, () => callAt, (t) => t + 1000) });
+    expect(res.block).toBe(true);
+  });
+
+  it('the base-record marker blocks even when the record was replaced with one for another root', async () => {
+    const data = temp('wd-s35-data-');
+    process.env.CLAUDE_PLUGIN_DATA = data;
+    const other = repo();
+    await recordSessionStart({ session_id: SID, cwd: other.repo });
+    const x = moved();
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => {
+      callAt = t;
+      return calls(x.tp)(t);
+    }, { marker: okMarker, statTime: recordAt(data, () => callAt, (t) => t - 3600_000) });
+    expect(res.block).toBe(true);
   });
 });
 
