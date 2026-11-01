@@ -10,7 +10,7 @@
       "name": "why-diff",
       "source": "./plugin",
       "description": "Trace every hunk of an agent's diff to the prompt that wrote it; flag unrequested changes and test tampering.",
-      "version": "0.2.2"
+      "version": "0.3.0"
     }
   ]
 }

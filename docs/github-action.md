@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # full history, so the base branch and merge base exist
-      - uses: mateuszkania-im/why-diff@v0.2.2
+      - uses: mateuszkania-im/why-diff@v0.3.0
         with:
           fail-on: risk    # optional: fail the job on any risk label
 ```

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- `why-diff notes`: stores the branch's provenance (per hunk: file, line range, match, label kinds, intent verdict with `--classify`, and the prompt, secrets masked) as a git note on HEAD under `refs/notes/why-diff`, and prints the `git push origin refs/notes/why-diff` hint. `--dry-run` prints the JSON.
+- Notes mode: without transcripts, why-diff reads the notes on the commits of the range and gives the hunks they cover their prompt (`source: "notes"`, report `mode: "notes"`); the rest stays a risk scan. Notes are untrusted: over 1 MB they are ignored, the shape is validated and text is sanitised. Labels and `--fail-on` come only from the diff.
+- The GitHub Action fetches `refs/notes/why-diff` before the report.
+- Guard: changes a shell command makes without naming the path (a script computing it, `node fix.js`, `rsync --delete`, an environment variable) are credited by time: the file's change time (ctime on POSIX, mtime on Windows) inside one of the session's Bash calls, with 2 s of slack; a deletion is dated by the nearest existing directory above it. Claude Code sessions expose these windows as `shellWindows`.
+- CI runs on Windows (Node 22) too.
+
+### Changed
+
+- A Bash call that failed still counts as having run; only Claude Code's own refusal message, as a plain error result, means it did not.
+- `--fail-on unattributed` applies only to transcript provenance, not to notes mode.
+- Repo roots also match in their native real path form (Windows 8.3 short names).
+
 ## 0.2.2
 
 ### Changed

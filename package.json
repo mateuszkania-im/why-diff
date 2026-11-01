@@ -1,6 +1,6 @@
 {
   "name": "why-diff",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it. Flags unrequested changes and test tampering.",
   "type": "module",
   "bin": {

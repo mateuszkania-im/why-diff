@@ -124,6 +124,18 @@ why-diff pr --dry-run    # print the new description, change nothing
 
 It needs a logged-in `gh`, edits only the description of the PR that already exists for the branch (between `<!-- why-diff:start -->` and `<!-- why-diff:end -->`), and never pushes or creates a PR. Running it again replaces that section. It reports committed work (`<base>...HEAD`) like the PR itself; add `--include-uncommitted` to include uncommitted changes. Add `--redact-prompts` to leave your prompt text out.
 
+### As a PR author: `why-diff notes`
+
+Provenance can also travel with the commits, as a git note that reviewers, CI and the GitHub Action read without any transcript:
+
+```bash
+why-diff notes                     # git note on HEAD under refs/notes/why-diff
+git push origin refs/notes/why-diff
+why-diff notes --dry-run           # print the note JSON instead
+```
+
+The note is compact JSON per hunk (file, line range, match, label kinds, verdict with `--classify`, and the prompt cut to 1500 characters with secrets masked; `--redact-prompts` leaves the text out). Without transcripts, `why-diff` reads the notes on the commits of the range (fetch them with `git fetch origin refs/notes/why-diff:refs/notes/why-diff`) and runs in **notes mode**: hunks a note covers show their prompt, the rest stays a risk scan. Labels are always computed from the diff, never taken from the note. Commit or rebase again and the note stays on the old commit: run `why-diff notes` again.
+
 ### As a reviewer or in CI: the GitHub Action
 
 CI has no transcripts, so there why-diff runs in **risk-scan mode**: no prompt attribution and no `unattributed` label, but every risk label (skipped or weakened tests, tests turned off in config, new dependencies, CI changes, suppressions, secret-like strings) on the PR diff. The action posts it as one sticky PR comment and the job summary.
@@ -141,12 +153,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # required: a shallow clone has no merge base
-      - uses: mateuszkania-im/why-diff@v0.2.2
+      - uses: mateuszkania-im/why-diff@v0.3.0
         with:
           fail-on: risk    # optional
 ```
 
-Fork PRs get the job summary only. Inputs, outputs and the security notes are in [docs/github-action.md](docs/github-action.md). Outside GitHub Actions, the CLI reads the target branch from GitLab (`CI_MERGE_REQUEST_TARGET_BRANCH_NAME`) and Bitbucket (`BITBUCKET_PR_DESTINATION_BRANCH`) variables. A reviewer can also run `why-diff` on a checked-out PR branch locally and get the same risk scan.
+The action fetches `refs/notes/why-diff` first, so provenance the author pushed with `why-diff notes` shows up in the comment. Fork PRs get the job summary only. Inputs, outputs and the security notes are in [docs/github-action.md](docs/github-action.md). Outside GitHub Actions, the CLI reads the target branch from GitLab (`CI_MERGE_REQUEST_TARGET_BRANCH_NAME`) and Bitbucket (`BITBUCKET_PR_DESTINATION_BRANCH`) variables. A reviewer can also run `why-diff` on a checked-out PR branch locally and get the same risk scan.
 
 ### As a team: `.why-diff.json` and the Stop hook
 
@@ -173,7 +185,7 @@ npx -y github:mateuszkania-im/why-diff --version
 That runs the committed standalone file `plugin/bin/why-diff.mjs` (one file, zero dependencies, nothing to build). From v0.2.0 each release also has a tarball, which skips the git clone and is faster:
 
 ```bash
-npx -y https://github.com/mateuszkania-im/why-diff/releases/download/v0.2.2/why-diff.tgz --version
+npx -y https://github.com/mateuszkania-im/why-diff/releases/download/v0.3.0/why-diff.tgz --version
 ```
 
 Tip: `alias why-diff="npx -y github:mateuszkania-im/why-diff"`.
@@ -228,10 +240,12 @@ why-diff [range] [options] [-- <paths>]
 
 why-diff pr [options]    put the report into the current branch's PR description (gh pr edit)
                          --dry-run, --base, --include-uncommitted, --classify, --redact-prompts, transcript options as above
+why-diff notes [options] store the branch's provenance as a git note on HEAD (refs/notes/why-diff)
+                         --dry-run, --base, --classify, --redact-prompts, transcript options as above
 why-diff guard [--on k]  Claude Code Stop hook (reads the hook payload from stdin)
 ```
 
-Invalid values for `--fail-on`, `--since`, `--classify` and `--format` are rejected with an error instead of being ignored. Binary files are listed but not diffed: the summary counts them (`summary.binaryFiles`, and `summary.unattributedBinaryFiles` for those no agent edit names), and `--fail-on unattributed` also fails on a changed binary file that no agent Write or shell command explains. Home directory paths in reports are shortened to `~` (`repo.root`, session paths) and edit paths are stored relative to the repo root. JSON output carries `schemaVersion: 1` and `mode` (`provenance` or `risk-scan`).
+Invalid values for `--fail-on`, `--since`, `--classify` and `--format` are rejected with an error instead of being ignored. Binary files are listed but not diffed: the summary counts them (`summary.binaryFiles`, and `summary.unattributedBinaryFiles` for those no agent edit names), and `--fail-on unattributed` also fails on a changed binary file that no agent Write or shell command explains. Home directory paths in reports are shortened to `~` (`repo.root`, session paths) and edit paths are stored relative to the repo root. JSON output carries `schemaVersion: 1` and `mode` (`provenance`, `risk-scan`, or `notes` when git notes supplied the prompts; such hunks carry `source: "notes"`).
 
 Secrets are masked everywhere they could leak: prompts, agent rationales, edit bodies, intent-check reasons, and key-shaped secrets in diff lines. `--redact-prompts` goes further and leaves prompt text and rationales out entirely, for reports you share.
 
@@ -267,13 +281,13 @@ Reports stay small on big diffs: every edit a hunk references is stored once in 
 
 ## Limitations
 
-- Provenance needs the transcripts, and they live only on the machine of whoever ran the agent. A reviewer or CI without them gets a risk scan: the same risk labels, but no prompt attribution and no `unattributed` label. That is why `why-diff pr` exists: the author attaches provenance to the PR.
+- Provenance needs the transcripts, and they live only on the machine of whoever ran the agent. A reviewer or CI without them gets a risk scan (the same risk labels, no `unattributed` label) unless the author shared provenance with `why-diff notes` (git notes, which need push access to the repo, so not from a fork) or `why-diff pr`. Notes describe the commit they were written on: after new commits or a rebase, hunks the old note does not cover stay risk-scanned until the author runs `why-diff notes` again. A note's prompts are the author's claim; labels and `--fail-on` never depend on them.
 - In a risk scan, `protected-path` applies to every hunk under a protected path, because there is no way to tell agent edits from human ones.
 - The intent check judges whole hunks: a requested 17-line function next to an accidental one-line change can be marked `unrequested` as a whole. Its verdicts also vary between runs on borderline cases. Use it to point your attention, not as a score.
 - Transcript formats are not public contracts. Adapters are tested against current Claude Code (2.1.x) and Codex (0.16x) files and will need updates.
-- Lines written by scripts the agent ran (`node fix.js`, codegen, formatters) can't be traced line by line, and show as `file-only` matches.
+- Lines written by scripts the agent ran (`node fix.js`, codegen, formatters) can't be traced line by line in the report, and show as `file-only` matches (or as unattributed when the command names no path). The guard still catches them by time, see below.
 - Binary files are attributed by path only: an agent Write or shell command that names the file (`cp logo.png assets/`) counts as explaining it, whatever bytes it wrote.
-- The guard credits a shell command for a file only when the command itself names that path: literally, by a glob (`*`, `?`, `**`), by a brace list (`test/{a,b}.test.js`), through a variable assigned a literal earlier on the same command line (`D=test; rm $D/*.js`), a `for` loop over a literal list, `bash -c` / `sh -c` / `eval`, `find ... -delete` / `-exec`, or a literal `ls` / `find` piped into `xargs`. A shell delete or rename counts only when the hunk is exactly that operation. An in-place rewrite (`sed -i`, `perl -i`, `>`, `tee`, `cp` onto the file, `truncate`, an inline `python -c` / `node -e` / heredoc script that opens a literal path for writing) counts for every change in that file, so a human edit made afterwards in the same file is credited to the agent too. Not resolved: variables set outside the command (the environment, an earlier tool call), paths a script computes (`node fix.js`, `os.remove(name)` with a computed name), `rsync --delete`. Such changes are not blocked live; the CLI and the Action still label them. A `**` in a shell path is credited as matching across directories (and `rm -r` with a glob as covering everything below the matches), even though bash without `globstar` expands `**` like `*`.
+- The guard credits a shell command for a file only when the command itself names that path: literally, by a glob (`*`, `?`, `**`), by a brace list (`test/{a,b}.test.js`), through a variable assigned a literal earlier on the same command line (`D=test; rm $D/*.js`), a `for` loop over a literal list, `bash -c` / `sh -c` / `eval`, `find ... -delete` / `-exec`, or a literal `ls` / `find` piped into `xargs`. A shell delete or rename counts only when the hunk is exactly that operation. An in-place rewrite (`sed -i`, `perl -i`, `>`, `tee`, `cp` onto the file, `truncate`, an inline `python -c` / `node -e` / heredoc script that opens a literal path for writing) counts for every change in that file, so a human edit made afterwards in the same file is credited to the agent too. A change no command names (a path a script computes, `node fix.js`, `os.remove(name)`, `rsync --delete`, a variable from the environment or an earlier call) is credited by time instead: when the file's change time (ctime on Linux and macOS, which a command cannot backdate the way it can mtime; mtime on Windows) lies within 2 seconds of one of the session's Bash calls, from the call to its result, the change counts as the agent's, for every hunk of the file. A deleted file is dated by the nearest directory above it that still exists, and counts only when the hunk is the whole deletion. A human edit made outside every agent shell call is never credited, because it moves the change time out of the windows. The honest edge: a human edit to a file while an agent's shell command is running (a long test run, a `sleep`) is credited to the agent, and so is any other change in that window, such as a `git stash pop` the agent ran over your uncommitted work. A `**` in a shell path is credited as matching across directories (and `rm -r` with a glob as covering everything below the matches), even though bash without `globstar` expands `**` like `*`.
 - `chmod`, `chown` and `touch` never explain changed lines, and a bare `.` explains files below it only for restores (`git checkout -- .`) and formatters (`prettier --write .`).
 - In a prompt longer than 64 KB (a pasted log or file), only the first and last 32 KB are read for path-like tokens; mentions of file names are still found anywhere. Markdown reports quote each prompt up to 1500 characters.
 - Sessions started in another folder (a sibling project, a workspace root) that edited the repo by absolute path are found only with `--scan-all`, which byte-scans every transcript modified in the window.
