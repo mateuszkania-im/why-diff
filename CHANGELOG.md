@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.5
+
+### Security
+
+Guard bypasses found in a security review of 0.3.4 (the agent is treated as the adversary):
+
+- Moving `.git` away (or the repository away from the session's directory) made the guard treat the session as one outside any repository. When no `.git` is found, the guard now blocks if the transcript carries the SessionStart record or failed marker (whatever the record says), or, without a marker, if a record file for this session changed during or after the session start, or names a root that is the cwd or contains it. With neither, a session outside a repository still finishes.
+- With the reftable ref backend (`git refs migrate --ref-format=reftable`), a commit made with plumbing (`commit-tree` plus `update-ref`, a private index) changed none of the dated ref files. The guard now also dates `reftable/` and every table in it, of the common dir and of a worktree, and blocks on an unknown `extensions.refStorage`.
+- Git hooks ran inside the guard: `git update-index` on the temporary index ran the repository's `post-index-change` hook (from `.git/hooks` or any `core.hooksPath`), which could put a test back while the guard read it. Every git call now goes through one helper: `core.hooksPath` points nowhere, `core.fsmonitor` and the untracked cache are off, `--no-ext-diff --no-textconv` are on every diff and log, `--no-filters` on `hash-object`, filter drivers are switched off, `log.showSignature` is off, no pager, prompt or lazy fetch, and no system or global config file is read (non-executable settings from it, such as line endings, the excludes file and `safe.directory`, are passed on). Diffs use `--ignore-submodules=dirty`, so no `git status` runs inside a submodule with its own config and `submodule.<name>.ignore` cannot hide a moved gitlink.
+- A test directory replaced by a symlink to its moved original hid the deletion of every file under it: the files were dated through the link. Each directory inside the repository is now read with `lstat`; a file under a symlink counts as deleted, dated by the symlink's own change time, and credited when that lies in a tool call window or after the last one.
+- Tests inside a submodule were never checked. Every checked-out submodule is now checked like the repository itself, from the commit the session's base records for it, dated by its own work tree, index and ref times, up to 3 levels deep, with the submodule path in the findings. One that cannot be read (not checked out while its gitlink changed, files but no repository, a symlink or mount in its place, the recorded commit missing, deeper than 3 levels) blocks as `unreviewed`.
+- Change times could be forged without root through a user-mounted file system inside the repository (a FAT disk image attached with `hdiutil`, or FUSE). A path on another device than the repository root is no longer dated: when it differs from the base, or is a test or config file, the guard blocks with `unreviewed`. Index, ref, object and base record files on another device read as changed during the session.
+
+### Documentation
+
+- README: the threat model now says that file ctime cannot be forged without root on the repository's own file system and that paths on other mounts inside the repository are not trusted; the Guard and Limitations text covers submodules, symlinked directories, the reftable backend, a moved `.git`, and git hooks, filters and global config being off.
+
 ## 0.3.4
 
 ### Security
