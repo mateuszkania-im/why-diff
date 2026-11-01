@@ -7,7 +7,8 @@
  *   npx why-diff --classify           # + LLM intent check (uses your local Claude Code)
  */
 import { Command, Option } from 'commander';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import pc from 'picocolors';
@@ -17,11 +18,14 @@ import { renderReport, isReportFormat, type ReportFormat } from './report/index.
 import { terminalSafe } from './report/shared.js';
 import type { Harness, LabelKind } from './types.js';
 import { git, repoRoot } from './git.js';
-import { runGuard, type GuardPayload } from './guard.js';
+import { guardDeadlineMs, runGuard, timeoutResult, type GuardPayload, type GuardResult } from './guard.js';
 import { recordSessionStart } from './session-start.js';
 import type { ClassifierKind } from './classify/index.js';
 import { ghRunner, PR_BODY_LIMIT, readPrBody, sectionBudget, upsertSection, writePrBody } from './pr.js';
 import { noteFromReport, writeNote, NOTES_REF } from './notes.js';
+
+/** Hidden subcommand: the guard check itself, run in a child process by `why-diff guard`. */
+const GUARD_CHILD = '__guard-check';
 
 const HARNESSES: Harness[] = ['claude-code', 'codex', 'opencode'];
 const CLASSIFIERS: ClassifierKind[] = ['auto', 'claude-cli', 'anthropic', 'openai'];
@@ -270,17 +274,70 @@ program
   .option('--on <kinds>', 'labels that block (comma list; default: test-skip-added,tests-disabled,assertion-removed,secret-like,ci-changed,protected-path,unreviewed, plus blockOn from .why-diff.json)')
   .action(async (o: { on?: string }) => {
     const raw = await readStdin();
+    // The check runs in a child process this one kills at the deadline: labelling is synchronous
+    // work an in-process timer cannot interrupt, and Claude Code's own hook timeout (30 s) would
+    // let the agent finish unchecked.
+    const result = await guardInChild(raw, o.on);
+    if (process.env.WHY_DIFF_DEBUG === '1') for (const n of result.notes ?? []) process.stderr.write(`why-diff guard (debug): ${terminalSafe(n)}\n`);
+    if (!result.block) return;
+    process.exitCode = 2;
+    process.stderr.write(terminalSafe(result.message ?? ''), () => process.exit(2));
+  });
+
+/** Internal: the guard check itself, run by `why-diff guard` in a child process. Prints the result as JSON. */
+program
+  .command(GUARD_CHILD, { hidden: true })
+  .option('--on <kinds>')
+  .action(async (o: { on?: string }) => {
+    const raw = await readStdin();
     let payload: GuardPayload = {};
     try { payload = raw.trim() ? JSON.parse(raw) : {}; } catch { /* not a hook payload */ }
     const blocking = o.on === undefined ? undefined : (new Set(o.on.split(',').map((s) => s.trim()).filter(Boolean)) as Set<LabelKind>);
     const result = await runGuard(payload, { blocking });
-    if (process.env.WHY_DIFF_DEBUG === '1') for (const n of result.notes ?? []) process.stderr.write(`why-diff guard (debug): ${terminalSafe(n)}\n`);
-    if (!result.block) return;
-    process.exitCode = 2;
-    // Past the internal deadline the check is still running: exit now, before the hook times out.
-    if (result.timedOut) process.stderr.write(terminalSafe(result.message ?? ''), () => process.exit(2));
-    else process.stderr.write(terminalSafe(result.message ?? ''));
+    process.stdout.write(`${JSON.stringify(result)}\n`, () => process.exit(0));
   });
+
+/**
+ * Run the guard check in a child process (this same CLI, {@link GUARD_CHILD}) with its own
+ * temporary directory. At the deadline the child and every process it started (its process group,
+ * on POSIX) are killed with SIGKILL, the temporary directory is removed, and the result is the
+ * timeout block. A child that dies without a result blocks too.
+ */
+async function guardInChild(raw: string, on: string | undefined): Promise<GuardResult> {
+  const ms = guardDeadlineMs();
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'why-diff-guard-'));
+  const posix = process.platform !== 'win32';
+  const env = { ...process.env, TMPDIR: tmp, TMP: tmp, TEMP: tmp };
+  const child = spawn(process.execPath, [...process.execArgv, process.argv[1]!, GUARD_CHILD, ...(on === undefined ? [] : ['--on', on])], { env, stdio: ['pipe', 'pipe', 'ignore'], detached: posix, windowsHide: true });
+  let out = '';
+  child.stdout!.setEncoding('utf8');
+  child.stdout!.on('data', (c: string) => { out += c; });
+  child.stdin!.on('error', () => {});
+  child.stdin!.end(raw);
+  const cleanup = (): Promise<void> => rm(tmp, { recursive: true, force: true }).catch(() => {});
+  return new Promise<GuardResult>((resolve) => {
+    const timer = setTimeout(() => {
+      try {
+        if (posix && child.pid) process.kill(-child.pid, 'SIGKILL');
+        else child.kill('SIGKILL');
+      } catch { /* already gone */ }
+      void cleanup().then(() => resolve(timeoutResult(ms)));
+    }, ms);
+    const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
+      clearTimeout(timer);
+      void cleanup().then(() => {
+        try {
+          const result = JSON.parse(out.trim().split('\n').pop() ?? '') as GuardResult;
+          if (typeof result.block === 'boolean' && Array.isArray(result.hits)) return resolve(result);
+        } catch { /* no result */ }
+        const reason = `the check exited without a result (${signal ? `signal ${signal}` : `exit ${code ?? '?'}`})`;
+        resolve({ block: true, hits: [`- why-diff could not check this session: ${reason}`], message: `why-diff guard: why-diff could not check this session: ${reason}\n\nTell the user that why-diff could not check the changes you made in this session, and what you changed, so they can check it.\n` });
+      });
+    };
+    child.on('error', () => finish(null, null));
+    child.on('close', finish);
+  });
+}
 
 /**
  * `why-diff session-start` — Claude Code SessionStart hook. Records HEAD's commit for the guard

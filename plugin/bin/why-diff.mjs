@@ -2624,7 +2624,8 @@ var program = new Command();
 
 // src/cli.ts
 var import_picocolors2 = __toESM(require_picocolors(), 1);
-import { mkdir as mkdir3, writeFile as writeFile2 } from "node:fs/promises";
+import { mkdir as mkdir3, mkdtemp as mkdtemp2, rm as rm2, writeFile as writeFile2 } from "node:fs/promises";
+import os9 from "node:os";
 import path13 from "node:path";
 import { spawn as spawn4 } from "node:child_process";
 
@@ -3031,7 +3032,7 @@ async function getDiffUnwrapped(cwd, target, opts) {
   if (opts.committedLayers && target.baseRev && opts.paths?.length && await hasHead(cwd)) {
     layers = { head: "", index: "" };
     try {
-      for (let [layer, revs] of [["head", [baseRev, "HEAD"]], ["index", ["--cached", baseRev]]]) {
+      for (let [layer, revs] of [["head", [baseRev, "HEAD"]], ["index", ["--cached", opts.indexBase ?? baseRev]]]) {
         let nameArgs = ["diff", "--name-only", "--no-renames", "-z", ...revs], names = (match ? (await git(root, nameArgs, { trim: !1 })).split("\0").filter(match) : (await gitPaths(root, nameArgs, opts.paths)).split("\0")).filter((f) => f && !f.startsWith(".why-diff/"));
         if (!names.length) continue;
         let args = [...common, ...revs], shown = await revealTextMarkedBinary(root, args, await gitPaths(root, args, [...new Set(names)].map((f) => `:(literal)${f}`)));
@@ -8799,7 +8800,7 @@ async function buildReport(opts = {}) {
   }
   let baseRev = await policyRev(root, target), config = opts.config ?? await loadConfig(root, baseRev, log), protectedGlob = compileGlobs(config.protected), ignoredGlob = compileGlobs(config.ignore);
   log(`diffing ${rangeLabel}`);
-  let detailed = await getDiffDetailed(root, target, { paths: opts.paths, honourSparseCheckout: opts.honourSparseCheckout, sparseTrust: opts.sparseTrust, contentIndex: opts.contentIndex, committedLayers: opts.committedLayers }), allHunks = withLayers(detailed.diff, detailed.layers), unreviewed = new Set(detailed.unreviewed), rulesFiles = /* @__PURE__ */ new Set();
+  let detailed = await getDiffDetailed(root, target, { paths: opts.paths, honourSparseCheckout: opts.honourSparseCheckout, sparseTrust: opts.sparseTrust, contentIndex: opts.contentIndex, committedLayers: opts.committedLayers, indexBase: opts.indexBase }), allHunks = withLayers(detailed.diff, detailed.layers), unreviewed = new Set(detailed.unreviewed), rulesFiles = /* @__PURE__ */ new Set();
   for (let h of allHunks)
     (samePath(h.file, CONFIG_FILE2) || h.oldFile !== void 0 && samePath(h.oldFile, CONFIG_FILE2)) && rulesFiles.add(h.file);
   let pkgHunks = allHunks.filter((h) => samePath(h.file, "package.json"));
@@ -10172,8 +10173,8 @@ function renderReport(report, format, opts = {}) {
 }
 
 // src/guard.ts
-import { createReadStream as createReadStream4 } from "node:fs";
-import { lstat as lstat3, readdir as readdir4, readFile as readFile8, realpath as realpath5 } from "node:fs/promises";
+import { constants as fsConstants, createReadStream as createReadStream4 } from "node:fs";
+import { access, lstat as lstat3, readdir as readdir4, readFile as readFile8, realpath as realpath5 } from "node:fs/promises";
 import readline2 from "node:readline";
 import path12 from "node:path";
 
@@ -10191,23 +10192,31 @@ function recordPath(sessionId) {
 function recordMarker(sessionId) {
   return `why-diff:base-record ${createHash2("sha256").update(sessionId).digest("hex")}`;
 }
+function failedMarker(sessionId) {
+  return `why-diff:base-record-failed ${createHash2("sha256").update(sessionId).digest("hex")}`;
+}
 async function recordSessionStart(payload) {
-  let id = payload.session_id;
-  if (!(typeof id != "string" || !id)) {
-    await writeRecord(id, payload);
+  try {
+    let id = payload.session_id, cwd = payload.cwd;
+    if (typeof id != "string" || !id || typeof cwd != "string" || !cwd) return;
+    let root;
     try {
-      if (JSON.parse(await readFile7(recordPath(id), "utf8")).session_id !== id) return;
+      root = await repoRoot(cwd);
     } catch {
       return;
     }
-    return JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: `${recordMarker(id)} (why-diff recorded the commit this session starts from)` } });
+    let fresh = payload.source !== "resume" && payload.source !== "compact";
+    return fresh && await writeRecord(id, root), await readFile7(recordPath(id), "utf8").then((t) => JSON.parse(t).session_id === id, () => !1) ? hookOutput(`${recordMarker(id)} (why-diff recorded the commit this session starts from)`) : fresh ? hookOutput(`${failedMarker(id)} (why-diff could not record the commit this session starts from; its Stop hook will block)`) : void 0;
+  } catch {
+    return;
   }
 }
-async function writeRecord(id, payload) {
+function hookOutput(context) {
+  return JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context } });
+}
+async function writeRecord(id, root) {
   try {
-    let cwd = payload.cwd;
-    if (typeof cwd != "string" || !cwd || payload.source === "resume" || payload.source === "compact") return;
-    let root = await repoRoot(cwd), head = await git(root, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]).catch(() => "") || null, record = { session_id: id, root, head, at: (/* @__PURE__ */ new Date()).toISOString() }, file = recordPath(id);
+    let head = await git(root, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]).catch(() => "") || null, indexTree = await git(root, ["write-tree"]).catch(() => "") || void 0, record = { session_id: id, root, head, at: (/* @__PURE__ */ new Date()).toISOString(), ...indexTree && /^[0-9a-f]{40,64}$/.test(indexTree) ? { indexTree } : {} }, file = recordPath(id);
     await mkdir2(path11.dirname(file), { recursive: !0, mode: 448 });
     let fh = await open2(file, "wx", 384);
     try {
@@ -10222,20 +10231,25 @@ async function writeRecord(id, payload) {
 
 // src/guard.ts
 var DEFAULT_BLOCK_ON = ["test-skip-added", "tests-disabled", "assertion-removed", "secret-like", "ci-changed", "protected-path", "unreviewed"], NO_BLOCK = { block: !1, hits: [] }, DEADLINE_MS = 2e4;
-async function runGuard(payload, opts) {
-  let env = Number(process.env.WHY_DIFF_GUARD_DEADLINE_MS), ms = Number.isFinite(env) && env > 0 ? env : DEADLINE_MS, timer, expired = new Promise((resolve) => {
-    timer = setTimeout(() => {
-      let hit = `- why-diff could not check this session: it did not finish within ${ms / 1e3} s (the Stop hook's time limit is 30 s), so its changes were not reviewed`;
-      resolve({
-        block: !0,
-        timedOut: !0,
-        hits: [hit],
-        message: `why-diff guard: ${hit.slice(2)}
+function guardDeadlineMs() {
+  let env = Number(process.env.WHY_DIFF_GUARD_DEADLINE_MS);
+  return Number.isFinite(env) && env > 0 ? env : DEADLINE_MS;
+}
+function timeoutResult(ms) {
+  let hit = `- why-diff could not check this session: it did not finish within ${ms / 1e3} s (the Stop hook's time limit is 30 s), so its changes were not reviewed`;
+  return {
+    block: !0,
+    timedOut: !0,
+    hits: [hit],
+    message: `why-diff guard: ${hit.slice(2)}
 
 Tell the user that why-diff could not check the changes you made in this session in time, and what you changed, so they can check it.
 `
-      });
-    }, ms);
+  };
+}
+async function runGuard(payload, opts) {
+  let ms = guardDeadlineMs(), timer, expired = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(timeoutResult(ms)), ms);
   }), work = checkSession(payload, opts);
   work.catch(() => {
   });
@@ -10278,22 +10292,39 @@ async function guard(payload, opts, state, notes) {
   state.relevant = !0;
   let statTime = opts.statTime ?? changeTime, metaTimes = await gitMetaTimes(gitEntry, statTime), sessionId = payload.session_id, record = sessionId ? await readBaseRecord(sessionId, statTime) : void 0, session = await claudeCodeAdapter.parse(payload.transcript_path);
   if (state.relevant = session.edits.some((e) => !e.failed) || (session.toolWindows?.length ?? 0) > 0, !state.relevant) return NO_BLOCK;
-  let root = await repoRoot(cwd), roots = [root, ...await worktreeRoots(root)].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdVariants = rootVariants(session.cwd), icase = await isCaseInsensitive(root), paths = [...new Set(session.edits.filter((e) => !e.failed).map((e) => {
+  let root = await repoRoot(cwd), real = (p) => realpath5(p).catch(() => path12.resolve(p));
+  if (await real(root) !== await real(path12.dirname(gitEntry)))
+    throw new FailClosedError(`git reports the work tree at ${root}, not at ${path12.dirname(gitEntry)} where the .git entry is (core.worktree or a .git file points elsewhere)`);
+  let roots = [root, ...await worktreeRoots(root)].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdVariants = rootVariants(session.cwd), icase = await isCaseInsensitive(root), paths = [...new Set(session.edits.filter((e) => !e.failed).map((e) => {
     let rel = repoRelativePath(e.filePath, roots, session.cwd, cwdVariants);
     if (!rel) return null;
     let p = rel.split(path12.sep).join("/"), magic = `:(${e.kind === "bash" && SHELL_GLOB.test(p) ? "glob" : "literal"}${icase ? ",icase" : ""})`;
     return [.../* @__PURE__ */ new Set([p, p.normalize("NFD")])].map((v) => `${magic}${v}`);
-  }).flatMap((p) => p ?? []))], windows = windowCheck(session), recordedHead;
+  }).flatMap((p) => p ?? []))], windows = windowCheck(session), recordedHead, indexBase, markers = sessionId ? await transcriptMarkers(payload.transcript_path, sessionId).catch(() => ({ ok: !0, failed: !0 })) : { ok: !1, failed: !1 };
+  if (markers.failed) throw new FailClosedError("base record could not be written at session start (the SessionStart hook said so); the session's base cannot be trusted");
   if (record) {
     if (!windows) throw new FailClosedError(`the session's base record cannot be dated: no tool call of this session has a readable time (${record.file})`);
     if (record.ctime >= windows.firstStart) throw new FailClosedError(`base record modified during session (${record.file})`);
     if (!record.data) throw new FailClosedError(`base record missing or unreadable (${record.file})`);
-    let real = (p) => realpath5(p).catch(() => path12.resolve(p));
-    await real(record.data.root) !== await real(root) ? notes.push(`base record is for another repository (${record.data.root}); this session now works in ${root}, so the base comes from the reflogs`) : record.data.head ? (recordedHead = record.data.head, notes.push(`base from the SessionStart record: ${record.data.head}`)) : notes.push("base record names no commit (unborn branch at session start); the base comes from the reflogs");
+    let recordRoot = await real(record.data.root);
+    if (recordRoot !== await real(root)) {
+      let here = await real(cwd);
+      if (here === recordRoot || here.startsWith(recordRoot.endsWith(path12.sep) ? recordRoot : `${recordRoot}${path12.sep}`))
+        throw new FailClosedError(`the base record is for ${record.data.root}, and this session's directory is inside it, but git now finds the repository ${root}`);
+      notes.push(`base record is for another repository (${record.data.root}); this session now works in ${root}, so the base comes from the reflogs`);
+    } else {
+      record.data.head ? (recordedHead = record.data.head, notes.push(`base from the SessionStart record: ${record.data.head}`)) : notes.push("base record names no commit (unborn branch at session start); the base comes from the reflogs");
+      let tree = record.data.indexTree;
+      tree && await git(root, ["cat-file", "-e", `${tree}^{tree}`]).then(() => !0, () => !1) && await writtenBefore(root, tree, windows.firstStart, opts.objectTime ?? changeTime) && (indexBase = tree, notes.push(`index compared against the index tree recorded at session start: ${tree}`));
+    }
   } else {
-    if (sessionId && await transcriptHasMarker(payload.transcript_path, recordMarker(sessionId)).catch(() => !0))
+    if (markers.ok)
       throw new FailClosedError(`base record missing: the SessionStart hook recorded one for this session, and it is gone (${recordPath(sessionId)})`);
-    notes.push("no SessionStart base record; the base comes from the reflogs");
+    {
+      let dir = path12.dirname(sessionId ? recordPath(sessionId) : recordPath("-"));
+      if (await access(dir, fsConstants.W_OK).then(() => !1, (err) => !GONE2.has(err.code ?? ""))) throw new FailClosedError(`the base record directory cannot be written (${dir}), so the session's base cannot be trusted`);
+      notes.push("no SessionStart base record; the base comes from the reflogs");
+    }
   }
   let baseRev = "HEAD", headed = await hasHead(root);
   headed && (baseRev = await sessionBase(root, Date.parse(session.startedAt), opts.objectTime ?? changeTime, recordedHead));
@@ -10319,7 +10350,8 @@ async function guard(payload, opts, state, notes) {
       // Every path through a temporary index without stat data or flags: git hashes the content.
       contentIndex: !0,
       // A change kept only in a commit or only staged (the working tree put back) shows too.
-      committedLayers: headed
+      committedLayers: headed,
+      ...indexBase ? { indexBase } : {}
     }), hits2 = [];
     for (let h of report.hunks) {
       if (h.labels.some((l) => l.kind === "unreviewed")) {
@@ -10351,16 +10383,24 @@ async function guard(payload, opts, state, notes) {
     let first = await check(paths, NO_CREDIT);
     if (first.length) return blocked(payload.transcript_path, first);
   }
-  let excluded = await sparseExcluded(root, sparseTrust), inWindow = windows?.inWindow ?? null, byWindow = await toolWindowFiles(root, headed ? baseRev : void 0, inWindow, statTime, excluded), hits = [], timedNew = [...byWindow.written].filter((f) => byWindow.untracked.has(f)).sort();
-  if (timedNew.length > MAX_TIMED_UNTRACKED) {
-    let over = timedNew.slice(MAX_TIMED_UNTRACKED);
+  let excluded = await sparseExcluded(root, sparseTrust), inWindow = windows?.inWindow ?? null, byWindow = await toolWindowFiles(root, headed ? baseRev : void 0, inWindow, statTime, excluded), hits = [], timedNew = [...byWindow.written].filter((f) => byWindow.untracked.has(f)).sort(), byteCap = Number(process.env.WHY_DIFF_MAX_TIMED_BYTES) > 0 ? Number(process.env.WHY_DIFF_MAX_TIMED_BYTES) : MAX_TIMED_BYTES, kept = timedNew.slice(0, MAX_TIMED_UNTRACKED), over = timedNew.slice(MAX_TIMED_UNTRACKED), bytes = 0;
+  for (let i = 0; i < kept.length; i += LSTAT_BATCH) {
+    let sizes = await Promise.all(kept.slice(i, i + LSTAT_BATCH).map((f) => lstat3(path12.join(root, ...f.split("/"))).then((st) => st.size, () => 0)));
+    for (let [j, size] of sizes.entries())
+      if (bytes += size, bytes > byteCap) {
+        over.unshift(...kept.slice(i + j)), kept.length = i + j;
+        break;
+      }
+    if (bytes > byteCap) break;
+  }
+  if (over.length) {
     for (let f of over) byWindow.written.delete(f);
-    hits.push(`- ${over[0]} unreviewed: ${over.length} more untracked files written during this session's tool calls were not reviewed (over the cap of ${MAX_TIMED_UNTRACKED}), e.g. ${over.slice(0, 3).join(", ")}`);
+    over.sort(), hits.push(`- ${over[0]} unreviewed: ${over.length} more untracked files written during this session's tool calls were not reviewed (over the caps of ${MAX_TIMED_UNTRACKED} files and ${byteCap} bytes read), e.g. ${over.slice(0, 3).join(", ")}`);
   }
   let credit = { written: byWindow.written, removed: byWindow.removed, detached: /* @__PURE__ */ new Set(), layered: /* @__PURE__ */ new Set() }, all = [...paths];
   for (let f of [...byWindow.written, ...byWindow.removed]) all.push(`:(literal)${f}`);
   if (headed && windows && metaTimes.some((t) => windows.inWindow(t) || t > windows.lastEnd))
-    for (let [args, deletedOnly] of [[[baseRev, "HEAD"], !1], [["--cached", baseRev], !1], [["--diff-filter=D", baseRev, "HEAD"], !0], [["--diff-filter=D", "--cached", baseRev], !0]]) {
+    for (let [args, deletedOnly] of [[[baseRev, "HEAD"], !1], [["--cached", indexBase ?? baseRev], !1], [["--diff-filter=D", baseRev, "HEAD"], !0], [["--diff-filter=D", "--cached", indexBase ?? baseRev], !0]]) {
       let out = await git(root, ["diff", "--name-only", "--no-renames", "-z", ...args, "--"], { trim: !1 });
       for (let f of out.split("\0"))
         !f || f.startsWith(".why-diff/") || (deletedOnly ? await lstat3(path12.join(root, ...f.split("/"))).then(() => !0, () => !1) && credit.detached.add(f) : (credit.layered.has(f) || all.push(`:(literal)${f}`), credit.layered.add(f)));
@@ -10369,7 +10409,7 @@ async function guard(payload, opts, state, notes) {
   for (let hit of await check(all, credit)) hits.includes(hit) || hits.push(hit);
   return hits.length ? blocked(payload.transcript_path, hits) : NO_BLOCK;
 }
-var NO_CREDIT = { written: /* @__PURE__ */ new Set(), removed: /* @__PURE__ */ new Set(), detached: /* @__PURE__ */ new Set(), layered: /* @__PURE__ */ new Set() }, MAX_TIMED_UNTRACKED = 2e3;
+var NO_CREDIT = { written: /* @__PURE__ */ new Set(), removed: /* @__PURE__ */ new Set(), detached: /* @__PURE__ */ new Set(), layered: /* @__PURE__ */ new Set() }, MAX_TIMED_UNTRACKED = 2e3, MAX_TIMED_BYTES = 32 * 1024 * 1024;
 async function blocked(transcript, hits) {
   return transcript && await shownBefore(transcript, hits).catch(() => !1) ? {
     block: !0,
@@ -10419,22 +10459,39 @@ async function gitMetaTimes(gitEntry, timeOf) {
   ], head = await readFile8(path12.join(gitDir, "HEAD"), "utf8").catch(() => ""), ref = /^ref:\s*(refs\/\S+)\s*$/.exec(head)?.[1];
   return ref && !ref.split("/").includes("..") ? files.push(time(path12.join(common, ...ref.split("/")))) : files.push(time(path12.join(gitDir, "HEAD"))), (await Promise.all(files)).filter((t) => t !== void 0);
 }
-async function transcriptHasMarker(transcript, marker) {
-  if (!transcript) return !1;
-  let stream = createReadStream4(transcript, { encoding: "utf8" }), lines = readline2.createInterface({ input: stream, crlfDelay: 1 / 0 });
+async function transcriptMarkers(transcript, sessionId) {
+  let found = { ok: !1, failed: !1 };
+  if (!transcript) return found;
+  let want = [recordMarker(sessionId), failedMarker(sessionId)], stream = createReadStream4(transcript, { encoding: "utf8" }), lines = readline2.createInterface({ input: stream, crlfDelay: 1 / 0 });
   try {
     for await (let raw of lines) {
-      if (!raw.includes(marker)) continue;
+      if (!want.some((m) => raw.includes(m))) continue;
       let line;
       try {
         line = JSON.parse(raw);
       } catch {
         continue;
       }
-      if (line.type === "attachment" && strings(line.attachment).some((t) => t.includes(marker))) return !0;
+      if (line.type !== "attachment") continue;
+      let texts = strings(line.attachment);
+      texts.some((t) => t.includes(want[0])) && (found.ok = !0), texts.some((t) => t.includes(want[1])) && (found.failed = !0);
     }
   } finally {
     lines.close(), stream.destroy();
+  }
+  return found;
+}
+async function writtenBefore(root, sha, cutoff, timeOf) {
+  let main = path12.resolve(root, await git(root, ["rev-parse", "--git-path", "objects"])), loose = await timeOf(path12.join(main, sha.slice(0, 2), sha.slice(2))).catch(() => {
+  });
+  if (loose !== void 0) return loose < cutoff;
+  let dir = path12.join(main, "pack");
+  for (let f of (await readdir4(dir).catch(() => [])).filter((x) => x.endsWith(".pack"))) {
+    let idx = path12.join(dir, `${f.slice(0, -5)}.idx`);
+    if (!(await Promise.all([timeOf(path12.join(dir, f)), timeOf(idx)].map((t) => t.catch(() => 1 / 0)))).every((t) => t < cutoff)) continue;
+    let buf = await readFile8(idx).catch(() => {
+    });
+    if (buf && packIndexHas(buf, sha)) return !0;
   }
   return !1;
 }
@@ -10668,7 +10725,7 @@ async function writePrBody(gh, body) {
 }
 
 // src/cli.ts
-var HARNESSES2 = ["claude-code", "codex", "opencode"], CLASSIFIERS = ["auto", "claude-cli", "anthropic", "openai"], FAIL_ON = ["risk", "unrequested", "tests", "unattributed"], VERSION = "0.3.3", program2 = new Command();
+var GUARD_CHILD = "__guard-check", HARNESSES2 = ["claude-code", "codex", "opencode"], CLASSIFIERS = ["auto", "claude-cli", "anthropic", "openai"], FAIL_ON = ["risk", "unrequested", "tests", "unattributed"], VERSION = "0.3.3", program2 = new Command();
 program2.name("why-diff").enablePositionalOptions().version(VERSION, "-V, --version").description("Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it.").argument("[range]", "git range (e.g. main...HEAD) or commit; default: branch vs main plus working tree").argument("[paths...]", "limit to these paths (give them after --, e.g. why-diff -- src)").option("--base <ref>", "branch or ref to compare against (default: auto-detected, incl. CI pull request targets)").option("-w, --working-tree", "only uncommitted changes vs HEAD").addOption(new Option("-f, --format <format>", "output format").choices(["terminal", "md", "html", "json"])).option("--html", "shortcut for --format html (writes .why-diff/report.html and opens it)").option("-o, --out <file>", "write output to a file instead of stdout").option("--no-open", "do not open the HTML report in a browser").option("-c, --classify [backend]", "LLM intent check: auto | claude-cli | anthropic | openai", !1).option("-m, --model <model>", "model for the intent check (default: haiku)").option("--harness <list>", "comma list of harnesses: claude-code,codex,opencode").option("-s, --session <files...>", "explicit transcript file(s) instead of auto-discovery").option("--since <date>", "only consider sessions after this date (ISO)").option("--scan-all", "also scan transcripts started outside the repo (sibling folders, workspace roots) that edited files in it; slower").option("-v, --verbose", "show rationale, commands and label details").option("--fail-on <what>", "exit 1 if: risk | unrequested | tests | unattributed (comma list) \u2014 for CI and hooks").option("--redact-prompts", "omit prompt text and agent rationales from the output (secrets are always masked)").option("-q, --quiet", "no progress output").action(async (rangeArg, pathArgs, o) => {
   let progress = (msg) => {
     o.quiet || process.stderr.write(import_picocolors2.default.dim(`\xB7 ${terminalSafe(msg)}
@@ -10797,16 +10854,54 @@ program2.command("notes").description(`store the branch's provenance as a git no
 `);
 });
 program2.command("guard").description("Claude Code Stop hook: block the agent from finishing if it skipped, weakened or deleted tests").option("--on <kinds>", "labels that block (comma list; default: test-skip-added,tests-disabled,assertion-removed,secret-like,ci-changed,protected-path,unreviewed, plus blockOn from .why-diff.json)").action(async (o) => {
+  let raw = await readStdin(), result = await guardInChild(raw, o.on);
+  if (process.env.WHY_DIFF_DEBUG === "1") for (let n of result.notes ?? []) process.stderr.write(`why-diff guard (debug): ${terminalSafe(n)}
+`);
+  result.block && (process.exitCode = 2, process.stderr.write(terminalSafe(result.message ?? ""), () => process.exit(2)));
+});
+program2.command(GUARD_CHILD, { hidden: !0 }).option("--on <kinds>").action(async (o) => {
   let raw = await readStdin(), payload = {};
   try {
     payload = raw.trim() ? JSON.parse(raw) : {};
   } catch {
   }
   let blocking = o.on === void 0 ? void 0 : new Set(o.on.split(",").map((s) => s.trim()).filter(Boolean)), result = await runGuard(payload, { blocking });
-  if (process.env.WHY_DIFF_DEBUG === "1") for (let n of result.notes ?? []) process.stderr.write(`why-diff guard (debug): ${terminalSafe(n)}
-`);
-  result.block && (process.exitCode = 2, result.timedOut ? process.stderr.write(terminalSafe(result.message ?? ""), () => process.exit(2)) : process.stderr.write(terminalSafe(result.message ?? "")));
+  process.stdout.write(`${JSON.stringify(result)}
+`, () => process.exit(0));
 });
+async function guardInChild(raw, on) {
+  let ms = guardDeadlineMs(), tmp = await mkdtemp2(path13.join(os9.tmpdir(), "why-diff-guard-")), posix2 = process.platform !== "win32", env = { ...process.env, TMPDIR: tmp, TMP: tmp, TEMP: tmp }, child = spawn4(process.execPath, [...process.execArgv, process.argv[1], GUARD_CHILD, ...on === void 0 ? [] : ["--on", on]], { env, stdio: ["pipe", "pipe", "ignore"], detached: posix2, windowsHide: !0 }), out = "";
+  child.stdout.setEncoding("utf8"), child.stdout.on("data", (c) => {
+    out += c;
+  }), child.stdin.on("error", () => {
+  }), child.stdin.end(raw);
+  let cleanup = () => rm2(tmp, { recursive: !0, force: !0 }).catch(() => {
+  });
+  return new Promise((resolve) => {
+    let timer = setTimeout(() => {
+      try {
+        posix2 && child.pid ? process.kill(-child.pid, "SIGKILL") : child.kill("SIGKILL");
+      } catch {
+      }
+      cleanup().then(() => resolve(timeoutResult(ms)));
+    }, ms), finish = (code2, signal) => {
+      clearTimeout(timer), cleanup().then(() => {
+        try {
+          let result = JSON.parse(out.trim().split(`
+`).pop() ?? "");
+          if (typeof result.block == "boolean" && Array.isArray(result.hits)) return resolve(result);
+        } catch {
+        }
+        let reason = `the check exited without a result (${signal ? `signal ${signal}` : `exit ${code2 ?? "?"}`})`;
+        resolve({ block: !0, hits: [`- why-diff could not check this session: ${reason}`], message: `why-diff guard: why-diff could not check this session: ${reason}
+
+Tell the user that why-diff could not check the changes you made in this session, and what you changed, so they can check it.
+` });
+      });
+    };
+    child.on("error", () => finish(null, null)), child.on("close", finish);
+  });
+}
 program2.command("session-start").description("Claude Code SessionStart hook: record the commit the session starts from, for the guard").action(async () => {
   try {
     let raw = await readStdin(), payload = {};

@@ -49,6 +49,8 @@ export interface BuildOptions {
   contentIndex?: boolean;
   /** See {@link DiffOptions.committedLayers} */
   committedLayers?: boolean;
+  /** See {@link DiffOptions.indexBase} */
+  indexBase?: string;
   /** Harnesses to read; default all */
   harnesses?: Harness[];
   /** Explicit transcript files (skips discovery) */
@@ -153,7 +155,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   const ignoredGlob = compileGlobs(config.ignore);
 
   log(`diffing ${rangeLabel}`);
-  const detailed = await getDiffDetailed(root, target, { paths: opts.paths, honourSparseCheckout: opts.honourSparseCheckout, sparseTrust: opts.sparseTrust, contentIndex: opts.contentIndex, committedLayers: opts.committedLayers });
+  const detailed = await getDiffDetailed(root, target, { paths: opts.paths, honourSparseCheckout: opts.honourSparseCheckout, sparseTrust: opts.sparseTrust, contentIndex: opts.contentIndex, committedLayers: opts.committedLayers, indexBase: opts.indexBase });
   const allHunks = withLayers(detailed.diff, detailed.layers);
   const unreviewed = new Set(detailed.unreviewed);
 

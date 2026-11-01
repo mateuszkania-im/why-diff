@@ -9,8 +9,8 @@
  * cannot be read), any error while checking it blocks, with the reason: the agent can break what
  * the guard reads (a truncated index, an unreadable file), and that must not let it finish unchecked.
  */
-import { createReadStream } from 'node:fs';
-import { lstat, readdir, readFile, realpath } from 'node:fs/promises';
+import { constants as fsConstants, createReadStream } from 'node:fs';
+import { access, lstat, readdir, readFile, realpath } from 'node:fs/promises';
 import readline from 'node:readline';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
@@ -19,7 +19,7 @@ import { emptyTree, FailClosedError, git, hasHead, indexEntries, isCaseInsensiti
 import { globToRegExp, repoRelativePath, rootVariants } from './attribute.js';
 import { compileGlobs, loadConfig, type WhyDiffConfig } from './config.js';
 import type { Hunk, LabelKind, Session } from './types.js';
-import { recordMarker, recordPath, type BaseRecord } from './session-start.js';
+import { failedMarker, recordMarker, recordPath, type BaseRecord } from './session-start.js';
 
 export const DEFAULT_BLOCK_ON: readonly LabelKind[] = ['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path', 'unreviewed'];
 
@@ -56,25 +56,35 @@ const NO_BLOCK: GuardResult = { block: false, hits: [] };
 /** Internal time limit of one guard run, below Claude Code's 30 s hook timeout (`WHY_DIFF_GUARD_DEADLINE_MS` overrides it, for tests). */
 const DEADLINE_MS = 20_000;
 
+/** The guard's time limit in ms: `WHY_DIFF_GUARD_DEADLINE_MS` when set (tests), else {@link DEADLINE_MS}. */
+export function guardDeadlineMs(): number {
+  const env = Number(process.env.WHY_DIFF_GUARD_DEADLINE_MS);
+  return Number.isFinite(env) && env > 0 ? env : DEADLINE_MS;
+}
+
+/** The blocking result for a check that ran past its time limit. */
+export function timeoutResult(ms: number): GuardResult {
+  const hit = `- why-diff could not check this session: it did not finish within ${ms / 1000} s (the Stop hook's time limit is 30 s), so its changes were not reviewed`;
+  return {
+    block: true,
+    timedOut: true,
+    hits: [hit],
+    message: `why-diff guard: ${hit.slice(2)}\n\nTell the user that why-diff could not check the changes you made in this session in time, and what you changed, so they can check it.\n`,
+  };
+}
+
 /**
- * Decide whether to block the Stop. A run that does not finish within {@link DEADLINE_MS} blocks:
- * a hook killed by Claude Code's own timeout would let the agent finish unchecked, and the agent
- * can make the check slow (a hundred thousand untracked files).
+ * Decide whether to block the Stop. In process, the time limit ({@link guardDeadlineMs}) is a soft
+ * one: it fires only when the check yields to the event loop, and the check keeps running after it.
+ * The hard deadline belongs to the CLI (`why-diff guard`), which runs this check in a child process
+ * and kills it at the limit: a hook killed by Claude Code's own 30 s timeout would let the agent
+ * finish unchecked, and the agent can make the check slow.
  */
 export async function runGuard(payload: GuardPayload, opts: GuardOptions): Promise<GuardResult> {
-  const env = Number(process.env.WHY_DIFF_GUARD_DEADLINE_MS);
-  const ms = Number.isFinite(env) && env > 0 ? env : DEADLINE_MS;
+  const ms = guardDeadlineMs();
   let timer: NodeJS.Timeout | undefined;
   const expired = new Promise<GuardResult>((resolve) => {
-    timer = setTimeout(() => {
-      const hit = `- why-diff could not check this session: it did not finish within ${ms / 1000} s (the Stop hook's time limit is 30 s), so its changes were not reviewed`;
-      resolve({
-        block: true,
-        timedOut: true,
-        hits: [hit],
-        message: `why-diff guard: ${hit.slice(2)}\n\nTell the user that why-diff could not check the changes you made in this session in time, and what you changed, so they can check it.\n`,
-      });
-    }, ms);
+    timer = setTimeout(() => resolve(timeoutResult(ms)), ms);
   });
   const work = checkSession(payload, opts);
   work.catch(() => {});
@@ -138,6 +148,13 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   state.relevant = session.edits.some((e) => !e.failed) || (session.toolWindows?.length ?? 0) > 0;
   if (!state.relevant) return NO_BLOCK;
   const root = await repoRoot(cwd);
+  const real = (p: string): Promise<string> => realpath(p).catch(() => path.resolve(p));
+  // The work tree git reports must be the one the `.git` entry sits in: `core.worktree` (or a gitfile
+  // in another directory pointing back) would make git diff a clean copy instead of the files the
+  // agent changed.
+  if ((await real(root)) !== (await real(path.dirname(gitEntry)))) {
+    throw new FailClosedError(`git reports the work tree at ${root}, not at ${path.dirname(gitEntry)} where the .git entry is (core.worktree or a .git file points elsewhere)`);
+  }
   const roots = [root, ...(await worktreeRoots(root))].flatMap(rootVariants).sort((a, b) => b.length - a.length);
   const cwdVariants = rootVariants(session.cwd);
   const icase = await isCaseInsensitive(root);
@@ -161,22 +178,43 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // first tool call (the agent cannot write it earlier, and rewriting it moves its ctime). A record
   // the transcript says was written (the hook's marker) must still be there.
   let recordedHead: string | undefined;
+  let indexBase: string | undefined;
+  const markers = sessionId ? await transcriptMarkers(payload.transcript_path, sessionId).catch(() => ({ ok: true, failed: true })) : { ok: false, failed: false };
+  if (markers.failed) throw new FailClosedError(`base record could not be written at session start (the SessionStart hook said so); the session's base cannot be trusted`);
   if (record) {
     if (!windows) throw new FailClosedError(`the session's base record cannot be dated: no tool call of this session has a readable time (${record.file})`);
     if (record.ctime >= windows.firstStart) throw new FailClosedError(`base record modified during session (${record.file})`);
     if (!record.data) throw new FailClosedError(`base record missing or unreadable (${record.file})`);
-    const real = (p: string): Promise<string> => realpath(p).catch(() => path.resolve(p));
-    if ((await real(record.data.root)) !== (await real(root))) {
+    const recordRoot = await real(record.data.root);
+    if (recordRoot !== (await real(root))) {
+      const here = await real(cwd);
+      if (here === recordRoot || here.startsWith(recordRoot.endsWith(path.sep) ? recordRoot : `${recordRoot}${path.sep}`)) {
+        throw new FailClosedError(`the base record is for ${record.data.root}, and this session's directory is inside it, but git now finds the repository ${root}`);
+      }
       notes.push(`base record is for another repository (${record.data.root}); this session now works in ${root}, so the base comes from the reflogs`);
-    } else if (record.data.head) {
-      recordedHead = record.data.head;
-      notes.push(`base from the SessionStart record: ${record.data.head}`);
     } else {
-      notes.push('base record names no commit (unborn branch at session start); the base comes from the reflogs');
+      if (record.data.head) {
+        recordedHead = record.data.head;
+        notes.push(`base from the SessionStart record: ${record.data.head}`);
+      } else {
+        notes.push('base record names no commit (unborn branch at session start); the base comes from the reflogs');
+      }
+      // The index at session start: staged changes from before the session are not the agent's.
+      const tree = record.data.indexTree;
+      if (tree && (await git(root, ['cat-file', '-e', `${tree}^{tree}`]).then(() => true, () => false)) && (await writtenBefore(root, tree, windows.firstStart, opts.objectTime ?? changeTime))) {
+        indexBase = tree;
+        notes.push(`index compared against the index tree recorded at session start: ${tree}`);
+      }
     }
-  } else if (sessionId && (await transcriptHasMarker(payload.transcript_path, recordMarker(sessionId)).catch(() => true))) {
-    throw new FailClosedError(`base record missing: the SessionStart hook recorded one for this session, and it is gone (${recordPath(sessionId)})`);
+  } else if (markers.ok) {
+    throw new FailClosedError(`base record missing: the SessionStart hook recorded one for this session, and it is gone (${recordPath(sessionId!)})`);
   } else {
+    // No record and no marker: the plugin may have been installed mid-session, or the hook's output
+    // lost. A record directory that exists but cannot be written was made so on purpose (no record
+    // can ever be kept there): fail closed rather than fall back to the reflogs.
+    const dir = path.dirname(sessionId ? recordPath(sessionId) : recordPath('-'));
+    const unwritable = await access(dir, fsConstants.W_OK).then(() => false, (err: NodeJS.ErrnoException) => !GONE.has(err.code ?? ''));
+    if (unwritable) throw new FailClosedError(`the base record directory cannot be written (${dir}), so the session's base cannot be trusted`);
     notes.push('no SessionStart base record; the base comes from the reflogs');
   }
 
@@ -230,6 +268,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
       contentIndex: true,
       // A change kept only in a commit or only staged (the working tree put back) shows too.
       committedLayers: headed,
+      ...(indexBase ? { indexBase } : {}),
     });
     const hits: string[] = [];
     for (const h of report.hunks) {
@@ -300,11 +339,28 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   const byWindow = await toolWindowFiles(root, headed ? baseRev : undefined, inWindow, statTime, excluded);
   const hits: string[] = [];
   // Untracked files credited by time alone are capped: past the cap they are not read, only reported.
+  // Both by count and by total size: reading and labelling them is synchronous work.
   const timedNew = [...byWindow.written].filter((f) => byWindow.untracked.has(f)).sort();
-  if (timedNew.length > MAX_TIMED_UNTRACKED) {
-    const over = timedNew.slice(MAX_TIMED_UNTRACKED);
+  const byteCap = Number(process.env.WHY_DIFF_MAX_TIMED_BYTES) > 0 ? Number(process.env.WHY_DIFF_MAX_TIMED_BYTES) : MAX_TIMED_BYTES;
+  const kept = timedNew.slice(0, MAX_TIMED_UNTRACKED);
+  const over = timedNew.slice(MAX_TIMED_UNTRACKED);
+  let bytes = 0;
+  for (let i = 0; i < kept.length; i += LSTAT_BATCH) {
+    const sizes = await Promise.all(kept.slice(i, i + LSTAT_BATCH).map((f) => lstat(path.join(root, ...f.split('/'))).then((st) => st.size, () => 0)));
+    for (const [j, size] of sizes.entries()) {
+      bytes += size;
+      if (bytes > byteCap) {
+        over.unshift(...kept.slice(i + j));
+        kept.length = i + j;
+        break;
+      }
+    }
+    if (bytes > byteCap) break;
+  }
+  if (over.length) {
     for (const f of over) byWindow.written.delete(f);
-    hits.push(`- ${over[0]} unreviewed: ${over.length} more untracked files written during this session's tool calls were not reviewed (over the cap of ${MAX_TIMED_UNTRACKED}), e.g. ${over.slice(0, 3).join(', ')}`);
+    over.sort();
+    hits.push(`- ${over[0]} unreviewed: ${over.length} more untracked files written during this session's tool calls were not reviewed (over the caps of ${MAX_TIMED_UNTRACKED} files and ${byteCap} bytes read), e.g. ${over.slice(0, 3).join(', ')}`);
   }
   const credit = { written: byWindow.written, removed: byWindow.removed, detached: new Set<string>(), layered: new Set<string>() };
   const all = [...paths];
@@ -318,7 +374,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // named it.
   if (headed && windows) {
     if (metaTimes.some((t) => windows.inWindow(t) || t > windows.lastEnd)) {
-      for (const [args, deletedOnly] of [[[baseRev, 'HEAD'], false], [['--cached', baseRev], false], [['--diff-filter=D', baseRev, 'HEAD'], true], [['--diff-filter=D', '--cached', baseRev], true]] as const) {
+      for (const [args, deletedOnly] of [[[baseRev, 'HEAD'], false], [['--cached', indexBase ?? baseRev], false], [['--diff-filter=D', baseRev, 'HEAD'], true], [['--diff-filter=D', '--cached', indexBase ?? baseRev], true]] as const) {
         const out = await git(root, ['diff', '--name-only', '--no-renames', '-z', ...args, '--'], { trim: false });
         for (const f of out.split('\0')) {
           if (!f || f.startsWith('.why-diff/')) continue;
@@ -350,6 +406,8 @@ interface Credit {
 const NO_CREDIT: Credit = { written: new Set(), removed: new Set(), detached: new Set(), layered: new Set() };
 /** Untracked files credited by change time alone that are read and diffed; the rest block as unreviewed. */
 const MAX_TIMED_UNTRACKED = 2000;
+/** Total size of those files that is read (`WHY_DIFF_MAX_TIMED_BYTES` overrides it, for tests). */
+const MAX_TIMED_BYTES = 32 * 1024 * 1024;
 
 async function blocked(transcript: string | undefined, hits: string[]): Promise<GuardResult> {
   // Every Stop with risky hits blocks; only `stop_hook_active` (set by Claude Code, after a block in
@@ -421,27 +479,52 @@ async function gitMetaTimes(gitEntry: string, timeOf: (p: string) => Promise<num
 }
 
 /**
- * Does the transcript hold the SessionStart hook's marker for this session (a hook attachment line
- * whose output carries it)? Proof that the base record was written, so it must still exist.
+ * The SessionStart hook's markers for this session in the transcript (hook attachment lines whose
+ * output carries them): `ok` proves the base record was written (so it must still exist), `failed`
+ * that it could not be (so there is no trusted base).
  */
-async function transcriptHasMarker(transcript: string | undefined, marker: string): Promise<boolean> {
-  if (!transcript) return false;
+async function transcriptMarkers(transcript: string | undefined, sessionId: string): Promise<{ ok: boolean; failed: boolean }> {
+  const found = { ok: false, failed: false };
+  if (!transcript) return found;
+  const want = [recordMarker(sessionId), failedMarker(sessionId)];
   const stream = createReadStream(transcript, { encoding: 'utf8' });
   const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
   try {
     for await (const raw of lines) {
-      if (!raw.includes(marker)) continue;
+      if (!want.some((m) => raw.includes(m))) continue;
       let line: { type?: unknown; attachment?: unknown };
       try {
         line = JSON.parse(raw) as typeof line;
       } catch {
         continue;
       }
-      if (line.type === 'attachment' && strings(line.attachment).some((t) => t.includes(marker))) return true;
+      if (line.type !== 'attachment') continue;
+      const texts = strings(line.attachment);
+      if (texts.some((t) => t.includes(want[0]!))) found.ok = true;
+      if (texts.some((t) => t.includes(want[1]!))) found.failed = true;
     }
   } finally {
     lines.close();
     stream.destroy();
+  }
+  return found;
+}
+
+/**
+ * Was this object written before `cutoff`: a loose object of the repository's own store whose file
+ * changed before then, or one in a pack whose pack and index files both did?
+ */
+async function writtenBefore(root: string, sha: string, cutoff: number, timeOf: (p: string) => Promise<number>): Promise<boolean> {
+  const main = path.resolve(root, await git(root, ['rev-parse', '--git-path', 'objects']));
+  const loose = await timeOf(path.join(main, sha.slice(0, 2), sha.slice(2))).catch(() => undefined);
+  if (loose !== undefined) return loose < cutoff;
+  const dir = path.join(main, 'pack');
+  for (const f of (await readdir(dir).catch(() => [] as string[])).filter((x) => x.endsWith('.pack'))) {
+    const idx = path.join(dir, `${f.slice(0, -5)}.idx`);
+    const times = await Promise.all([timeOf(path.join(dir, f)), timeOf(idx)].map((t) => t.catch(() => Infinity)));
+    if (!times.every((t) => t < cutoff)) continue;
+    const buf = await readFile(idx).catch(() => undefined);
+    if (buf && packIndexHas(buf, sha)) return true;
   }
   return false;
 }

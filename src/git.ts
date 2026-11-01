@@ -74,6 +74,8 @@ export interface DiffOptions {
    * staged (the working tree put back) still shows. Returned apart in {@link DetailedDiff.layers}.
    */
   committedLayers?: boolean;
+  /** With {@link committedLayers}: diff the index against this tree (the index at session start) instead of the base */
+  indexBase?: string;
 }
 
 /** How far the guard trusts a sparse checkout (see {@link sparseExcluded}). */
@@ -422,7 +424,7 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
   if (opts.committedLayers && target.baseRev && opts.paths?.length && (await hasHead(cwd))) {
     layers = { head: '', index: '' };
     try {
-      for (const [layer, revs] of [['head', [baseRev, 'HEAD']], ['index', ['--cached', baseRev]]] as const) {
+      for (const [layer, revs] of [['head', [baseRev, 'HEAD']], ['index', ['--cached', opts.indexBase ?? baseRev]]] as const) {
         // Tree to tree and index to tree: blob ids only, no stat data and no working tree reads.
         const nameArgs = ['diff', '--name-only', '--no-renames', '-z', ...revs];
         const names = (match ? (await git(root, nameArgs, { trim: false })).split('\0').filter(match) : (await gitPaths(root, nameArgs, opts.paths)).split('\0'))

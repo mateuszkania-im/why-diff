@@ -19,6 +19,8 @@ export interface BaseRecord {
   head: string | null;
   /** When the record was written (ISO) */
   at: string;
+  /** The index at session start, as a tree (`git write-tree`); absent when it could not be written */
+  indexTree?: string;
 }
 
 /** `$CLAUDE_PLUGIN_DATA` (set by Claude Code for plugin hooks), else `~/.cache/why-diff`. */
@@ -36,37 +38,57 @@ export function recordMarker(sessionId: string): string {
   return `why-diff:base-record ${createHash('sha256').update(sessionId).digest('hex')}`;
 }
 
+/** The text the SessionStart hook adds to the transcript when the record could not be written. */
+export function failedMarker(sessionId: string): string {
+  return `why-diff:base-record-failed ${createHash('sha256').update(sessionId).digest('hex')}`;
+}
+
 /**
  * Write the base record for a SessionStart payload (`{session_id, cwd, source}`). Never throws: a
  * session must start whatever happens here. Only the first SessionStart of a session writes (a
  * resume or compaction keeps the record of the real start), and a resumed session that has none
  * gets none (it would be dated after the session's earlier tool calls).
  *
- * Returns the hook's stdout when the session has a record: SessionStart JSON whose
- * `additionalContext` carries {@link recordMarker}, so the transcript proves the record existed and
- * the guard can block when it later goes missing. Otherwise undefined (print nothing).
+ * Returns the hook's stdout, SessionStart JSON for the transcript, or undefined (print nothing):
+ * - in a repository at startup or `/clear` (any source but resume and compact), always a marker:
+ *   {@link recordMarker} when the record is there, {@link failedMarker} when it could not be
+ *   written (an unwritable data directory left by an earlier session), so the guard can block
+ *   when the record later goes missing, or never existed;
+ * - on resume or compaction, {@link recordMarker} when the session has a record;
+ * - outside a repository, nothing.
  */
 export async function recordSessionStart(payload: { session_id?: unknown; cwd?: unknown; source?: unknown }): Promise<string | undefined> {
-  const id = payload.session_id;
-  if (typeof id !== 'string' || !id) return undefined;
-  await writeRecord(id, payload);
   try {
-    const data = JSON.parse(await readFile(recordPath(id), 'utf8')) as BaseRecord;
-    if (data.session_id !== id) return undefined;
+    const id = payload.session_id;
+    const cwd = payload.cwd;
+    if (typeof id !== 'string' || !id || typeof cwd !== 'string' || !cwd) return undefined;
+    let root: string;
+    try {
+      root = await repoRoot(cwd);
+    } catch {
+      return undefined; // not a repository: nothing to guard
+    }
+    const fresh = payload.source !== 'resume' && payload.source !== 'compact';
+    if (fresh) await writeRecord(id, root);
+    const ok = await readFile(recordPath(id), 'utf8').then((t) => (JSON.parse(t) as BaseRecord).session_id === id, () => false);
+    if (ok) return hookOutput(`${recordMarker(id)} (why-diff recorded the commit this session starts from)`);
+    return fresh ? hookOutput(`${failedMarker(id)} (why-diff could not record the commit this session starts from; its Stop hook will block)`) : undefined;
   } catch {
     return undefined;
   }
-  return JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `${recordMarker(id)} (why-diff recorded the commit this session starts from)` } });
 }
 
-async function writeRecord(id: string, payload: { cwd?: unknown; source?: unknown }): Promise<void> {
+function hookOutput(context: string): string {
+  return JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context } });
+}
+
+async function writeRecord(id: string, root: string): Promise<void> {
   try {
-    const cwd = payload.cwd;
-    if (typeof cwd !== 'string' || !cwd) return;
-    if (payload.source === 'resume' || payload.source === 'compact') return;
-    const root = await repoRoot(cwd);
     const head = (await git(root, ['rev-parse', '--verify', '-q', 'HEAD^{commit}']).catch(() => '')) || null;
-    const record: BaseRecord = { session_id: id, root, head, at: new Date().toISOString() };
+    // The index as a tree (fails during a merge with conflicts: then none), so staged changes from
+    // before the session are not taken for the agent's.
+    const indexTree = (await git(root, ['write-tree']).catch(() => '')) || undefined;
+    const record: BaseRecord = { session_id: id, root, head, at: new Date().toISOString(), ...(indexTree && /^[0-9a-f]{40,64}$/.test(indexTree) ? { indexTree } : {}) };
     const file = recordPath(id);
     await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
     const fh = await open(file, 'wx', 0o600);
@@ -76,6 +98,6 @@ async function writeRecord(id: string, payload: { cwd?: unknown; source?: unknow
       await fh.close();
     }
   } catch {
-    // Not a repository, an existing record, an unwritable data dir: nothing to record.
+    // An existing record (kept), an unwritable data dir (the caller prints the failed marker).
   }
 }
