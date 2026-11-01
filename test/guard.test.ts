@@ -488,7 +488,9 @@ describe('runGuard on pasted blobs', () => {
       applyEdit(repo, SKIP_OLD, SKIP_NEW);
       const t0 = Date.now();
       const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-blob' }, { blocking: BLOCKING, home, objectTime: oldObjects });
-      expect(Date.now() - t0).toBeLessThan(5000);
+      // Intent: well within the 30 s Stop hook timeout. On Windows every guard run also makes one PowerShell
+      // Get-Volume call (about 1-2 s on the CI runner), so the budget is wider there.
+      expect(Date.now() - t0).toBeLessThan(process.platform === 'win32' ? 12_000 : 5000);
       expect(r.block).toBe(true);
     }, 120_000);
   }
