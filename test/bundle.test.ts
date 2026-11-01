@@ -25,3 +25,13 @@ describe('standalone bundle', () => {
     expect(pkg.dependencies ?? {}).toEqual({});
   });
 });
+
+describe('published package', () => {
+  it('ships the CLI once: the bundle, not a second unbundled copy in dist/', () => {
+    const out = execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: root, encoding: 'utf8' });
+    const files = (JSON.parse(out) as Array<{ files: Array<{ path: string }> }>)[0]!.files.map((f) => f.path);
+    expect(files).toContain('plugin/bin/why-diff.mjs');
+    expect(files).toContain('dist/index.js');
+    expect(files.filter((f) => /^dist\/cli\.(js|d\.ts)$/.test(f))).toEqual([]);
+  });
+});
