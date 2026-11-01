@@ -442,7 +442,8 @@ describe('sec033 #9: an out-of-band base record from SessionStart', () => {
     const head = commit(x.repo, 'A');
     await recordSessionStart({ session_id: 's33', cwd: x.repo });
     const rec = JSON.parse(readFileSync(recordFile(data), 'utf8')) as { session_id: string; root: string; head: string; at: string };
-    expect(rec).toMatchObject({ session_id: 's33', root: x.repo, head });
+    // The root in the form the guard compares (realpath: native separators on Windows).
+    expect(rec).toMatchObject({ session_id: 's33', root: realpathSync.native(x.repo), head });
     if (posix) expect(statSync(recordFile(data)).mode & 0o777).toBe(0o600);
     // A second SessionStart for the same session (resume, compact) keeps the first record.
     writeFileSync(x.tp, testFile(true));
@@ -525,7 +526,7 @@ describe('sec033 #9: the session-start command and its hook', () => {
       expect(r.status).toBe(0);
       expect(r.stdout).toBe('');
     }
-  });
+  }, 30_000); // four CLI runs under tsx
 
   it('the plugin registers it as a SessionStart hook next to the Stop hook', () => {
     const hooks = JSON.parse(readFileSync(path.join(root, 'plugin', 'hooks', 'hooks.json'), 'utf8')) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };

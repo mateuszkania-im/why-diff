@@ -5,7 +5,7 @@
  * file last changed before the session's first tool call: rewriting it changes its ctime.
  */
 import { createHash } from 'node:crypto';
-import { mkdir, open, readFile } from 'node:fs/promises';
+import { mkdir, open, readFile, realpath } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { git, repoRoot } from './git.js';
@@ -13,7 +13,7 @@ import { git, repoRoot } from './git.js';
 /** What `session-start` writes, one file per session. */
 export interface BaseRecord {
   session_id: string;
-  /** Repository root, as `git rev-parse --show-toplevel` prints it */
+  /** Repository root (`git rev-parse --show-toplevel`, resolved with realpath) */
   root: string;
   /** HEAD's commit at session start; null on an unborn branch */
   head: string | null;
@@ -68,6 +68,8 @@ export async function recordSessionStart(payload: { session_id?: unknown; cwd?: 
     } catch {
       return undefined; // not a repository: nothing to guard
     }
+    // The form the guard compares against: git prints `C:/x` on Windows, realpath gives `C:\\x`.
+    root = await realpath(root).catch(() => path.resolve(root));
     const fresh = payload.source !== 'resume' && payload.source !== 'compact';
     if (fresh) await writeRecord(id, root);
     const ok = await readFile(recordPath(id), 'utf8').then((t) => (JSON.parse(t) as BaseRecord).session_id === id, () => false);

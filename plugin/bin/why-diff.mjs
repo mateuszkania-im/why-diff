@@ -10174,13 +10174,13 @@ function renderReport(report, format, opts = {}) {
 
 // src/guard.ts
 import { constants as fsConstants, createReadStream as createReadStream4 } from "node:fs";
-import { access, lstat as lstat3, readdir as readdir4, readFile as readFile8, realpath as realpath5 } from "node:fs/promises";
+import { access, lstat as lstat3, readdir as readdir4, readFile as readFile8, realpath as realpath6 } from "node:fs/promises";
 import readline2 from "node:readline";
 import path12 from "node:path";
 
 // src/session-start.ts
 import { createHash as createHash2 } from "node:crypto";
-import { mkdir as mkdir2, open as open2, readFile as readFile7 } from "node:fs/promises";
+import { mkdir as mkdir2, open as open2, readFile as readFile7, realpath as realpath5 } from "node:fs/promises";
 import os8 from "node:os";
 import path11 from "node:path";
 function dataDir() {
@@ -10205,6 +10205,7 @@ async function recordSessionStart(payload) {
     } catch {
       return;
     }
+    root = await realpath5(root).catch(() => path11.resolve(root));
     let fresh = payload.source !== "resume" && payload.source !== "compact";
     return fresh && await writeRecord(id, root), await readFile7(recordPath(id), "utf8").then((t) => JSON.parse(t).session_id === id, () => !1) ? hookOutput(`${recordMarker(id)} (why-diff recorded the commit this session starts from)`) : fresh ? hookOutput(`${failedMarker(id)} (why-diff could not record the commit this session starts from; its Stop hook will block)`) : void 0;
   } catch {
@@ -10292,7 +10293,7 @@ async function guard(payload, opts, state, notes) {
   state.relevant = !0;
   let statTime = opts.statTime ?? changeTime, metaTimes = await gitMetaTimes(gitEntry, statTime), sessionId = payload.session_id, record = sessionId ? await readBaseRecord(sessionId, statTime) : void 0, session = await claudeCodeAdapter.parse(payload.transcript_path);
   if (state.relevant = session.edits.some((e) => !e.failed) || (session.toolWindows?.length ?? 0) > 0, !state.relevant) return NO_BLOCK;
-  let root = await repoRoot(cwd), real = (p) => realpath5(p).catch(() => path12.resolve(p));
+  let root = await repoRoot(cwd), real = (p) => realpath6(p).catch(() => path12.resolve(p));
   if (await real(root) !== await real(path12.dirname(gitEntry)))
     throw new FailClosedError(`git reports the work tree at ${root}, not at ${path12.dirname(gitEntry)} where the .git entry is (core.worktree or a .git file points elsewhere)`);
   let roots = [root, ...await worktreeRoots(root)].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdVariants = rootVariants(session.cwd), icase = await isCaseInsensitive(root), paths = [...new Set(session.edits.filter((e) => !e.failed).map((e) => {
@@ -10869,6 +10870,37 @@ program2.command(GUARD_CHILD, { hidden: !0 }).option("--on <kinds>").action(asyn
   process.stdout.write(`${JSON.stringify(result)}
 `, () => process.exit(0));
 });
+function killTree(pid, posix2, fallback) {
+  if (!pid) return Promise.resolve();
+  if (posix2) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      try {
+        fallback();
+      } catch {
+      }
+    }
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let tk = spawn4("taskkill", ["/T", "/F", "/PID", String(pid)], { stdio: "ignore", windowsHide: !0 });
+    tk.on("error", () => {
+      try {
+        fallback();
+      } catch {
+      }
+      resolve();
+    }), tk.on("close", (code2) => {
+      if (code2 !== 0)
+        try {
+          fallback();
+        } catch {
+        }
+      resolve();
+    });
+  });
+}
 async function guardInChild(raw, on) {
   let ms = guardDeadlineMs(), tmp = await mkdtemp2(path13.join(os9.tmpdir(), "why-diff-guard-")), posix2 = process.platform !== "win32", env = { ...process.env, TMPDIR: tmp, TMP: tmp, TEMP: tmp }, child = spawn4(process.execPath, [...process.execArgv, process.argv[1], GUARD_CHILD, ...on === void 0 ? [] : ["--on", on]], { env, stdio: ["pipe", "pipe", "ignore"], detached: posix2, windowsHide: !0 }), out = "";
   child.stdout.setEncoding("utf8"), child.stdout.on("data", (c) => {
@@ -10879,11 +10911,7 @@ async function guardInChild(raw, on) {
   });
   return new Promise((resolve) => {
     let timer = setTimeout(() => {
-      try {
-        posix2 && child.pid ? process.kill(-child.pid, "SIGKILL") : child.kill("SIGKILL");
-      } catch {
-      }
-      cleanup().then(() => resolve(timeoutResult(ms)));
+      killTree(child.pid, posix2, () => child.kill("SIGKILL")).then(cleanup).then(() => resolve(timeoutResult(ms)));
     }, ms), finish = (code2, signal) => {
       clearTimeout(timer), cleanup().then(() => {
         try {

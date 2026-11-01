@@ -509,5 +509,5 @@ describe('why-diff guard CLI', () => {
     expect(run({ transcript_path: transcript, cwd: repo, session_id: 's-cli' }).status).toBe(2);
     expect(run({ transcript_path: transcript, cwd: repo, session_id: 's-cli', stop_hook_active: true }).status).toBe(0);
     expect(run({ cwd: repo }).status).toBe(0);
-  });
+  }, 30_000); // four CLI runs, each starting node twice (the guard checks in a child process)
 });

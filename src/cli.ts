@@ -298,10 +298,32 @@ program
   });
 
 /**
+ * Kill a process and everything it started: its process group on POSIX (it was spawned detached, as
+ * a group leader), `taskkill /T /F` on Windows (falling back to `fallback` when taskkill fails).
+ */
+function killTree(pid: number | undefined, posix: boolean, fallback: () => void): Promise<void> {
+  if (!pid) return Promise.resolve();
+  if (posix) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      try { fallback(); } catch { /* already gone */ }
+    }
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    const tk = spawn('taskkill', ['/T', '/F', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true });
+    tk.on('error', () => { try { fallback(); } catch { /* gone */ } resolve(); });
+    tk.on('close', (code) => { if (code !== 0) { try { fallback(); } catch { /* gone */ } } resolve(); });
+  });
+}
+
+/**
  * Run the guard check in a child process (this same CLI, {@link GUARD_CHILD}) with its own
- * temporary directory. At the deadline the child and every process it started (its process group,
- * on POSIX) are killed with SIGKILL, the temporary directory is removed, and the result is the
- * timeout block. A child that dies without a result blocks too.
+ * temporary directory. At the deadline the child and every process it started are killed (its
+ * process group on POSIX, its process tree with `taskkill /T /F` on Windows), the temporary
+ * directory is removed, and the result is the timeout block. A child that dies without a result
+ * blocks too.
  */
 async function guardInChild(raw: string, on: string | undefined): Promise<GuardResult> {
   const ms = guardDeadlineMs();
@@ -317,11 +339,7 @@ async function guardInChild(raw: string, on: string | undefined): Promise<GuardR
   const cleanup = (): Promise<void> => rm(tmp, { recursive: true, force: true }).catch(() => {});
   return new Promise<GuardResult>((resolve) => {
     const timer = setTimeout(() => {
-      try {
-        if (posix && child.pid) process.kill(-child.pid, 'SIGKILL');
-        else child.kill('SIGKILL');
-      } catch { /* already gone */ }
-      void cleanup().then(() => resolve(timeoutResult(ms)));
+      void killTree(child.pid, posix, () => child.kill('SIGKILL')).then(cleanup).then(() => resolve(timeoutResult(ms)));
     }, ms);
     const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
       clearTimeout(timer);
