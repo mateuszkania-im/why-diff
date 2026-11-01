@@ -19,6 +19,7 @@ import { emptyTree, FailClosedError, git, hasHead, indexEntries, isCaseInsensiti
 import { globToRegExp, repoRelativePath, rootVariants } from './attribute.js';
 import { compileGlobs, loadConfig, type WhyDiffConfig } from './config.js';
 import type { Hunk, LabelKind, Session } from './types.js';
+import { recordPath, type BaseRecord } from './session-start.js';
 
 export const DEFAULT_BLOCK_ON: readonly LabelKind[] = ['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path', 'unreviewed'];
 
@@ -114,9 +115,16 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // file system, since the agent can break what git needs to find the repository (`.git/HEAD`, the
   // config, a `.git` file pointing nowhere).
   const cwd = payload.cwd ?? process.cwd();
-  if (!(await hasGitEntry(cwd))) return NO_BLOCK;
+  const gitEntry = await findGitEntry(cwd);
+  if (!gitEntry) return NO_BLOCK;
   // From here on an error blocks: an unreadable transcript could hide what the session did.
   state.relevant = true;
+  // Read before any git command runs (none of why-diff's own may move them, but stat first anyway):
+  // when the index and refs last changed, and the session's base record.
+  const statTime = opts.statTime ?? changeTime;
+  const metaTimes = await gitMetaTimes(gitEntry, statTime);
+  const sessionId = payload.session_id;
+  const record = sessionId ? await readBaseRecord(sessionId, statTime) : undefined;
   const session = await claudeCodeAdapter.parse(payload.transcript_path);
   // A session with no edits and no tool calls cannot have touched the repository.
   state.relevant = session.edits.some((e) => !e.failed) || (session.toolWindows?.length ?? 0) > 0;
@@ -140,9 +148,19 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
     })
     .flatMap((p) => p ?? []))];
 
+  const windows = windowCheck(session);
+  // The base record from SessionStart: trusted only if its file last changed before the session's
+  // first tool call (the agent cannot write it earlier, and rewriting it moves its ctime).
+  let recordedHead: string | undefined;
+  if (record) {
+    if (windows && record.ctime >= windows.firstStart) throw new FailClosedError(`base record modified during session (${record.file})`);
+    if (!record.data) throw new FailClosedError(`the session's base record cannot be read (${record.file})`);
+    if (record.data.root === root && record.data.head) recordedHead = record.data.head;
+  }
+
   let baseRev = 'HEAD';
   const headed = await hasHead(root);
-  if (headed) baseRev = await sessionBase(root, Date.parse(session.startedAt), opts.objectTime ?? changeTime);
+  if (headed) baseRev = await sessionBase(root, Date.parse(session.startedAt), opts.objectTime ?? changeTime, recordedHead);
 
   // The policy comes from the session-start commit, so the agent cannot loosen it mid-session.
   // An invalid config must not break the session: fall back to defaults.
@@ -256,8 +274,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // A skip-worktree file missing from the working tree is excused only when the sparse checkout,
   // as the repository's own config and patterns from before the session define it, leaves it out.
   const excluded = await sparseExcluded(root, sparseTrust);
-  const statTime = opts.statTime ?? changeTime;
-  const inWindow = windowCheck(session);
+  const inWindow = windows?.inWindow ?? null;
   const byWindow = await toolWindowFiles(root, headed ? baseRev : undefined, inWindow, statTime, excluded);
   const hits: string[] = [];
   // Untracked files credited by time alone are capped: past the cap they are not read, only reported.
@@ -272,12 +289,13 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   for (const f of [...byWindow.written, ...byWindow.removed]) all.push(`:(literal)${f}`);
 
   // Changes git keeps outside the working tree: files that differ between the base and HEAD or the
-  // index, credited when the index or the branch ref (or its reflog) last changed during a call.
-  // Among them, a file gone from the index or HEAD but still on disk was untracked, and counts as
-  // deleted, even when the command that did it never named it.
-  if (headed && inWindow) {
-    const t = await refsChangeTime(root, statTime);
-    if (t !== undefined && inWindow(t)) {
+  // index, credited when the index, the branch ref, HEAD's reflog or packed-refs changed during a
+  // call, or after the last one (a later `git status` from an IDE rewrites the index, and that cannot
+  // be told apart from the agent's detached work). Among them, a file gone from the index or HEAD
+  // but still on disk was untracked, and counts as deleted, even when the command that did it never
+  // named it.
+  if (headed && windows) {
+    if (metaTimes.some((t) => windows.inWindow(t) || t > windows.lastEnd)) {
       for (const [args, deletedOnly] of [[[baseRev, 'HEAD'], false], [['--cached', baseRev], false], [['--diff-filter=D', baseRev, 'HEAD'], true], [['--diff-filter=D', '--cached', baseRev], true]] as const) {
         const out = await git(root, ['diff', '--name-only', '--no-renames', '-z', ...args, '--'], { trim: false });
         for (const f of out.split('\0')) {
@@ -333,16 +351,69 @@ async function blocked(transcript: string | undefined, hits: string[]): Promise<
   };
 }
 
-/** Is there a `.git` entry (directory, file or link) in `dir` or any directory above it? */
-async function hasGitEntry(dir: string): Promise<boolean> {
+/** The nearest `.git` entry (directory, file or link) in `dir` or any directory above it, or null. */
+async function findGitEntry(dir: string): Promise<string | null> {
   for (let d = path.resolve(dir); ; d = path.dirname(d)) {
+    const entry = path.join(d, '.git');
     try {
-      await lstat(path.join(d, '.git'));
-      return true;
+      await lstat(entry);
+      return entry;
     } catch (err) {
-      if (!GONE.has((err as NodeJS.ErrnoException).code ?? '')) return true; // unreadable: assume a repository
+      if (!GONE.has((err as NodeJS.ErrnoException).code ?? '')) return entry; // unreadable: assume a repository
     }
-    if (path.dirname(d) === d) return false;
+    if (path.dirname(d) === d) return null;
+  }
+}
+
+/**
+ * Change times of the files git rewrites when the index or a ref moves: the index, HEAD's reflog,
+ * the ref HEAD points at (its loose file, or `packed-refs` when it has none) and `packed-refs`
+ * when present; the HEAD file itself when detached. Read from the file system alone, so no git
+ * process can touch them first. A missing index is dated by the directory that held it. Nothing
+ * that cannot be read fails: the times only add credit.
+ */
+async function gitMetaTimes(gitEntry: string, timeOf: (p: string) => Promise<number>): Promise<number[]> {
+  let gitDir = gitEntry;
+  try {
+    const st = await lstat(gitEntry);
+    if (!st.isDirectory()) {
+      const m = /^gitdir:\s*(.+?)\s*$/m.exec(await readFile(gitEntry, 'utf8'));
+      if (!m) return [];
+      gitDir = path.resolve(path.dirname(gitEntry), m[1]!);
+    }
+  } catch {
+    return [];
+  }
+  const common = await readFile(path.join(gitDir, 'commondir'), 'utf8').then((c) => path.resolve(gitDir, c.trim()), () => gitDir);
+  const time = (p: string): Promise<number | undefined> => timeOf(p).then((t) => t, () => undefined);
+  const files: Array<Promise<number | undefined>> = [
+    time(path.join(gitDir, 'index')).then((t) => t ?? time(gitDir)),
+    time(path.join(gitDir, 'logs', 'HEAD')),
+    time(path.join(common, 'packed-refs')),
+  ];
+  const head = await readFile(path.join(gitDir, 'HEAD'), 'utf8').catch(() => '');
+  const ref = /^ref:\s*(refs\/\S+)\s*$/.exec(head)?.[1];
+  if (ref && !ref.split('/').includes('..')) files.push(time(path.join(common, ...ref.split('/'))));
+  else files.push(time(path.join(gitDir, 'HEAD')));
+  return (await Promise.all(files)).filter((t): t is number => t !== undefined);
+}
+
+/** The session's base record (see `why-diff session-start`) with its file's change time, if there is one. */
+async function readBaseRecord(sessionId: string, timeOf: (p: string) => Promise<number>): Promise<{ file: string; ctime: number; data?: BaseRecord } | undefined> {
+  const file = recordPath(sessionId);
+  let ctime: number;
+  try {
+    ctime = await timeOf(file);
+  } catch (err) {
+    if (GONE.has((err as NodeJS.ErrnoException).code ?? '')) return undefined;
+    throw new FailClosedError(`the session's base record cannot be read (${file})`);
+  }
+  try {
+    const data = JSON.parse(await readFile(file, 'utf8')) as BaseRecord;
+    const ok = data && data.session_id === sessionId && typeof data.root === 'string' && (data.head === null || (typeof data.head === 'string' && /^[0-9a-f]{40,64}$/.test(data.head)));
+    return ok ? { file, ctime, data } : { file, ctime };
+  } catch {
+    return { file, ctime };
   }
 }
 
@@ -430,51 +501,22 @@ async function toolWindowFiles(root: string, rev: string | undefined, inWindow: 
  * session has none. An open window (background or detached process, no result yet) lasts until this
  * guard runs; long calls are kept (dropping them would let `sleep 700; node fix.js` slip through).
  */
-function windowCheck(session: Session): ((ms: number) => boolean) | null {
+function windowCheck(session: Session): { inWindow: (ms: number) => boolean; firstStart: number; lastEnd: number } | null {
   const now = Date.now();
-  const windows = (session.toolWindows ?? [])
+  const raw = (session.toolWindows ?? [])
     .map((w) => ({ start: Date.parse(w.start), end: w.open ? Math.max(now, Date.parse(w.end)) : Date.parse(w.end) }))
-    .filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end >= w.start)
-    .map((w) => ({ start: w.start - WINDOW_SLACK_MS, end: w.end + WINDOW_SLACK_MS }));
-  if (!windows.length) return null;
-  return (ms) => windows.some((w) => ms >= w.start && ms <= w.end);
+    .filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end >= w.start);
+  if (!raw.length) return null;
+  const windows = raw.map((w) => ({ start: w.start - WINDOW_SLACK_MS, end: w.end + WINDOW_SLACK_MS }));
+  return {
+    inWindow: (ms) => windows.some((w) => ms >= w.start && ms <= w.end),
+    /** When the first tool call started (no slack) */
+    firstStart: Math.min(...raw.map((w) => w.start)),
+    /** When the last window closes, slack included */
+    lastEnd: Math.max(...windows.map((w) => w.end)),
+  };
 }
 
-/**
- * When git last recorded a change outside the working tree: the latest change time of the index,
- * HEAD's reflog and the ref HEAD points at (its loose file, or `packed-refs` when it has none; the
- * HEAD file itself when detached). A file that is gone is dated by the nearest directory above it
- * that still exists (removing it changed that directory). Undefined when none can be dated.
- */
-async function refsChangeTime(root: string, timeOf: (p: string) => Promise<number>): Promise<number | undefined> {
-  const gitPath = async (name: string): Promise<string> => path.resolve(root, await git(root, ['rev-parse', '--git-path', name]));
-  const files = [await gitPath('index'), await gitPath('logs/HEAD')];
-  const ref = await git(root, ['symbolic-ref', '-q', 'HEAD']).catch(() => '');
-  if (ref) {
-    const loose = await gitPath(ref);
-    files.push(loose);
-    if (!(await lstat(loose).then(() => true, () => false))) files.push(await gitPath('packed-refs'));
-  } else {
-    files.push(await gitPath('HEAD'));
-  }
-  const top = path.resolve(root);
-  const dated = async (p: string): Promise<number | undefined> => {
-    for (let d = p; ; d = path.dirname(d)) {
-      try {
-        return await timeOf(d);
-      } catch (err) {
-        if (!GONE.has((err as NodeJS.ErrnoException).code ?? '')) throw err;
-      }
-      if (d === top || path.dirname(d) === d) return undefined;
-    }
-  };
-  let latest: number | undefined;
-  for (const f of files) {
-    const t = await dated(f);
-    if (t !== undefined && (latest === undefined || t > latest)) latest = t;
-  }
-  return latest;
-}
 /**
  * The commit HEAD pointed at when the session started: the diff base, so edits the agent committed
  * during the session still count. Claude Code transcripts record the branch, not a commit, and
@@ -498,11 +540,11 @@ async function refsChangeTime(root: string, timeOf: (p: string) => Promise<numbe
  * when it is no longer an ancestor of HEAD (a reset dropped it): only the session's paths are
  * diffed, so a merge base would let a reset hide the commits it dropped.
  */
-async function sessionBase(root: string, startedAt: number, timeOf: (p: string) => Promise<number>): Promise<string> {
+async function sessionBase(root: string, startedAt: number, timeOf: (p: string) => Promise<number>, recorded?: string): Promise<string> {
   if (!Number.isFinite(startedAt)) throw new FailClosedError('the transcript has no session start time');
   const cutoff = startedAt - WINDOW_SLACK_MS;
   const parse = (out: string): Array<{ sha: string; at: number }> => out.split('\n').map((l) => {
-    const m = /^([0-9a-f]{40,64})\t(?:HEAD@\{)?(\d+)\}?$/.exec(l.trim());
+    const m = /^([0-9a-f]{40,64})\t(?:[^\t]*@\{)?(\d+)\}?$/.exec(l.trim());
     return m ? { sha: m[1]!, at: Number(m[2]) * 1000 } : null;
   }).filter((e): e is { sha: string; at: number } => e !== null);
 
@@ -542,17 +584,30 @@ async function sessionBase(root: string, startedAt: number, timeOf: (p: string) 
     return at;
   };
 
-  // Candidates, in order of preference for a tie: the reflog (newest first), then HEAD's history.
-  const order: string[] = [];
-  const add = (sha: string): void => {
-    if (!order.includes(sha) && order.length < MAX_BASE_CANDIDATES) order.push(sha);
-  };
-  for (const e of parse(await git(root, ['reflog', 'show', '--format=%H%x09%gd', '--date=unix', 'HEAD', '--']).catch(() => ''))) {
-    if (e.at <= startedAt) add(e.sha);
+  const isCommit = async (sha: string): Promise<boolean> => git(root, ['cat-file', '-e', `${sha}^{commit}`]).then(() => true, () => false);
+  if (recorded) {
+    // The commit recorded at SessionStart, out of the agent's reach: still only if its object predates the session.
+    if ((await isCommit(recorded)) && (await writtenAt(recorded)) !== undefined) return recorded;
+    throw new FailClosedError(`the commit recorded at session start (${recorded.slice(0, 12)}) is missing or was not written before the session`);
   }
+
+  // Candidates, in order of preference for a tie: the reflogs of HEAD and of the current branch
+  // (newest first), then HEAD's history. Every qualifying reflog commit is considered: past the cap
+  // the check fails closed rather than drop any (a flooded reflog could push the real base out).
+  const order: string[] = [];
+  const cap = Number(process.env.WHY_DIFF_MAX_BASE_CANDIDATES) > 0 ? Number(process.env.WHY_DIFF_MAX_BASE_CANDIDATES) : MAX_BASE_CANDIDATES;
+  const branch = await git(root, ['symbolic-ref', '-q', 'HEAD']).catch(() => '');
+  for (const ref of ['HEAD', ...(branch ? [branch] : [])]) {
+    for (const e of parse(await git(root, ['reflog', 'show', '--format=%H%x09%gd', '--date=unix', ref, '--']).catch(() => ''))) {
+      if (e.at > startedAt || order.includes(e.sha)) continue;
+      if (order.length >= cap) throw new FailClosedError(`HEAD's reflog has more than ${cap} commits from before the session; the session base cannot be chosen among them`);
+      order.push(e.sha);
+    }
+  }
+  // HEAD's first-parent history: the first commit written before the session, outside the cap.
   for (const e of parse(await git(root, ['log', '--first-parent', '-n', '5000', '--format=%H%x09%ct', 'HEAD', '--']).catch(() => ''))) {
     if ((await writtenAt(e.sha)) !== undefined) {
-      add(e.sha);
+      if (!order.includes(e.sha)) order.push(e.sha);
       break;
     }
   }
@@ -576,8 +631,8 @@ async function sessionBase(root: string, startedAt: number, timeOf: (p: string) 
   return tied.find((sha) => tips.has(sha)) ?? tied[0]!;
 }
 
-/** Reflog commits considered for the session base (a longer reflog is cut, newest kept). */
-const MAX_BASE_CANDIDATES = 1000;
+/** Distinct pre-session reflog commits considered for the session base; more fails closed. */
+const MAX_BASE_CANDIDATES = 10_000;
 
 /** Is `sha` listed in this pack index (version 2: magic, version, 256-entry fan-out, sorted names)? */
 function packIndexHas(buf: Buffer, sha: string): boolean {

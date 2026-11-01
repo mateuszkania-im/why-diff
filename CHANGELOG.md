@@ -13,8 +13,13 @@ Guard bypasses found in a security review of 0.3.2 (the agent is treated as the 
 - Run time: 100,000 untracked files written during a call took 37 s, past the 30 s hook timeout. Paths the session named are now checked first; at most 2000 untracked files credited by change time alone are read, the rest block as `unreviewed` unread; and a run past 20 s (`WHY_DIFF_GUARD_DEADLINE_MS`) blocks with a clear message and exits.
 - Labels: `it.skipIf(` / `test.skipIf(` / `describe.skipIf(` and `.runIf(`, bracket access (`it["skip"]`, `it['skip']`, ``it[`skip`]``) and a bare `return;` added as the first statement of a test body count as skips; an `expect(...)` subject changed into a literal, or into the value the assertion used to expect, counts as a weakened assertion.
 
+- Session base record: the plugin now has a SessionStart hook (`why-diff session-start`) that records HEAD's commit outside the repository (`$CLAUDE_PLUGIN_DATA`, else `~/.cache/why-diff`, mode 0600), so truncating the reflogs and resetting to an older commit no longer moves the base. The guard uses the record when its file last changed before the session's first tool call, and blocks when it changed later or when the recorded commit was not written before the session. Without a record it falls back to the reflogs of HEAD and the current branch plus the first-parent history.
+- A reflog flooded with more pre-session commits than the candidate cap (10,000) fails closed instead of being cut, and HEAD's first-parent candidate never takes a slot under the cap.
+- Index and ref dating no longer uses only the latest change time: a path is credited when any of the index, the branch ref, HEAD's reflog and `packed-refs` changed during a tool call, or later than the last one (a `git status` from an IDE rewrites the index afterwards and used to hide the agent's change). These files are read before the guard runs any git command.
+
 ### Documentation
 
+- README: the SessionStart base record, and the reflog fallback without it.
 - README Limitations: label heuristics can be evaded by restructuring code (`if (false)`, try/catch, a shadowed `it`, an arrow never called); the guard catches common weakenings, not every semantic one.
 
 ## 0.3.2

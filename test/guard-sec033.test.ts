@@ -3,12 +3,15 @@
  * forged through the reflog or a reset, a test file untracked by a command that does not name it,
  * a weakening kept only in a commit or the index, and the hook timeout with many untracked files.
  */
-import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+import { mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { lstat } from 'node:fs/promises';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runGuard, type GuardOptions } from '../src/guard.js';
+import { recordSessionStart } from '../src/session-start.js';
 import type { LabelKind } from '../src/types.js';
 import { tempDir, writeSyntheticTranscript, type SyntheticCall } from './helpers/claude-fixture.js';
 
@@ -97,6 +100,15 @@ function gitMetaInWindow(r: string, callAt: () => number): (p: string) => Promis
   return async (p) => {
     const st = await lstat(p);
     return path.resolve(p).startsWith(gitDir) ? callAt() + 1000 : st.ctimeMs;
+  };
+}
+
+/** Like {@link gitMetaInWindow}, but `.git` files read as changed between the session start and its first call (outside every window). */
+function gitMetaBeforeCalls(r: string, callAt: () => number): (p: string) => Promise<number> {
+  const gitDir = path.join(r, '.git') + path.sep;
+  return async (p) => {
+    const st = await lstat(p);
+    return path.resolve(p).startsWith(gitDir) ? callAt() - 5000 : st.ctimeMs;
   };
 }
 
@@ -218,7 +230,11 @@ describe.skipIf(!posix)('sec033 #3: a test file untracked by a command that does
 
   it('is not credited when the index and refs last changed outside every call', async () => {
     const x = setup();
-    const res = await guardRun(x.repo, x.home, (t) => [bash(t, 'echo hi')]);
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => {
+      callAt = t;
+      return [bash(t, 'echo hi')];
+    }, { statTime: gitMetaBeforeCalls(x.repo, () => callAt) });
     expect(res.block).toBe(false);
   });
 });
@@ -274,7 +290,11 @@ describe('sec033 #4: a weakening kept only in a commit or the index', () => {
     pause(20);
     const mark = Date.now();
     cacheinfo(x.repo, true);
-    const res = await guardRun(x.repo, x.home, (t) => [bash(t, 'echo hi')], { objectTime: objectsAfter(() => mark) });
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => {
+      callAt = t;
+      return [bash(t, 'echo hi')];
+    }, { objectTime: objectsAfter(() => mark), statTime: gitMetaBeforeCalls(x.repo, () => callAt) });
     expect(res.block).toBe(false);
   });
 });
@@ -314,5 +334,200 @@ describe('sec033 #5: bounded work with many untracked files', () => {
     replaceIn(x.tp, 'expect(f(1)).toBe(1);', 'expect(f(1)).toBe(1);\n  expect(f(1)).toBeDefined();');
     const res = await guardRun(x.repo, x.home, (t) => [edit(t, x.tp, 'expect(f(1)).toBe(1);', 'expect(f(1)).toBe(1);\n  expect(f(1)).toBeDefined();')]);
     expect(res.block).toBe(false);
+  });
+});
+
+describe('sec033 #7: a flooded reflog cannot push the real base out of the candidates', () => {
+  /** A1..A3 then B (HEAD), all before the session; HEAD's and main's reflogs rewritten to name only A1..A3. */
+  function flooded(): { repo: string; home: string; tp: string; times: Record<string, number> } {
+    const x = repo();
+    const times: Record<string, number> = {};
+    for (let i = 1; i <= 3; i++) {
+      writeFileSync(x.tp, testFile(true, `// A${i}\n`));
+      times[commit(x.repo, `A${i}`)] = i * 1000;
+    }
+    writeFileSync(x.tp, testFile(false, '// A3\n'));
+    const b = commit(x.repo, 'B: unskip t5');
+    times[b] = 9000;
+    for (const log of [path.join(x.repo, '.git', 'logs', 'HEAD'), path.join(x.repo, '.git', 'logs', 'refs', 'heads', 'main')]) {
+      writeFileSync(log, readFileSync(log, 'utf8').split('\n').filter((l) => l && !l.includes(b)).join('\n') + '\n');
+    }
+    replaceIn(x.tp, 'it("t5"', 'it.skip("t5"');
+    return { ...x, times };
+  }
+
+  it('the first-parent candidate never takes a slot under the cap', async () => {
+    process.env.WHY_DIFF_MAX_BASE_CANDIDATES = '3';
+    const x = flooded();
+    const res = await guardRun(x.repo, x.home, (t) => [edit(t, x.tp, 'it("t5"', 'it.skip("t5"')], { objectTime: objectTimes(x.repo, x.times) });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('test-skip-added');
+  });
+
+  it('more qualifying reflog entries than the cap fails closed', async () => {
+    process.env.WHY_DIFF_MAX_BASE_CANDIDATES = '2';
+    const x = flooded();
+    const res = await guardRun(x.repo, x.home, (t) => [edit(t, x.tp, 'it("t5"', 'it.skip("t5"')], { objectTime: objectTimes(x.repo, x.times) });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('why-diff could not check this session');
+    expect(res.message).toContain('reflog');
+  });
+});
+
+describe('sec033 #8: index and ref dating is not hidden by a later git operation', () => {
+  it('a staged weakening still blocks when the index was rewritten after the last call (an IDE git status)', async () => {
+    const x = repo();
+    writeFileSync(x.tp, testFile());
+    commit(x.repo, 'A');
+    pause(20);
+    const mark = Date.now();
+    const blob = git(x.repo, ['hash-object', '-w', '--stdin'], undefined, testFile().replace('it("t5"', 'it.skip("t5"')).trim();
+    git(x.repo, ['update-index', '--cacheinfo', `100644,${blob},${TEST}`]);
+    // Real ctimes: the index changed "now", after every call window (which ended 45 s ago).
+    const res = await guardRun(x.repo, x.home, (t) => [bash(t, 'B=$(sed s/x/y/ f | git hash-object -w --stdin) && git update-index --cacheinfo 100644,$B,f')], { objectTime: objectsAfter(() => mark) });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('test-skip-added');
+  });
+
+  it('a commit made in a call still blocks when only the index is later (one file inside a window is enough)', async () => {
+    const x = repo();
+    writeFileSync(x.tp, testFile());
+    commit(x.repo, 'A');
+    pause(20);
+    const mark = Date.now();
+    const blob = git(x.repo, ['hash-object', '-w', '--stdin'], undefined, testFile().replace('it("t5"', 'it.skip("t5"')).trim();
+    git(x.repo, ['update-index', '--cacheinfo', `100644,${blob},${TEST}`]);
+    git(x.repo, ['commit', '-qm', 'fix flaky test']);
+    let callAt = 0;
+    const index = path.join(x.repo, '.git', 'index');
+    const res = await guardRun(x.repo, x.home, (t) => {
+      callAt = t;
+      return [bash(t, 'sh .git/c.sh'), bash(t + 20_000, 'echo hi')];
+    }, {
+      objectTime: objectsAfter(() => mark),
+      // Refs inside the first call; the index (the latest) between the two calls: outside every window, not after the last.
+      statTime: async (p) => (path.resolve(p) === index ? callAt + 12_000 : gitMetaInWindow(x.repo, () => callAt)(p)),
+    });
+    expect(res.block).toBe(true);
+  });
+});
+
+describe('sec033 #9: an out-of-band base record from SessionStart', () => {
+  /** A (t5 skipped) then B, both pre-session; the "agent" truncates both reflogs to A and resets to A. */
+  async function setup(): Promise<{ repo: string; home: string; tp: string; a: string; b: string; data: string }> {
+    const data = temp('wd-s33-data-');
+    process.env.CLAUDE_PLUGIN_DATA = data;
+    const x = twoCommits();
+    await recordSessionStart({ session_id: 's33', cwd: x.repo });
+    for (const log of [path.join(x.repo, '.git', 'logs', 'HEAD'), path.join(x.repo, '.git', 'logs', 'refs', 'heads', 'main')]) {
+      writeFileSync(log, readFileSync(log, 'utf8').split('\n')[0] + '\n');
+    }
+    git(x.repo, ['reset', '-q', '--hard', x.a]);
+    return { ...x, data };
+  }
+  const recordFile = (data: string): string => path.join(data, 'sessions', `${createHash('sha256').update('s33').digest('hex')}.json`);
+  /** The record reads as written at session start; the test file as rewritten during the call. */
+  const times = (x: { tp: string; data: string }, callAt: () => number, recordAt: (t: number) => number) => async (p: string): Promise<number> => {
+    const st = await lstat(p);
+    if (path.resolve(p) === path.resolve(recordFile(x.data))) return recordAt(callAt());
+    if (path.resolve(p) === path.resolve(x.tp)) return callAt() + 1000;
+    return st.ctimeMs;
+  };
+
+  it('session-start writes the record (0600) once, prints nothing, and never fails', async () => {
+    const data = temp('wd-s33-data-');
+    process.env.CLAUDE_PLUGIN_DATA = data;
+    const x = repo();
+    writeFileSync(x.tp, testFile());
+    const head = commit(x.repo, 'A');
+    await recordSessionStart({ session_id: 's33', cwd: x.repo });
+    const rec = JSON.parse(readFileSync(recordFile(data), 'utf8')) as { session_id: string; root: string; head: string; at: string };
+    expect(rec).toMatchObject({ session_id: 's33', root: x.repo, head });
+    if (posix) expect(statSync(recordFile(data)).mode & 0o777).toBe(0o600);
+    // A second SessionStart for the same session (resume, compact) keeps the first record.
+    writeFileSync(x.tp, testFile(true));
+    commit(x.repo, 'B');
+    await recordSessionStart({ session_id: 's33', cwd: x.repo });
+    expect(JSON.parse(readFileSync(recordFile(data), 'utf8')).head).toBe(head);
+    // Not a repository, no session id, garbage: no throw.
+    await expect(recordSessionStart({ session_id: 'x', cwd: temp('wd-s33-plain-') })).resolves.toBeUndefined();
+    await expect(recordSessionStart({})).resolves.toBeUndefined();
+  });
+
+  it('truncated reflogs plus reset --hard to an older commit block when the record names the real base', async () => {
+    const x = await setup();
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => {
+      callAt = t;
+      return [bash(t, 'head -1 .git/logs/HEAD > .git/x && mv .git/x .git/logs/HEAD && git reset --hard A')];
+    }, { objectTime: objectTimes(x.repo, { [x.a]: 1000, [x.b]: 2000 }), statTime: times(x, () => callAt, (t) => t - 5000) });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('test-skip-added');
+  });
+
+  it('a record changed at or after the first call fails closed', async () => {
+    const x = await setup();
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => {
+      callAt = t;
+      return [bash(t, 'git reset --hard A')];
+    }, { objectTime: objectTimes(x.repo, { [x.a]: 1000, [x.b]: 2000 }), statTime: times(x, () => callAt, (t) => t + 1000) });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('base record modified during session');
+  });
+
+  it('a recorded head whose object was written during the session fails closed', async () => {
+    const x = await setup();
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => {
+      callAt = t;
+      return [bash(t, 'git reset --hard A')];
+    }, { objectTime: async (p) => (p.endsWith(path.join(x.b.slice(0, 2), x.b.slice(2))) ? Date.now() : objectTimes(x.repo, { [x.a]: 1000 })(p)), statTime: times(x, () => callAt, (t) => t - 5000) });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('why-diff could not check this session');
+  });
+
+  it('a record for another repository is ignored (reflog fallback)', async () => {
+    const data = temp('wd-s33-data-');
+    process.env.CLAUDE_PLUGIN_DATA = data;
+    const other = repo();
+    writeFileSync(other.tp, testFile());
+    commit(other.repo, 'other');
+    await recordSessionStart({ session_id: 's33', cwd: other.repo });
+    const x = repo();
+    writeFileSync(x.tp, testFile());
+    commit(x.repo, 'A');
+    const res = await guardRun(x.repo, x.home, (t) => [edit(t, x.tp, 'expect(f(1)).toBe(1);', 'expect(f(1)).toBe(1);')], { statTime: async (p) => { await lstat(p); return Date.now() - 59_000; } });
+    expect(res.block).toBe(false);
+  });
+});
+
+describe('sec033 #9: the session-start command and its hook', () => {
+  const root = path.resolve(__dirname, '..');
+  const tsxLoader = pathToFileURL(path.join(root, 'node_modules', 'tsx', 'dist', 'esm', 'index.mjs')).href;
+  const run = (cwd: string, input: string, data: string) =>
+    spawnSync(process.execPath, ['--import', tsxLoader, path.join(root, 'src', 'cli.ts'), 'session-start'], { cwd, input, encoding: 'utf8', env: { ...process.env, CLAUDE_PLUGIN_DATA: data } });
+
+  it('writes the record, prints nothing and exits 0; garbage input and a plain directory exit 0 too', () => {
+    const data = temp('wd-s33-data-');
+    const x = repo();
+    writeFileSync(x.tp, testFile());
+    const head = commit(x.repo, 'A');
+    const ok = run(x.repo, JSON.stringify({ session_id: 'cli-1', cwd: x.repo, source: 'startup' }), data);
+    expect(ok.status).toBe(0);
+    expect(ok.stdout).toBe('');
+    const file = path.join(data, 'sessions', `${createHash('sha256').update('cli-1').digest('hex')}.json`);
+    expect(JSON.parse(readFileSync(file, 'utf8')).head).toBe(head);
+    for (const input of ['not json', '', JSON.stringify({ session_id: 'cli-2', cwd: temp('wd-s33-plain-') })]) {
+      const r = run(x.repo, input, data);
+      expect(r.status).toBe(0);
+      expect(r.stdout).toBe('');
+    }
+  });
+
+  it('the plugin registers it as a SessionStart hook next to the Stop hook', () => {
+    const hooks = JSON.parse(readFileSync(path.join(root, 'plugin', 'hooks', 'hooks.json'), 'utf8')) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };
+    expect(hooks.hooks.Stop?.[0]?.hooks[0]?.command).toContain('why-diff.mjs" guard');
+    expect(hooks.hooks.SessionStart?.[0]?.hooks[0]?.command).toContain('why-diff.mjs" session-start');
   });
 });

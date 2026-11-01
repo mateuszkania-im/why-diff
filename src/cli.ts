@@ -18,6 +18,7 @@ import { terminalSafe } from './report/shared.js';
 import type { Harness, LabelKind } from './types.js';
 import { git, repoRoot } from './git.js';
 import { runGuard, type GuardPayload } from './guard.js';
+import { recordSessionStart } from './session-start.js';
 import type { ClassifierKind } from './classify/index.js';
 import { ghRunner, PR_BODY_LIMIT, readPrBody, sectionBudget, upsertSection, writePrBody } from './pr.js';
 import { noteFromReport, writeNote, NOTES_REF } from './notes.js';
@@ -278,6 +279,23 @@ program
     // Past the internal deadline the check is still running: exit now, before the hook times out.
     if (result.timedOut) process.stderr.write(terminalSafe(result.message ?? ''), () => process.exit(2));
     else process.stderr.write(terminalSafe(result.message ?? ''));
+  });
+
+/**
+ * `why-diff session-start` — Claude Code SessionStart hook. Records HEAD's commit for the guard
+ * (see src/session-start.ts). Never blocks or fails the session: always exits 0, prints nothing.
+ */
+program
+  .command('session-start')
+  .description('Claude Code SessionStart hook: record the commit the session starts from, for the guard')
+  .action(async () => {
+    try {
+      const raw = await readStdin();
+      let payload: Record<string, unknown> = {};
+      try { payload = raw.trim() ? (JSON.parse(raw) as Record<string, unknown>) : {}; } catch { /* not a hook payload */ }
+      if (payload && typeof payload === 'object') await recordSessionStart(payload);
+    } catch { /* never fail the session */ }
+    process.exitCode = 0;
   });
 
 /**
