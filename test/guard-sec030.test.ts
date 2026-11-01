@@ -389,6 +389,20 @@ describe('sec030 #7: the session base does not trust committer dates', () => {
     expect(r.block).toBe(true);
   });
 
+  it('blocks on a backdated agent commit that was then packed away with git gc', async () => {
+    const { repo, home } = makeRepo();
+    const t0 = Date.now() - 120_000;
+    const transcript = writeSyntheticTranscript(home, repo, 's-gc', [{ prompt: 'fix', at: iso(t0), calls: [
+      { tool: 'Edit', at: iso(t0 + 10_000), input: { file_path: tp(repo), old_string: 'it("t5"', new_string: 'it.skip("t5"' } },
+      bash(t0 + 20_000, 'GIT_COMMITTER_DATE=2026-01-02T00:00:00Z git commit -qam wip && git gc -q'),
+    ] }]);
+    skipT5(repo);
+    sh(repo, ['commit', '-qam', 'wip'], new Date(Date.parse(LONG_AGO) + 1000).toISOString());
+    sh(repo, ['gc', '-q']);
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-gc' }, { blocking: BL, home });
+    expect(r.block).toBe(true);
+  });
+
   it('blocks when the agent amended the pre-session commit (base no longer an ancestor of HEAD)', async () => {
     const { repo, home } = makeRepo();
     const t0 = Date.now() - 120_000;

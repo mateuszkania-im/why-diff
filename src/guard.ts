@@ -8,7 +8,7 @@
  * same file never does. Every internal error means "do not block".
  */
 import { createHash, randomBytes } from 'node:crypto';
-import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
@@ -86,10 +86,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
 
   let baseRev = 'HEAD';
   const headed = await hasHead(root);
-  if (headed) {
-    const before = await git(root, ['rev-list', '-1', `--before=${session.startedAt}`, 'HEAD']).catch(() => '');
-    if (before) baseRev = before;
-  }
+  if (headed) baseRev = (await sessionBase(root, Date.parse(session.startedAt), opts.statTime ?? changeTime).catch(() => undefined)) ?? 'HEAD';
 
   // Files a shell command changed without naming them (a script computing the path, `rsync --delete`,
   // a path from the environment, a background process): credited when the file (or, once deleted,
@@ -276,6 +273,56 @@ async function toolWindowFiles(root: string, rev: string | undefined, session: S
   }
   return { written, removed };
 }
+/**
+ * The commit HEAD pointed at when the session started: the diff base, so edits the agent committed
+ * during the session still count. Committer dates are the agent's to set (`GIT_COMMITTER_DATE`, which
+ * also stamps the reflog entry), so dates only pick candidates: HEAD's reflog (newest first; the
+ * first-parent history when there is no reflog) is walked to the first entry stamped before the
+ * session start whose commit object was not written during the session, judged by the change time
+ * of its loose object file (or, once packed, by whether any pack file was written during the
+ * session). Without such an entry the oldest one is used. A base that is no longer an ancestor of
+ * HEAD (an amend, a rebase) becomes its merge base with HEAD.
+ */
+async function sessionBase(root: string, startedAt: number, timeOf: (p: string) => Promise<number>): Promise<string | undefined> {
+  if (!Number.isFinite(startedAt)) return undefined;
+  const parse = (out: string, unit: number): Array<{ sha: string; at: number }> => out.split('\n').map((l) => {
+    const m = /^([0-9a-f]{40,64})\t(?:HEAD@\{)?(\d+)\}?$/.exec(l.trim());
+    return m ? { sha: m[1]!, at: Number(m[2]) * unit } : null;
+  }).filter((e): e is { sha: string; at: number } => e !== null);
+  let entries = parse(await git(root, ['reflog', 'show', '--format=%H%x09%gd', '--date=unix', 'HEAD', '--']).catch(() => ''), 1000);
+  if (!entries.length) entries = parse(await git(root, ['log', '--first-parent', '-n', '2000', '--format=%H%x09%ct', 'HEAD', '--']).catch(() => ''), 1000);
+  if (!entries.length) return undefined;
+
+  const objects = path.resolve(root, await git(root, ['rev-parse', '--git-path', 'objects']));
+  const cutoff = startedAt - WINDOW_SLACK_MS;
+  let packedDuringSession: boolean | undefined;
+  const writtenDuringSession = async (sha: string): Promise<boolean> => {
+    try {
+      return (await timeOf(path.join(objects, sha.slice(0, 2), sha.slice(2)))) >= cutoff;
+    } catch {
+      // packed: its own time is unknown, so trust it only if no pack was written during the session
+      if (packedDuringSession === undefined) {
+        const dir = path.join(objects, 'pack');
+        const packs = (await readdir(dir).catch(() => [] as string[])).filter((f) => f.endsWith('.pack'));
+        const times = await Promise.all(packs.map((f) => timeOf(path.join(dir, f)).catch(() => Infinity)));
+        packedDuringSession = times.some((t) => t >= cutoff);
+      }
+      return packedDuringSession;
+    }
+  };
+  let base = entries[entries.length - 1]!.sha;
+  for (const e of entries) {
+    if (e.at > startedAt) continue;
+    if (!(await git(root, ['cat-file', '-e', `${e.sha}^{commit}`]).then(() => true, () => false))) continue;
+    if (await writtenDuringSession(e.sha)) continue;
+    base = e.sha;
+    break;
+  }
+  const ancestor = await git(root, ['merge-base', '--is-ancestor', base, 'HEAD']).then(() => true, () => false);
+  if (!ancestor) base = await git(root, ['merge-base', base, 'HEAD']).catch(() => base);
+  return base;
+}
+
 const REMOVE_OPS: ReadonlySet<string> = new Set(['delete', 'move']);
 const REWRITE_OPS: ReadonlySet<string> = new Set(['edit', 'write', 'append', 'copy']);
 

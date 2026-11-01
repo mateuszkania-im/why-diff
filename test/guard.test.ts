@@ -52,6 +52,12 @@ function makeRepo(realRoot = true): { repo: string; home: string; stateDir: stri
   return { repo, home: temp('why-diff-guard-home-'), stateDir: temp('why-diff-guard-state-') };
 }
 
+/** Change time as the guard reads it, except that git objects count as written before the session (test setup). */
+async function setupObjectsBeforeSession(p: string): Promise<number> {
+  if (p.split(path.sep).join('/').includes('/.git/objects/')) return 0;
+  return (await lstat(p)).ctimeMs;
+}
+
 function editCall(repo: string, oldS: string, newS: string, at = CALL_AT): SyntheticCall {
   return { tool: 'Edit', at, input: { file_path: path.join(repo, 'test', 'f.test.js'), old_string: oldS, new_string: newS } };
 }
@@ -131,7 +137,8 @@ describe('runGuard', () => {
       const transcript = writeSyntheticTranscript(home, repo, 's-sh', [{ prompt: 'tidy up', at: SESSION_AT, calls }]);
       writeFileSync(path.join(repo, 'src', 'x.js'), 'export const x = 2;\n');
       act(repo);
-      return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sh' }, { blocking, home, stateDir });
+      // The setup commits are made now, after the synthetic session start: date their objects before it.
+      return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sh' }, { blocking, home, stateDir, statTime: setupObjectsBeforeSession });
     }
     it('blocks on rm of a test file', async () => {
       const r = await run('rm $R/test/f.test.js', (repo) => rmSync(path.join(repo, 'test', 'f.test.js')));
