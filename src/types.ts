@@ -73,6 +73,19 @@ export interface ReportEdit extends FileEdit {
 /** Characters kept per `oldText` / `newText` / `command` in `Report.edits`, and per diff line text. */
 export const EDIT_TEXT_CAP = 2048;
 
+/**
+ * When one shell tool call ran: from the assistant line that issued it to the line carrying its
+ * result. The guard credits a changed file to the session when the file's mtime lies inside one.
+ */
+export interface ShellWindow {
+  /** Tool call id from the transcript */
+  callId: string;
+  /** ISO timestamp of the tool call */
+  start: string;
+  /** ISO timestamp of its result */
+  end: string;
+}
+
 /** A parsed agent session. */
 export interface Session {
   id: string;
@@ -86,6 +99,8 @@ export interface Session {
   title?: string;
   prompts: Prompt[];
   edits: FileEdit[];
+  /** Shell tool calls that ran to a result, with their time span (Claude Code only) */
+  shellWindows?: ShellWindow[];
 }
 
 /** One line inside a diff hunk. */

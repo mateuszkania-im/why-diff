@@ -434,3 +434,44 @@ describe('prompt cleaning on pasted blobs', () => {
     expect(humanPromptText({ type: 'user', message: { role: 'user', content: '<command-name>/goal</command-name><command-args>ship it</command-args>' } } as never)).toBe('/goal ship it');
   });
 });
+
+describe('ClaudeCodeAdapter.parse: shell windows', () => {
+  it('records one window per Bash call, from the tool_use line to its tool_result line', async () => {
+    const home = tempDir('why-diff-home-');
+    const file = writeSyntheticTranscript(home, '/work/shop', 'win-1', [{
+      prompt: 'fix the tests',
+      at: '2026-10-20T10:00:00.000Z',
+      calls: [
+        { tool: 'Bash', at: '2026-10-20T10:00:05.000Z', resultAt: '2026-10-20T10:00:09.000Z', input: { command: 'node fix.js' } },
+        { tool: 'Edit', at: '2026-10-20T10:00:10.000Z', input: { file_path: '/work/shop/a.js', old_string: 'a', new_string: 'b' } },
+        { tool: 'Bash', at: '2026-10-20T10:00:20.000Z', input: { command: 'npm test' }, isError: true },
+      ],
+    }]);
+    const s = await adapter.parse(file);
+    expect(s.shellWindows).toEqual([
+      { callId: 'toolu_0101xxxxxxxxxxxxxxxx', start: '2026-10-20T10:00:05.000Z', end: '2026-10-20T10:00:09.000Z' },
+      // a failing command (non-zero exit) may still have changed files
+      { callId: 'toolu_0103xxxxxxxxxxxxxxxx', start: '2026-10-20T10:00:20.000Z', end: '2026-10-20T10:00:21.000Z' },
+    ]);
+  });
+
+  it('records no window for a Bash call that never got a result or was denied', async () => {
+    const home = tempDir('why-diff-home-');
+    const file = writeSyntheticTranscript(home, '/work/shop', 'win-2', [{
+      prompt: 'clean up',
+      at: '2026-10-20T10:00:00.000Z',
+      calls: [{ tool: 'Bash', at: '2026-10-20T10:00:05.000Z', input: { command: 'node wipe.js' }, isError: true, result: 'The user doesn\'t want to proceed with this tool use. The tool use was rejected.' }],
+    }]);
+    const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+    // make the result text the real rejection message
+    const last = lines[lines.length - 1] as { message: { content: Array<{ content: string }> } };
+    last.message.content[0]!.content = 'The user doesn\'t want to proceed with this tool use. The tool use was rejected.';
+    writeFileSync(file, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
+    expect((await adapter.parse(file)).shellWindows ?? []).toEqual([]);
+
+    const unfinished = writeSyntheticTranscript(home, '/work/shop', 'win-3', [{ prompt: 'x', at: '2026-10-20T10:00:00.000Z', calls: [{ tool: 'Bash', at: '2026-10-20T10:00:05.000Z', input: { command: 'node a.js' } }] }]);
+    const kept = readFileSync(unfinished, 'utf8').split('\n').filter(Boolean).slice(0, -1);
+    writeFileSync(unfinished, `${kept.join('\n')}\n`);
+    expect((await adapter.parse(unfinished)).shellWindows ?? []).toEqual([]);
+  });
+});

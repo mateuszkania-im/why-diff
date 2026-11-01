@@ -406,6 +406,107 @@ describe('runGuard', () => {
   }, 60_000);
 });
 
+describe('runGuard: shell changes whose path the command does not name (mtime windows)', () => {
+  const BL = new Set<LabelKind>(['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path']);
+  const T = Date.now() - 30 * 60_000; // the Bash call starts here
+  const iso = (ms: number): string => new Date(ms).toISOString();
+  const sec = (ms: number): Date => new Date(ms);
+  // A script that computes the path it rewrites: no literal test path on the command line.
+  const FIX_JS = "const fs = require('fs');\nconst p = ['te', 'st'].join('') + '/f.' + 'test.js';\nfs.writeFileSync(p, fs.readFileSync(p, 'utf8').replace('it(\"t5\"', 'it.skip(\"t5\"'));\n";
+
+  async function run(act: (repo: string) => void, opts: { resultAt?: number; sessionAt?: number; callAt?: number } = {}): Promise<{ block: boolean; message?: string }> {
+    const { repo, home, stateDir } = makeRepo();
+    writeFileSync(path.join(repo, 'fix.js'), FIX_JS);
+    sh(repo, ['add', '-A']);
+    sh(repo, ['commit', '-qm', 'script'], LONG_AGO);
+    const callAt = opts.callAt ?? T;
+    const transcript = writeSyntheticTranscript(home, repo, 's-win', [{
+      prompt: 'make the suite green',
+      at: iso(opts.sessionAt ?? callAt - 60_000),
+      calls: [{ tool: 'Bash', at: iso(callAt), resultAt: iso(opts.resultAt ?? callAt + 4000), input: { command: `cd ${repo} && node fix.js`, description: 'run the fixer' } }],
+    }]);
+    act(repo);
+    return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-win' }, { blocking: BL, home, stateDir });
+  }
+  const testPath = (repo: string): string => path.join(repo, 'test', 'f.test.js');
+
+  it('blocks on a test file a script rewrote, when its mtime lies inside the Bash call window', async () => {
+    const r = await run((repo) => {
+      applyEdit(repo, SKIP_OLD, SKIP_NEW);
+      utimesSync(testPath(repo), sec(T + 2000), sec(T + 2000));
+    });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('test/f.test.js');
+    expect(r.message).toContain('test-skip-added');
+  });
+
+  it('allows 2 s of clock slack on each side of the window', async () => {
+    const r = await run((repo) => {
+      applyEdit(repo, SKIP_OLD, SKIP_NEW);
+      utimesSync(testPath(repo), sec(T + 4000 + 1500), sec(T + 4000 + 1500));
+    });
+    expect(r.block).toBe(true);
+  });
+
+  it('does not credit the same change when the file mtime lies outside every window (a human edit)', async () => {
+    const r = await run((repo) => {
+      applyEdit(repo, SKIP_OLD, SKIP_NEW);
+      utimesSync(testPath(repo), sec(T + 60_000), sec(T + 60_000));
+    });
+    expect(r.block).toBe(false);
+  });
+
+  it('a later human edit moves the mtime out of the window, so the change is not credited', async () => {
+    const r = await run((repo) => {
+      applyEdit(repo, SKIP_OLD, SKIP_NEW); // mtime = now, long after the window
+    });
+    expect(r.block).toBe(false);
+  });
+
+  it('blocks on a whole-file deletion when the parent directory mtime lies inside the window', async () => {
+    const r = await run((repo) => {
+      rmSync(testPath(repo));
+      utimesSync(path.join(repo, 'test'), sec(T + 1000), sec(T + 1000));
+    });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('test/f.test.js');
+  });
+
+  it('does not credit a deletion when the parent directory mtime lies outside the window', async () => {
+    const r = await run((repo) => {
+      rmSync(testPath(repo));
+      utimesSync(path.join(repo, 'test'), sec(T + 60_000), sec(T + 60_000));
+    });
+    expect(r.block).toBe(false);
+  });
+
+  it('ignores a Bash window longer than 10 minutes', async () => {
+    const r = await run((repo) => {
+      applyEdit(repo, SKIP_OLD, SKIP_NEW);
+      utimesSync(testPath(repo), sec(T + 5 * 60_000), sec(T + 5 * 60_000));
+    }, { resultAt: T + 11 * 60_000 });
+    expect(r.block).toBe(false);
+  });
+
+  it('credits a change under a protected path the same way', async () => {
+    const { repo, home, stateDir } = makeRepo();
+    mkdirSync(path.join(repo, 'infra'));
+    writeFileSync(path.join(repo, 'infra', 'main.tf'), 'a = 1\n');
+    writeFileSync(path.join(repo, '.why-diff.json'), JSON.stringify({ protected: ['infra/**'] }));
+    sh(repo, ['add', '-A']);
+    sh(repo, ['commit', '-qm', 'rules'], LONG_AGO);
+    const transcript = writeSyntheticTranscript(home, repo, 's-prot', [{
+      prompt: 'bump it', at: iso(T - 60_000),
+      calls: [{ tool: 'Bash', at: iso(T), resultAt: iso(T + 3000), input: { command: `cd ${repo} && ./bump.sh`, description: 'x' } }],
+    }]);
+    writeFileSync(path.join(repo, 'infra', 'main.tf'), 'a = 2\n');
+    utimesSync(path.join(repo, 'infra', 'main.tf'), sec(T + 1000), sec(T + 1000));
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-prot' }, { blocking: BL, home, stateDir });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('protected-path');
+  });
+});
+
 describe('runGuard with Unicode file names', () => {
   for (const [name, form] of [['NFD', 'NFD'], ['NFC', 'NFC']] as const) {
     it(`blocks on an it.skip the agent wrote into a test file named in ${name}`, async () => {

@@ -64,8 +64,10 @@ function copyTreeReplacing(src: string, dst: string, from: string, to: string): 
 export interface SyntheticCall {
   tool: 'Edit' | 'Write' | 'Bash';
   input: Record<string, unknown>;
-  /** ISO timestamp of the tool call; the result is stamped one second later. */
+  /** ISO timestamp of the tool call; the result is stamped one second later (or at `resultAt`). */
   at: string;
+  /** ISO timestamp of the tool_result line (default: `at` + 1 s). */
+  resultAt?: string;
   /** Assistant text emitted with the call (becomes the rationale). */
   text?: string;
   isError?: boolean;
@@ -107,7 +109,7 @@ export function writeSyntheticTranscript(home: string, cwd: string, sessionId: s
       if (call.text) content.push({ type: 'text', text: call.text });
       content.push({ type: 'tool_use', id: toolUseId, name: call.tool, input: call.input });
       lines.push({ ...base('assistant', call.at), promptId, message: { model: 'claude-sonnet-4-5', id: `msg_${toolUseId}`, type: 'message', role: 'assistant', content, stop_reason: 'tool_use', usage: { input_tokens: 10, output_tokens: 10 } } });
-      const resultAt = new Date(Date.parse(call.at) + 1000).toISOString();
+      const resultAt = call.resultAt ?? new Date(Date.parse(call.at) + 1000).toISOString();
       lines.push({
         ...base('user', resultAt),
         promptId,

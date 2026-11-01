@@ -12,10 +12,10 @@ import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
-import { git, hasHead, repoRoot, worktreeRoots } from './git.js';
+import { emptyTree, git, hasHead, listUntracked, repoRoot, worktreeRoots } from './git.js';
 import { globToRegExp, repoRelativePath, rootVariants } from './attribute.js';
-import { loadConfig, type WhyDiffConfig } from './config.js';
-import type { Hunk, LabelKind } from './types.js';
+import { compileGlobs, loadConfig, type WhyDiffConfig } from './config.js';
+import type { Hunk, LabelKind, Session } from './types.js';
 
 export const DEFAULT_BLOCK_ON: readonly LabelKind[] = ['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path'];
 
@@ -72,18 +72,26 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
       return [...new Set([p, p.normalize('NFD')])].map((v) => `${magic}${v}`);
     })
     .flatMap((p) => p ?? []))];
-  if (!paths.length) return NO_BLOCK;
 
   let baseRev = 'HEAD';
-  if (await hasHead(root)) {
+  const headed = await hasHead(root);
+  if (headed) {
     const before = await git(root, ['rev-list', '-1', `--before=${session.startedAt}`, 'HEAD']).catch(() => '');
     if (before) baseRev = before;
   }
+
+  // Files a shell command changed without naming them (a script computing the path, `rsync --delete`,
+  // a path from the environment): credited when the file (or, once deleted, its directory) was last
+  // modified while one of this session's shell calls ran.
+  const byWindow = await shellWindowFiles(root, headed ? baseRev : undefined, session);
+  for (const f of [...byWindow.written, ...byWindow.removed]) paths.push(`:(literal)${f}`);
+  if (!paths.length) return NO_BLOCK;
 
   // The policy comes from the session-start commit, so the agent cannot loosen it mid-session.
   // An invalid config must not break the session: fall back to defaults.
   const config: WhyDiffConfig = await loadConfig(root, baseRev).catch(() => ({}));
   const blocking = opts.blocking ?? new Set<LabelKind>([...DEFAULT_BLOCK_ON, ...(config.blockOn ?? [])]);
+  const protectedGlob = compileGlobs(config.protected);
 
   const report = await buildReport({
     cwd: root,
@@ -120,6 +128,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   const hits: string[] = [];
   const keys: string[] = [];
   for (const h of report.hunks) {
+    let timed = false;
     if (h.match !== 'exact' && h.match !== 'partial') {
       // A shell command leaves a file-only hunk. It counts only when the session's own command
       // named that path (literally or by a glob): a delete/rename when the hunk is nothing but that
@@ -129,10 +138,25 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
       const source = h.hunk.oldFile ?? h.hunk.file;
       const removed = h.match === 'file-only' && shellOnly(h.hunk) && targeted(removedByShell, source, true);
       const rewritten = h.match === 'file-only' && h.hunk.status !== 'renamed' && targeted(rewrittenByShell, h.hunk.file, false);
-      if (!removed && !rewritten) continue;
+      // Not named by any command: the file's own mtime (or its directory's, once deleted) inside a
+      // shell call window. A rewrite counts for every hunk of the file; a deletion or rename only
+      // when the hunk is nothing but that operation.
+      if (!removed && !rewritten) {
+        timed = h.hunk.status === 'renamed'
+          ? shellOnly(h.hunk) ? byWindow.removed.has(source) : byWindow.removed.has(source) && byWindow.written.has(h.hunk.file)
+          : h.hunk.status === 'deleted' ? shellOnly(h.hunk) && byWindow.removed.has(h.hunk.file) : byWindow.written.has(h.hunk.file);
+        if (!timed) continue;
+      }
     }
-    if (!h.editIds.length || !h.editIds.every((id) => id.startsWith(`${session.id}:`))) continue;
-    for (const l of h.labels) {
+    // Every explaining edit must be this session's; a hunk credited by its mtime alone may have none.
+    if ((!h.editIds.length && !timed) || !h.editIds.every((id) => id.startsWith(`${session.id}:`))) continue;
+    const labels = [...h.labels];
+    if (timed && !labels.some((l) => l.kind === 'protected-path')) {
+      // `protected-path` is only set on hunks an agent edit explains; a timed hunk is one too.
+      const glob = protectedGlob(h.hunk.file) ?? (h.hunk.oldFile ? protectedGlob(h.hunk.oldFile) : undefined);
+      if (glob) labels.push({ kind: 'protected-path', severity: 'risk', detail: `Protected path (${glob}): ${h.hunk.file}` });
+    }
+    for (const l of labels) {
       if (!blocking.has(l.kind)) continue;
       hits.push(`- ${h.hunk.file}:${h.hunk.newStart} ${l.kind}: ${l.detail}`);
       keys.push(`${h.hunk.file}\t${l.kind}\t${l.detail}`);
@@ -164,6 +188,49 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
 }
 
 const SHELL_GLOB = /[*?[]/;
+/** Clock slack on each side of a shell call window (transcript stamps vs file system times). */
+const WINDOW_SLACK_MS = 2000;
+/** Longer calls (a dev server, a watch) would credit too much: they are not used. */
+const WINDOW_MAX_MS = 10 * 60_000;
+const LSTAT_BATCH = 64;
+
+/**
+ * Changed files (against `rev`, working tree and untracked) whose mtime lies inside one of the
+ * session's shell call windows (`written`), and deleted ones whose parent directory's mtime does
+ * (`removed`). A human edit after the call moves the mtime out of every window, so it is never
+ * credited; a human edit to the same file while the agent's command was running is (the one edge).
+ */
+async function shellWindowFiles(root: string, rev: string | undefined, session: Session): Promise<{ written: Set<string>; removed: Set<string> }> {
+  const written = new Set<string>();
+  const removed = new Set<string>();
+  const windows = (session.shellWindows ?? [])
+    .map((w) => ({ start: Date.parse(w.start), end: Date.parse(w.end) }))
+    .filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end >= w.start && w.end - w.start <= WINDOW_MAX_MS)
+    .map((w) => ({ start: w.start - WINDOW_SLACK_MS, end: w.end + WINDOW_SLACK_MS }));
+  if (!windows.length) return { written, removed };
+  const inWindow = (ms: number): boolean => windows.some((w) => ms >= w.start && ms <= w.end);
+
+  const changed = await git(root, ['diff', '--name-only', '--no-renames', '-z', rev ?? (await emptyTree(root)), '--'], { trim: false }).catch(() => '');
+  const files = [...new Set([...changed.split('\0').filter(Boolean), ...(await listUntracked(root).catch(() => []))])]
+    .filter((f) => !f.startsWith('.why-diff/'));
+  for (let i = 0; i < files.length; i += LSTAT_BATCH) {
+    await Promise.all(files.slice(i, i + LSTAT_BATCH).map(async (f) => {
+      const abs = path.join(root, ...f.split('/'));
+      try {
+        if (inWindow((await lstat(abs)).mtimeMs)) written.add(f);
+        return;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return;
+      }
+      try {
+        if (inWindow((await lstat(path.dirname(abs))).mtimeMs)) removed.add(f);
+      } catch {
+        // the directory went too: nothing to date the deletion by
+      }
+    }));
+  }
+  return { written, removed };
+}
 const REMOVE_OPS: ReadonlySet<string> = new Set(['delete', 'move']);
 const REWRITE_OPS: ReadonlySet<string> = new Set(['edit', 'write', 'append', 'copy']);
 

@@ -25,7 +25,7 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 
-import type { DiscoverOptions, EditKind, FileEdit, Harness, Prompt, Session, SessionAdapter } from '../types.js';
+import type { DiscoverOptions, EditKind, FileEdit, Harness, Prompt, Session, SessionAdapter, ShellWindow } from '../types.js';
 import { DRIVE_PATH, driveKey, fileMentions, filePathNeedles, pathWithin } from './scan.js';
 import { detectBashMutations } from './bash-mutations.js';
 
@@ -120,6 +120,8 @@ const PEEK_LINES = 60;
 const AGENT_TOOLS = new Set(['Agent', 'Task']);
 const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Bash']);
 const SKIP_MIN_LINE = 64 * 1024;
+/** A shell call the user refused never ran, so it gets no time window. */
+const DENIED = /doesn't want to proceed|tool use was rejected|permission (?:was )?denied/i;
 const TOOL_USE_ID = Buffer.from('"tool_use_id":"');
 
 /** Tools whose result can turn into FileEdits (see emitEdits). */
@@ -276,6 +278,7 @@ class SessionBuilder {
   private summaryTitle: string | undefined;
   private readonly prompts: Prompt[] = [];
   private readonly edits: FileEdit[] = [];
+  private readonly shellWindows: ShellWindow[] = [];
   private readonly pending = new Map<string, PendingCall>();
   private readonly pendingOrder: string[] = [];
   /** Transcript `promptId` (turn id) -> our Prompt.id */
@@ -373,6 +376,7 @@ class SessionBuilder {
       ...(this.title ?? this.summaryTitle ? { title: this.title ?? this.summaryTitle } : {}),
       prompts: this.prompts,
       edits: this.edits,
+      ...(this.shellWindows.length ? { shellWindows: this.shellWindows } : {}),
     };
   }
 
@@ -398,7 +402,7 @@ class SessionBuilder {
     if (results.length > 0) {
       for (const r of results) {
         if (!r.tool_use_id) continue;
-        this.resolveCall(r.tool_use_id, {
+        this.resolveCall(r.tool_use_id, line.timestamp, {
           isError: r.is_error === true,
           text: blockText(r.content),
           // toolUseResult is per line; only trust it when the line holds one result.
@@ -468,12 +472,18 @@ class SessionBuilder {
     else if (!sawToolUse) this.lastAssistantText = '';
   }
 
-  private resolveCall(toolUseId: string, outcome: ToolOutcome): void {
+  private resolveCall(toolUseId: string, resultAt: string | undefined, outcome: ToolOutcome): void {
     const call = this.pending.get(toolUseId);
     if (!call) return; // result for a call we never saw (compaction, truncated file)
     this.pending.delete(toolUseId);
     const idx = this.pendingOrder.indexOf(toolUseId);
     if (idx !== -1) this.pendingOrder.splice(idx, 1);
+    // A command that failed (non-zero exit) may still have changed files: only a refused one did not run.
+    if (call.name === 'Bash' && resultAt && !(outcome.isError && DENIED.test(outcome.text))) {
+      const start = Date.parse(call.at);
+      const end = Date.parse(resultAt);
+      if (Number.isFinite(start) && Number.isFinite(end) && end >= start) this.shellWindows.push({ callId: toolUseId, start: call.at, end: resultAt });
+    }
     this.emitEdits(call, outcome);
   }
 
