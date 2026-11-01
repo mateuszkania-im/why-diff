@@ -1155,8 +1155,13 @@ async function toolWindowFiles(root: string, rev: string | undefined, windows: {
       const up = await dirState(path.posix.dirname(f));
       if (up.kind === 'symlink') {
         // Never followed: the file is gone from the repository, removed when the symlink appeared.
+        // Whatever git makes of it (git for Windows reads through a junction), every change to the
+        // file is credited by the link's own time.
         const t = await timeOf(path.join(top, ...up.at.split('/'))).catch(() => Infinity);
-        if (inWindow(t) || t > lastEnd) removed.add(f);
+        if (inWindow(t) || t > lastEnd) {
+          removed.add(f);
+          written.add(f);
+        }
         return;
       }
       if (up.kind === 'foreign') {

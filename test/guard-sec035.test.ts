@@ -846,10 +846,12 @@ describe('sec035 fix round 1 (E, F): the Windows file system type', () => {
     expect(script).toContain('$env:WD_PATH');
   });
 
-  it.skipIf(posix)('a test directory replaced by a junction is a deletion (junctions are never followed)', async () => {
+  it.skipIf(posix)('a test directory replaced by a junction to a weakened copy blocks (junctions are never followed)', async () => {
     const x = repo();
     const kept = path.join(temp('wd-s35-junc-'), 'kept');
     renameSync(path.join(x.repo, 'test'), kept);
+    // git for Windows may read through the junction (a modified file) or not (a deleted one): either blocks.
+    replaceIn(path.join(kept, 'a.test.js'), 'it("t5"', 'it.skip("t5"');
     symlinkSync(kept, path.join(x.repo, 'test'), 'junction');
     expect((await lstat(path.join(x.repo, 'test'))).isSymbolicLink()).toBe(true);
     const res = await guardRun(x.repo, x.home, (t) => [bash(t, 'tidy.cmd')]);

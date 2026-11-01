@@ -11130,7 +11130,7 @@ async function toolWindowFiles(root, rev, windows, statTime, pathStat, excluded,
       let up = await dirState(path12.posix.dirname(f));
       if (up.kind === "symlink") {
         let t2 = await timeOf(path12.join(top, ...up.at.split("/"))).catch(() => 1 / 0);
-        (inWindow(t2) || t2 > lastEnd) && removed.add(f);
+        (inWindow(t2) || t2 > lastEnd) && (removed.add(f), written.add(f));
         return;
       }
       if (up.kind === "foreign") {
