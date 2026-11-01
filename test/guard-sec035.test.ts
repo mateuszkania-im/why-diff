@@ -1078,3 +1078,41 @@ describe('sec035 fix round 3 (L1, L3): Linux mounts by mount ID; a submodule\'s 
     expect(res.message).toContain('worktree git dir');
   });
 });
+
+describe('sec035 fix round 3 (M2): a worktree git dir is compared with its common dir, not its parent', () => {
+  const under = (dir: string) => async (p: string) => {
+    const st = await lstat(p);
+    const hit = path.resolve(p) === dir || path.resolve(p).startsWith(`${dir}${path.sep}`);
+    return { dev: hit ? Number(st.dev) + 1000 : Number(st.dev), ctimeMs: st.ctimeMs, symlink: st.isSymbolicLink() };
+  };
+
+  it('top level: a volume over .git/worktrees (worktree git dir and its parent on one device, not the common dir\'s) blocks without a record', async () => {
+    const x = repo();
+    const wt = path.join(temp('wd-s35-m2-'), 'wt');
+    git(x.repo, ['worktree', 'add', '-q', '-b', 'feature', wt]);
+    const src = path.join(wt, 'src', 'f.js');
+    replaceIn(src, 'x;', 'x + 0;');
+    const worktrees = realpathSync(path.join(x.repo, '.git', 'worktrees'));
+    const control = await guardRun(wt, x.home, (t) => [edit(t, src, 'x;', 'x + 0;')]);
+    expect(control.message ?? '').toBe('');
+    const res = await guardRun(wt, x.home, (t) => [edit(t, src, 'x;', 'x + 0;')], { pathStat: under(worktrees) });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('worktree git dir');
+  });
+
+  it('submodule: the same mount over its upstream .git/worktrees blocks without a record', async () => {
+    const upstream = temp('wd-s35-m2-up-');
+    mkdirSync(path.join(upstream, 'test'));
+    writeFileSync(path.join(upstream, 'test', 'a.test.js'), testFile());
+    git(upstream, ['init', '-q', '-b', 'main']);
+    git(upstream, ['add', '-A']);
+    git(upstream, ['commit', '-qm', 'L'], PAST);
+    const x = repo('wd-s35-m2s-');
+    git(upstream, ['worktree', 'add', '-q', '-b', 'wt', path.join(x.repo, 'lib')]);
+    git(x.repo, ['add', 'lib']);
+    git(x.repo, ['commit', '-qm', 'lib as a gitlink'], PAST);
+    const res = await guardRun(x.repo, x.home, (t) => [bash(t, 'echo hi')], { pathStat: under(realpathSync(path.join(upstream, '.git', 'worktrees'))) });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('worktree git dir');
+  });
+});
