@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { lstat, readFile, stat } from 'node:fs/promises';
 import type { Harness, Hunk, Prompt, Report, Session, SessionAdapter } from './types.js';
-import { getDiff, git, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
+import { getDiff, git, isCaseInsensitive, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
 import { attribute, repoRelativePath, rootVariants } from './attribute.js';
 import { labelHunks, needsFileText } from './labels.js';
@@ -169,7 +169,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   log(`found ${sessions.length} agent session(s), ${hunks.length} hunk(s)`);
 
   const prompts = sessions.flatMap((s) => s.prompts);
-  let attributed = attribute(hunks, sessions, root, { since, extraRoots });
+  let attributed = attribute(hunks, sessions, root, { since, extraRoots, ignoreCase: await isCaseInsensitive(root) });
   if (opts.keepAgentIgnored) {
     // Guard: ignore may drop only hunks no session edit explains.
     const kept = attributed.filter((h) => !(isIgnored(h.hunk) && h.match === 'none'));

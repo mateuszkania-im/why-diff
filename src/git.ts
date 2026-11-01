@@ -174,6 +174,21 @@ export async function worktreeRoots(cwd: string): Promise<string[]> {
   }
 }
 
+/**
+ * Does the repository's file system ignore letter case? Asked of the file system itself (`.git`
+ * and `.GIT` are the same entry), not only of `core.ignorecase`, which anyone can set to false.
+ */
+export async function isCaseInsensitive(root: string): Promise<boolean> {
+  if (process.platform === 'win32') return true;
+  try {
+    const [a, b] = await Promise.all([stat(path.join(root, '.git')), stat(path.join(root, '.GIT'))]);
+    if (a.ino === b.ino && a.dev === b.dev) return true;
+  } catch {
+    // `.GIT` missing: case-sensitive, unless git says otherwise
+  }
+  return (await git(root, ['config', '--bool', 'core.ignorecase']).catch(() => '')) === 'true';
+}
+
 /** Current branch name, or `undefined` on a detached HEAD / unborn branch. */
 export async function currentBranch(cwd: string): Promise<string | undefined> {
   try {

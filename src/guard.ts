@@ -12,7 +12,7 @@ import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
-import { emptyTree, git, hasHead, listUntracked, repoRoot, worktreeRoots } from './git.js';
+import { emptyTree, git, hasHead, isCaseInsensitive, listUntracked, repoRoot, worktreeRoots } from './git.js';
 import { globToRegExp, repoRelativePath, rootVariants } from './attribute.js';
 import { compileGlobs, loadConfig, type WhyDiffConfig } from './config.js';
 import type { Hunk, LabelKind, Session } from './types.js';
@@ -61,6 +61,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   const session = await claudeCodeAdapter.parse(payload.transcript_path);
   const roots = [root, ...(await worktreeRoots(root))].flatMap(rootVariants).sort((a, b) => b.length - a.length);
   const cwdVariants = rootVariants(session.cwd);
+  const icase = await isCaseInsensitive(root);
   // Shell commands can name globs (`rm test/*.test.js`): those become `:(glob)` pathspecs,
   // whose `*`/`?` stay within a segment and `**` spans segments, like the shell.
   const paths = [...new Set(session.edits
@@ -69,7 +70,8 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
       const rel = repoRelativePath(e.filePath, roots, session.cwd, cwdVariants);
       if (!rel) return null;
       const p = rel.split(path.sep).join('/');
-      const magic = e.kind === 'bash' && SHELL_GLOB.test(p) ? ':(glob)' : ':(literal)';
+      // On a case-insensitive file system `TEST/F.test.js` names `test/f.test.js`.
+      const magic = `:(${e.kind === 'bash' && SHELL_GLOB.test(p) ? 'glob' : 'literal'}${icase ? ',icase' : ''})`;
       // Paths are compared in NFC; a file stored under its NFD name (Linux) still has to be diffed.
       return [...new Set([p, p.normalize('NFD')])].map((v) => `${magic}${v}`);
     })
@@ -118,9 +120,11 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   const removedByShell = shellTargets(REMOVE_OPS);
   const rewrittenByShell = shellTargets(REWRITE_OPS);
   const targeted = (targets: Set<string>, file: string, dirs: boolean): boolean => {
-    const f = file.normalize('NFC').replace(/^(\.\/)+/, '');
-    for (const r of targets) {
+    let f = file.normalize('NFC').replace(/^(\.\/)+/, '');
+    if (icase) f = f.toLowerCase();
+    for (let r of targets) {
       if (!r) continue;
+      if (icase) r = r.toLowerCase();
       if (f === r || (dirs && f.startsWith(`${r}/`))) return true;
       if (SHELL_GLOB.test(r) && globToRegExp(r).test(f)) return true;
     }

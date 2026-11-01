@@ -7,8 +7,9 @@ import { ClaudeCodeAdapter } from '../src/adapters/claude.js';
 import { codexAdapter, isInside } from '../src/adapters/codex.js';
 import { opencodeAdapter } from '../src/adapters/opencode.js';
 import { filePathNeedles, pathWithin } from '../src/adapters/scan.js';
-import { repoRelativePath } from '../src/attribute.js';
-import { tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
+import { attribute, repoRelativePath, win32Spelling } from '../src/attribute.js';
+import type { Hunk, Session } from '../src/types.js';
+import { nat, tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const BOM = '\uFEFF';
@@ -100,3 +101,36 @@ describe('Windows-style paths (path logic only)', () => {
     }
   });
 });
+
+describe('alias spellings of a Windows path (sec030 #6)', () => {
+  const cases: Array<[string, string]> = [
+    ['\\\\?\\C:\\r\\test\\f.test.js', 'C:\\r\\test\\f.test.js'],
+    ['\\\\.\\C:\\r\\test\\f.test.js', 'C:\\r\\test\\f.test.js'],
+    ['//?/C:/r/test/f.test.js', 'C:/r/test/f.test.js'],
+    ['\\\\?\\UNC\\srv\\share\\f.js', '\\\\srv\\share\\f.js'],
+    ['C:\\r\\test\\f.test.js::$DATA', 'C:\\r\\test\\f.test.js'],
+    ['C:\\r\\test\\f.test.js::$data', 'C:\\r\\test\\f.test.js'],
+    ['C:\\r\\test\\f.test.js.', 'C:\\r\\test\\f.test.js'],
+    ['C:\\r\\test\\f.test.js . .', 'C:\\r\\test\\f.test.js'],
+    ['C:\\r\\test. \\f.test.js', 'C:\\r\\test\\f.test.js'],
+    ['C:\\r\\..\\r\\f.js', 'C:\\r\\..\\r\\f.js'],
+    ['/home/u/f.js.', '/home/u/f.js.'],
+  ];
+  for (const [input, want] of cases) it(`win32Spelling(${JSON.stringify(input)})`, () => expect(win32Spelling(input)).toBe(want));
+
+  for (const fp of ['\\\\?\\C:\\r\\test\\f.test.js', '\\\\.\\C:\\r\\test\\f.test.js', 'C:\\r\\test\\f.test.js::$DATA', 'C:\\r\\test\\f.test.js.', 'C:\\r\\test\\f.test.js ']) {
+    it(`repoRelativePath resolves ${JSON.stringify(fp)} into the repo`, () => expect(repoRelativePath(fp, ['C:/r'], 'C:/r')).toBe('test/f.test.js'));
+  }
+
+  it('attribute matches an edit spelled in another case to the diff file when the repo ignores case', () => {
+    const hunk: Hunk = { id: 'h1', file: 'test/f.test.js', status: 'modified', oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, header: '@@', lines: [{ type: 'del', text: 'it("a")', oldNo: 1 }, { type: 'add', text: 'it.skip("a")', newNo: 1 }] };
+    const session: Session = {
+      id: 's', harness: 'claude-code', cwd: nat('/work/r'), path: 'x', startedAt: '2026-01-01T00:00:00Z', endedAt: '2026-01-01T00:00:00Z',
+      prompts: [{ id: 's:0', sessionId: 's', harness: 'claude-code', index: 0, at: '2026-01-01T00:00:00Z', text: 'x' }],
+      edits: [{ id: 's:e:0', sessionId: 's', harness: 'claude-code', toolUseId: 'e', tool: 'Edit', kind: 'edit', filePath: nat('/work/r/TEST/F.TEST.JS'), at: '2026-01-01T00:00:01Z', promptId: 's:0', oldText: 'it("a")', newText: 'it.skip("a")' }],
+    };
+    expect(attribute([hunk], [session], nat('/work/r'), { ignoreCase: true })[0]!.match).toBe('exact');
+    if (process.platform !== 'win32') expect(attribute([hunk], [session], nat('/work/r'), { ignoreCase: false })[0]!.match).toBe('none');
+  });
+});
+

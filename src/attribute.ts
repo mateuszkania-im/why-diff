@@ -151,7 +151,7 @@ const HUNK_HEADER = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(.*)$/;
  *                  still match by content (branches merged later), but are not
  *                  used for the weak file-only fallback.
  */
-export function attribute(hunks: Hunk[], sessions: Session[], repoRoot: string, opts: { since?: Date; extraRoots?: string[] } = {}): AttributedHunk[] {
+export function attribute(hunks: Hunk[], sessions: Session[], repoRoot: string, opts: { since?: Date; extraRoots?: string[]; ignoreCase?: boolean } = {}): AttributedHunk[] {
   const prompts = new Map<string, Prompt>();
   for (const s of sessions) for (const p of s.prompts) prompts.set(p.id, p);
 
@@ -160,7 +160,7 @@ export function attribute(hunks: Hunk[], sessions: Session[], repoRoot: string, 
     diffFiles.add(h.file.normalize('NFC'));
     if (h.oldFile) diffFiles.add(h.oldFile.normalize('NFC'));
   }
-  const index = indexEdits(sessions, repoRoot, diffFiles, opts.extraRoots);
+  const index = indexEdits(sessions, repoRoot, diffFiles, opts.extraRoots, opts.ignoreCase);
   index.sinceMs = opts.since?.getTime();
   return hunks.flatMap((hunk) => attributeHunk(hunk, index, prompts));
 }
@@ -215,7 +215,7 @@ interface ShellIndex {
   globs: string[];
 }
 
-function indexEdits(sessions: Session[], repoRoot: string, diffFiles: Set<string> = new Set(), extraRoots: string[] = []): EditIndex {
+function indexEdits(sessions: Session[], repoRoot: string, diffFiles: Set<string> = new Set(), extraRoots: string[] = [], ignoreCase = false): EditIndex {
   // Longest first: a worktree nested in the repo (`.claude/worktrees/x`) must win over the repo root.
   const roots = [repoRoot, ...extraRoots].flatMap(rootVariants).sort((a, b) => b.length - a.length);
   const byFile = new Map<string, IndexedEdit[]>();
@@ -223,9 +223,27 @@ function indexEdits(sessions: Session[], repoRoot: string, diffFiles: Set<string
   const shell = new Map<string, ShellCommand>();
   let seq = 0;
 
+  // On a case-insensitive file system `TEST/F.test.js` is `test/f.test.js`: spell each edit path
+  // (and each directory above a diff file) the way the diff does.
+  const folded = new Map<string, string>();
+  if (ignoreCase) {
+    for (const f of diffFiles) {
+      for (let p = f; p && !folded.has(p.toLowerCase()); p = p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '') folded.set(p.toLowerCase(), p);
+    }
+  }
+  const fold = (rel: string | null): string | null => {
+    if (rel === null || !ignoreCase) return rel;
+    const lower = rel.toLowerCase();
+    const exact = folded.get(lower);
+    if (exact !== undefined) return exact;
+    // a deleted file under a directory the diff knows: fix the directory part
+    const slash = lower.lastIndexOf('/');
+    const dir = slash === -1 ? undefined : folded.get(lower.slice(0, slash));
+    return dir !== undefined ? `${dir}${rel.slice(slash)}` : rel;
+  };
   const resolved = sessions.map((session) => {
     const cwdVariants = rootVariants(session.cwd);
-    return session.edits.map((edit) => (edit.failed ? null : repoRelativePath(edit.filePath, roots, session.cwd, cwdVariants)));
+    return session.edits.map((edit) => (edit.failed ? null : fold(repoRelativePath(edit.filePath, roots, session.cwd, cwdVariants))));
   });
   const worktrees = nestedWorktreeRoots(sessions, resolved, diffFiles);
 
@@ -452,6 +470,7 @@ export function repoRelativePath(
   cwd = '',
   cwdVariants: string[] = rootVariants(cwd),
 ): string | null {
+  filePath = win32Spelling(filePath);
   if (DRIVE_PATH.test(filePath) || (!path.isAbsolute(filePath) && DRIVE_PATH.test(cwd))) return driveRelativePath(filePath, roots, cwd, cwdVariants);
   // Compared in Unicode NFC: macOS file APIs and agents may hand over NFD names (`cafe\u0301.js`)
   // where git reports NFC (`caf\u00e9.js`).
@@ -463,6 +482,9 @@ export function repoRelativePath(
   if (!abs) return null;
   cwdVariants = cwdVariants.map((v) => path.resolve(v.normalize('NFC')));
   roots = roots.map((r) => path.resolve(r.normalize('NFC')));
+  // The file system's own spelling first: true case on a case-insensitive volume (`TEST/F.test.js`).
+  const canonical = canonicalPath(abs).normalize('NFC');
+  if (canonical !== abs) candidates.add(canonical);
   candidates.add(abs);
   for (const v of cwdVariants) {
     for (const w of cwdVariants) {
@@ -481,8 +503,9 @@ export function repoRelativePath(
 /** {@link repoRelativePath} for Windows drive paths: case-insensitive, either slash style. */
 function driveRelativePath(filePath: string, roots: string[], cwd: string, cwdVariants: string[] = []): string | null {
   // win32 resolution handles both slash styles and resolves `.` / `..` before containment is checked.
-  const resolved = DRIVE_PATH.test(filePath) ? path.win32.resolve(filePath) : DRIVE_PATH.test(cwd) ? path.win32.resolve(cwd, filePath) : null;
+  let resolved = DRIVE_PATH.test(filePath) ? path.win32.resolve(filePath) : DRIVE_PATH.test(cwd) ? path.win32.resolve(cwd, filePath) : null;
   if (!resolved) return null;
+  if (process.platform === 'win32') resolved = canonicalPath(resolved);
   const abs = resolved.normalize('NFC').replace(/\\/g, '/').replace(/\/$/, '');
   if (abs.split('/').includes('..')) return null;
   // The same file under another spelling of the session cwd (an 8.3 short name such as
@@ -505,6 +528,40 @@ function driveRelativePath(filePath: string, roots: string[], cwd: string, cwdVa
     }
   }
   return null;
+}
+
+/**
+ * One spelling for the many ways Windows names the same file: no `\\\\?\\` / `\\\\.\\` device prefix
+ * (`\\\\?\\UNC\\srv` back to `\\\\srv`), no `::$DATA` stream suffix, and no trailing dots or spaces on any
+ * segment (Win32 drops them: `f.test.js.` opens `f.test.js`). Other paths are returned unchanged.
+ */
+export function win32Spelling(p: string): string {
+  let s = p;
+  const unc = /^[\\/]{2}[?.][\\/]UNC[\\/]/i.exec(s);
+  if (unc) s = `${s[0]}${s[0]}${s.slice(unc[0].length)}`;
+  else if (/^[\\/]{2}[?.][\\/]/.test(s)) s = s.slice(4);
+  const windowsLike = DRIVE_PATH.test(s) || /^[\\/]{2}[^\\/]/.test(s) || unc !== null || process.platform === 'win32';
+  if (!windowsLike) return s;
+  s = s.replace(/::\$DATA$/i, '');
+  return s.split(/([\\/])/).map((seg, i) => (i % 2 === 1 || seg === '.' || seg === '..' ? seg : seg.replace(/[. ]+$/, '') || seg)).join('');
+}
+
+/**
+ * The path as the file system spells it: the nearest existing ancestor resolved with
+ * `realpathSync.native` (true letter case on a case-insensitive volume, symlinks and 8.3 names
+ * expanded), with the part that no longer exists appended as given.
+ */
+export function canonicalPath(abs: string): string {
+  const rest: string[] = [];
+  for (let p = abs; ; p = path.dirname(p)) {
+    try {
+      const real = realpathSync.native(p);
+      return rest.length ? path.join(real, ...rest.reverse()) : real;
+    } catch {
+      if (path.dirname(p) === p) return abs;
+      rest.push(path.basename(p));
+    }
+  }
 }
 
 export function rootVariants(p: string): string[] {
