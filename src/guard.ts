@@ -278,8 +278,8 @@ async function toolWindowFiles(root: string, rev: string | undefined, session: S
  * 3. otherwise fail closed ({@link FailClosedError}).
  *
  * A commit counts as written before the session only when it is a loose object of this repository's
- * own store whose file changed before the session started, or sits in one of its packs whose file
- * did. Objects reachable only through alternates are never trusted. A `.git/shallow` changed during
+ * own store whose file changed before the session started, or sits in one of its packs whose pack
+ * and index files both did (an index changed during the session fails closed). Objects reachable only through alternates are never trusted. A `.git/shallow` changed during
  * the session fails closed. A base that is no longer an ancestor of HEAD becomes its merge base.
  */
 async function sessionBase(root: string, startedAt: number, timeOf: (p: string) => Promise<number>): Promise<string> {
@@ -304,8 +304,16 @@ async function sessionBase(root: string, startedAt: number, timeOf: (p: string) 
     if (!oldPacks) {
       oldPacks = [];
       const dir = path.join(main, 'pack');
-      for (const f of (await readdir(dir).catch(() => [] as string[])).filter((x) => x.endsWith('.pack'))) {
-        if ((await timeOf(path.join(dir, f)).catch(() => Infinity)) < cutoff) oldPacks.push(path.join(dir, `${f.slice(0, -5)}.idx`));
+      const files = await readdir(dir).catch(() => [] as string[]);
+      // A pack index rewritten during the session could list anything: no pack can be trusted then.
+      for (const f of files.filter((x) => x.endsWith('.idx'))) {
+        if ((await timeOf(path.join(dir, f)).catch(() => Infinity)) >= cutoff) throw new FailClosedError('a pack index (.git/objects/pack/*.idx) changed during the session');
+      }
+      // Trusted: a pack and its index both from before the session (a missing index is not).
+      for (const f of files.filter((x) => x.endsWith('.pack'))) {
+        const idx = path.join(dir, `${f.slice(0, -5)}.idx`);
+        const times = await Promise.all([timeOf(path.join(dir, f)), timeOf(idx)].map((t) => t.catch(() => Infinity)));
+        if (times.every((t) => t < cutoff)) oldPacks.push(idx);
       }
     }
     for (const idx of oldPacks) if (await packIndexHas(idx, sha)) return true;

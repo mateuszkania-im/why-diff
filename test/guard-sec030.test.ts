@@ -507,6 +507,19 @@ describe('sec030 #7: the session base does not trust committer dates', () => {
     expect(r.message).not.toContain('could not check');
   });
 
+  it('fails closed when a pack index was rewritten during the session, even next to an old pack', async () => {
+    const { repo, home } = makeRepo();
+    sh(repo, ['gc', '-q']);
+    const t0 = Date.now() - 120_000;
+    const transcript = writeSyntheticTranscript(home, repo, 's-idx', [{ prompt: 'fix', at: iso(t0), calls: [
+      { tool: 'Edit', at: iso(t0 + 10_000), input: { file_path: tp(repo), old_string: 'it("t5"', new_string: 'it.skip("t5"' } },
+    ] }]);
+    skipT5(repo);
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-idx' }, { blocking: BL, home, objectTime: async (p) => { await lstat(p); return p.endsWith('.idx') ? Date.now() : 0; } });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('could not check');
+  });
+
   it('does not trust a packed commit when a pack was written during the session', async () => {
     const { repo, home } = makeRepo();
     const t0 = Date.now() - 120_000;
