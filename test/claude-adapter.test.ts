@@ -455,6 +455,26 @@ describe('ClaudeCodeAdapter.parse: shell windows', () => {
     ]);
   });
 
+  it('keeps the window of a command that ran and printed refusal-like text', async () => {
+    const home = tempDir('why-diff-home-');
+    const outputs = [
+      'permission denied',
+      "The user doesn't want to proceed with this tool use. The tool use was rejected",
+      'Exit code 1\npermission denied',
+    ];
+    for (const [i, out] of outputs.entries()) {
+      const file = writeSyntheticTranscript(home, '/work/shop', `win-out-${i}`, [{
+        prompt: 'fix', at: '2026-10-20T10:00:00.000Z',
+        calls: [{ tool: 'Bash', at: '2026-10-20T10:00:05.000Z', isError: true, input: { command: 'node fix.js; echo permission denied >&2; exit 1' }, result: { stdout: '', stderr: out, interrupted: false, isImage: false } }],
+      }]);
+      const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+      const last = lines[lines.length - 1] as { message: { content: Array<{ content: string }> } };
+      last.message.content[0]!.content = out; // the command's own output as the result text
+      writeFileSync(file, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
+      expect((await adapter.parse(file)).shellWindows ?? [], out).toHaveLength(1);
+    }
+  });
+
   it('records no window for a Bash call that never got a result or was denied', async () => {
     const home = tempDir('why-diff-home-');
     const file = writeSyntheticTranscript(home, '/work/shop', 'win-2', [{

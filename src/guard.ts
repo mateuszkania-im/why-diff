@@ -33,6 +33,8 @@ export interface GuardOptions {
   home?: string;
   /** Where guard-state.json lives; default `<repo>/.why-diff` */
   stateDir?: string;
+  /** Change time of a path in ms (tests); default: lstat ctime on POSIX, mtime on Windows */
+  statTime?: (absPath: string) => Promise<number>;
 }
 
 export interface GuardResult {
@@ -81,9 +83,9 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   }
 
   // Files a shell command changed without naming them (a script computing the path, `rsync --delete`,
-  // a path from the environment): credited when the file (or, once deleted, its directory) was last
-  // modified while one of this session's shell calls ran.
-  const byWindow = await shellWindowFiles(root, headed ? baseRev : undefined, session);
+  // a path from the environment): credited when the file (or, once deleted, the nearest directory above it) last changed
+  // while one of this session's shell calls ran (ctime on POSIX, mtime on Windows).
+  const byWindow = await shellWindowFiles(root, headed ? baseRev : undefined, session, opts.statTime ?? changeTime);
   for (const f of [...byWindow.written, ...byWindow.removed]) paths.push(`:(literal)${f}`);
   if (!paths.length) return NO_BLOCK;
 
@@ -138,7 +140,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
       const source = h.hunk.oldFile ?? h.hunk.file;
       const removed = h.match === 'file-only' && shellOnly(h.hunk) && targeted(removedByShell, source, true);
       const rewritten = h.match === 'file-only' && h.hunk.status !== 'renamed' && targeted(rewrittenByShell, h.hunk.file, false);
-      // Not named by any command: the file's own mtime (or its directory's, once deleted) inside a
+      // Not named by any command: the file's own change time (or, once deleted, its directory's) inside a
       // shell call window. A rewrite counts for every hunk of the file; a deletion or rename only
       // when the hunk is nothing but that operation.
       if (!removed && !rewritten) {
@@ -148,7 +150,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
         if (!timed) continue;
       }
     }
-    // Every explaining edit must be this session's; a hunk credited by its mtime alone may have none.
+    // Every explaining edit must be this session's; a hunk credited by its change time alone may have none.
     if ((!h.editIds.length && !timed) || !h.editIds.every((id) => id.startsWith(`${session.id}:`))) continue;
     const labels = [...h.labels];
     if (timed && !labels.some((l) => l.kind === 'protected-path')) {
@@ -190,22 +192,32 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
 const SHELL_GLOB = /[*?[]/;
 /** Clock slack on each side of a shell call window (transcript stamps vs file system times). */
 const WINDOW_SLACK_MS = 2000;
-/** Longer calls (a dev server, a watch) would credit too much: they are not used. */
-const WINDOW_MAX_MS = 10 * 60_000;
 const LSTAT_BATCH = 64;
 
 /**
- * Changed files (against `rev`, working tree and untracked) whose mtime lies inside one of the
- * session's shell call windows (`written`), and deleted ones whose parent directory's mtime does
- * (`removed`). A human edit after the call moves the mtime out of every window, so it is never
- * credited; a human edit to the same file while the agent's command was running is (the one edge).
+ * When a path last changed. POSIX ctime: a command can backdate mtime (`touch -d`) but not ctime,
+ * and any later write (a human edit) moves ctime past the window. Windows has no such ctime
+ * (`ctimeMs` there is the metadata change time Node fakes from mtime), so it uses mtime.
  */
-async function shellWindowFiles(root: string, rev: string | undefined, session: Session): Promise<{ written: Set<string>; removed: Set<string> }> {
+async function changeTime(p: string): Promise<number> {
+  const st = await lstat(p);
+  return process.platform === 'win32' ? st.mtimeMs : st.ctimeMs;
+}
+
+/**
+ * Changed files (against `rev`, working tree and untracked) whose change time lies inside one of the
+ * session's shell call windows (`written`), and deleted ones whose nearest existing ancestor
+ * directory's time does (`removed`). A human edit after the call moves the time out of every window,
+ * so it is never credited; a human edit to the same file while an agent command is running is (the
+ * one edge; long-running commands widen it).
+ */
+async function shellWindowFiles(root: string, rev: string | undefined, session: Session, timeOf: (p: string) => Promise<number>): Promise<{ written: Set<string>; removed: Set<string> }> {
   const written = new Set<string>();
   const removed = new Set<string>();
   const windows = (session.shellWindows ?? [])
     .map((w) => ({ start: Date.parse(w.start), end: Date.parse(w.end) }))
-    .filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end >= w.start && w.end - w.start <= WINDOW_MAX_MS)
+    // Long calls are kept: dropping them would let `sleep 700; node fix.js` slip through.
+    .filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end >= w.start)
     .map((w) => ({ start: w.start - WINDOW_SLACK_MS, end: w.end + WINDOW_SLACK_MS }));
   if (!windows.length) return { written, removed };
   const inWindow = (ms: number): boolean => windows.some((w) => ms >= w.start && ms <= w.end);
@@ -217,15 +229,20 @@ async function shellWindowFiles(root: string, rev: string | undefined, session: 
     await Promise.all(files.slice(i, i + LSTAT_BATCH).map(async (f) => {
       const abs = path.join(root, ...f.split('/'));
       try {
-        if (inWindow((await lstat(abs)).mtimeMs)) written.add(f);
+        if (inWindow(await timeOf(abs))) written.add(f);
         return;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return;
       }
-      try {
-        if (inWindow((await lstat(path.dirname(abs))).mtimeMs)) removed.add(f);
-      } catch {
-        // the directory went too: nothing to date the deletion by
+      // Deleted: date it by the nearest directory above it that still exists (up to the repo root).
+      for (let dir = path.dirname(abs); ; dir = path.dirname(dir)) {
+        try {
+          if (inWindow(await timeOf(dir))) removed.add(f);
+          return;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return;
+        }
+        if (dir === root || path.dirname(dir) === dir || !dir.startsWith(root)) return;
       }
     }));
   }

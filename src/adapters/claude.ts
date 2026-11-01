@@ -96,6 +96,8 @@ interface ToolOutcome {
   isError: boolean;
   text: string;
   result: EditToolResult | undefined;
+  /** The line's raw `toolUseResult` when the line holds this one result (an object for a command that ran) */
+  raw?: unknown;
 }
 
 interface PendingCall {
@@ -120,8 +122,15 @@ const PEEK_LINES = 60;
 const AGENT_TOOLS = new Set(['Agent', 'Task']);
 const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Bash']);
 const SKIP_MIN_LINE = 64 * 1024;
-/** A shell call the user refused never ran, so it gets no time window. */
-const DENIED = /doesn't want to proceed|tool use was rejected|permission (?:was )?denied/i;
+/**
+ * Claude Code's own messages for a tool call that never ran (the user refused it, or a permission
+ * rule denied it). Matched from the start of the result text only, and only when the result carries
+ * no shell output record: a command that ran and printed the same words keeps its window.
+ */
+const NEVER_RAN = [
+  /^(?:Error: )?The user doesn't want to proceed with this tool use\. The tool use was rejected\b/,
+  /^(?:Error: )?Permission to use [\w-]+ (?:with command [\s\S]* )?has been denied\b/,
+];
 const TOOL_USE_ID = Buffer.from('"tool_use_id":"');
 
 /** Tools whose result can turn into FileEdits (see emitEdits). */
@@ -407,6 +416,7 @@ class SessionBuilder {
           text: blockText(r.content),
           // toolUseResult is per line; only trust it when the line holds one result.
           result: results.length === 1 && isRecord(line.toolUseResult) ? (line.toolUseResult as EditToolResult) : undefined,
+          raw: results.length === 1 ? line.toolUseResult : undefined,
         });
       }
       return;
@@ -478,8 +488,9 @@ class SessionBuilder {
     this.pending.delete(toolUseId);
     const idx = this.pendingOrder.indexOf(toolUseId);
     if (idx !== -1) this.pendingOrder.splice(idx, 1);
-    // A command that failed (non-zero exit) may still have changed files: only a refused one did not run.
-    if (call.name === 'Bash' && resultAt && !(outcome.isError && DENIED.test(outcome.text))) {
+    // A command that failed (non-zero exit) may still have changed files: only one that never ran
+    // gets no window, and that is decided on structure, never on what a command printed.
+    if (call.name === 'Bash' && resultAt && !neverRan(outcome)) {
       const start = Date.parse(call.at);
       const end = Date.parse(resultAt);
       if (Number.isFinite(start) && Number.isFinite(end) && end >= start) this.shellWindows.push({ callId: toolUseId, start: call.at, end: resultAt });
@@ -577,6 +588,17 @@ class SessionBuilder {
   private unknownPromptId(): string {
     return `${this.sessionId}:unknown`;
   }
+}
+
+/**
+ * A refused or denied call: an error whose result record is a plain string (a command that ran
+ * has a `{ stdout, stderr, ... }` record) and whose whole text starts with Claude Code's fixed
+ * refusal message. When in doubt the call counts as having run.
+ */
+function neverRan(outcome: ToolOutcome): boolean {
+  if (!outcome.isError || typeof outcome.raw !== 'string') return false;
+  const text = outcome.text.trimStart();
+  return NEVER_RAN.some((re) => re.test(text));
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { lstat } from 'node:fs/promises';
 import { afterEach, describe, expect, it } from 'vitest';
 import { acquireLock, releaseLock, runGuard } from '../src/guard.js';
 import type { LabelKind } from '../src/types.js';
@@ -414,7 +415,9 @@ describe('runGuard: shell changes whose path the command does not name (mtime wi
   // A script that computes the path it rewrites: no literal test path on the command line.
   const FIX_JS = "const fs = require('fs');\nconst p = ['te', 'st'].join('') + '/f.' + 'test.js';\nfs.writeFileSync(p, fs.readFileSync(p, 'utf8').replace('it(\"t5\"', 'it.skip(\"t5\"'));\n";
 
-  async function run(act: (repo: string) => void, opts: { resultAt?: number; sessionAt?: number; callAt?: number } = {}): Promise<{ block: boolean; message?: string }> {
+  // Tests date files by their mtime (settable with utimes); the guard itself uses ctime on POSIX.
+  const byMtime = async (p: string): Promise<number> => (await lstat(p)).mtimeMs;
+  async function run(act: (repo: string) => void, opts: { resultAt?: number; sessionAt?: number; callAt?: number; statTime?: (p: string) => Promise<number> } = {}): Promise<{ block: boolean; message?: string }> {
     const { repo, home, stateDir } = makeRepo();
     writeFileSync(path.join(repo, 'fix.js'), FIX_JS);
     sh(repo, ['add', '-A']);
@@ -426,7 +429,7 @@ describe('runGuard: shell changes whose path the command does not name (mtime wi
       calls: [{ tool: 'Bash', at: iso(callAt), resultAt: iso(opts.resultAt ?? callAt + 4000), input: { command: `cd ${repo} && node fix.js`, description: 'run the fixer' } }],
     }]);
     act(repo);
-    return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-win' }, { blocking: BL, home, stateDir });
+    return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-win' }, { blocking: BL, home, stateDir, statTime: 'statTime' in opts ? opts.statTime : byMtime });
   }
   const testPath = (repo: string): string => path.join(repo, 'test', 'f.test.js');
 
@@ -480,12 +483,40 @@ describe('runGuard: shell changes whose path the command does not name (mtime wi
     expect(r.block).toBe(false);
   });
 
-  it('ignores a Bash window longer than 10 minutes', async () => {
+  it('keeps a Bash window longer than 10 minutes (`sleep 700; node fix.js`)', async () => {
     const r = await run((repo) => {
       applyEdit(repo, SKIP_OLD, SKIP_NEW);
-      utimesSync(testPath(repo), sec(T + 5 * 60_000), sec(T + 5 * 60_000));
-    }, { resultAt: T + 11 * 60_000 });
+      utimesSync(testPath(repo), sec(T + 11 * 60_000), sec(T + 11 * 60_000));
+    }, { resultAt: T + 12 * 60_000 });
+    expect(r.block).toBe(true);
+  });
+
+  it('dates a deletion by the nearest existing ancestor when the parent directory went too', async () => {
+    const r = await run((repo) => {
+      rmSync(path.join(repo, 'test'), { recursive: true });
+      utimesSync(repo, sec(T + 1000), sec(T + 1000));
+    });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('test/f.test.js');
+  });
+
+  it('does not credit a deletion whose nearest existing ancestor was changed outside the window', async () => {
+    const r = await run((repo) => {
+      rmSync(path.join(repo, 'test'), { recursive: true });
+      utimesSync(repo, sec(T + 60_000), sec(T + 60_000));
+    });
     expect(r.block).toBe(false);
+  });
+
+  // POSIX only: Windows has no ctime that utimes leaves alone, so the guard falls back to mtime there.
+  it.skipIf(process.platform === 'win32')('uses ctime by default: a script that backdates the mtime is still credited', async () => {
+    const now = Date.now();
+    const r = await run((repo) => {
+      applyEdit(repo, SKIP_OLD, SKIP_NEW);
+      // `touch -d` style backdating: mtime far outside the window, ctime stays "now" (inside it)
+      utimesSync(testPath(repo), sec(now - 3 * 3600_000), sec(now - 3 * 3600_000));
+    }, { callAt: now - 5000, resultAt: now + 60_000, sessionAt: now - 30_000, statTime: undefined as unknown as (p: string) => Promise<number> });
+    expect(r.block).toBe(true);
   });
 
   it('credits a change under a protected path the same way', async () => {
@@ -501,7 +532,7 @@ describe('runGuard: shell changes whose path the command does not name (mtime wi
     }]);
     writeFileSync(path.join(repo, 'infra', 'main.tf'), 'a = 2\n');
     utimesSync(path.join(repo, 'infra', 'main.tf'), sec(T + 1000), sec(T + 1000));
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-prot' }, { blocking: BL, home, stateDir });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-prot' }, { blocking: BL, home, stateDir, statTime: byMtime });
     expect(r.block).toBe(true);
     expect(r.message).toContain('protected-path');
   });
