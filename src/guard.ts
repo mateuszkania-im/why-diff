@@ -9,10 +9,11 @@
  * cannot be read), any error while checking it blocks, with the reason: the agent can break what
  * the guard reads (a truncated index, an unreadable file), and that must not let it finish unchecked.
  */
-import { constants as fsConstants, createReadStream } from 'node:fs';
+import { constants as fsConstants, createReadStream, realpath as realpathCb } from 'node:fs';
 import { access, lstat, readdir, readFile, realpath, stat, statfs } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import readline from 'node:readline';
+import os from 'node:os';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
@@ -22,6 +23,8 @@ import { compileGlobs, loadConfig, type WhyDiffConfig } from './config.js';
 import type { Hunk, LabelKind, Session } from './types.js';
 import { isConfigFile, isTestFile } from './labels.js';
 import { dataDir, failedMarker, recordMarker, recordPath, type BaseRecord } from './session-start.js';
+
+const realpathNative = realpathCb.native;
 
 export const DEFAULT_BLOCK_ON: readonly LabelKind[] = ['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path', 'unreviewed'];
 
@@ -976,32 +979,58 @@ async function readFileSystemType(p: string): Promise<string> {
   const { type } = await statfs(p);
   return LINUX_FS.get(type) ?? `unknown (0x${type.toString(16)})`;
 }
-const windowsVolumes = new Map<string, Promise<string>>();
 /**
- * Windows: the file system of the volume holding `p`, by drive letter, from `fsutil fsinfo volumeinfo`
- * (or, when that cannot run, PowerShell's `Get-Volume`). A UNC or network path, or anything that
- * cannot be read, throws.
+ * The commands that read a Windows volume's file system, by absolute path under `%SystemRoot%` (the
+ * hook's own environment, not the agent's), run in the temporary directory without a shell, so
+ * nothing in the repository or on `PATH` can stand in for them (exported for tests).
  */
-function windowsFileSystemType(p: string): Promise<string> {
-  const drive = /^([A-Za-z]):[\\/]/.exec(path.resolve(p))?.[1]?.toUpperCase();
-  if (!drive) return Promise.reject(new Error(`${p} is not on a local drive (a UNC or network path)`));
-  let t = windowsVolumes.get(drive);
+export function windowsVolumeCommands(realPath: string, driveRoot: string): Array<{ file: string; args: string[]; options: { cwd: string; windowsHide: true; shell: false; encoding: 'utf8'; timeout: number } }> {
+  const system32 = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32');
+  const options = { cwd: os.tmpdir(), windowsHide: true as const, shell: false as const, encoding: 'utf8' as const, timeout: 15_000 };
+  const quoted = realPath.replace(/'/g, "''");
+  return [
+    { file: path.join(system32, 'WindowsPowerShell', 'v1.0', 'powershell.exe'), args: ['-NoProfile', '-NonInteractive', '-Command', `$v = Get-Volume -FilePath '${quoted}' -ErrorAction Stop; "$($v.FileSystemType)|$($v.DriveType)"`], options },
+    { file: path.join(system32, 'fsutil.exe'), args: ['fsinfo', 'volumeinfo', driveRoot], options },
+  ];
+}
+const windowsVolumes = new Map<number, Promise<string>>();
+/**
+ * Windows: the file system of the volume that actually holds `p` (after following junctions and
+ * folder mount points with `realpath`): `fsutil fsinfo volumeinfo` on the drive root when the path
+ * is on that root's own volume (same volume serial), else (or when fsutil fails) PowerShell's
+ * `Get-Volume -FilePath`, which also gives the drive type. Cached by volume serial (`st_dev`) for the
+ * process: a guard run spawns it once. A UNC or
+ * network path, a remote or unknown drive type, or anything that cannot be read, throws.
+ */
+async function windowsFileSystemType(p: string): Promise<string> {
+  const real = await new Promise<string>((resolve, reject) => realpathNative(p, (err, out) => (err ? reject(err) : resolve(out))));
+  if (/^\\\\/.test(real)) throw new Error(`${real} is a UNC or network path`);
+  const drive = /^([A-Za-z]):[\\/]/.exec(real)?.[1]?.toUpperCase();
+  if (!drive) throw new Error(`${real} is not on a local drive`);
+  const dev = Number((await stat(real)).dev);
+  let t = windowsVolumes.get(dev);
   if (!t) {
-    const run = (file: string, args: string[]): Promise<string> => new Promise((resolve, reject) => execFile(file, args, { encoding: 'utf8', windowsHide: true, timeout: 10_000 }, (err, out) => (err ? reject(err) : resolve(out))));
-    t = run('fsutil', ['fsinfo', 'volumeinfo', `${drive}:\\`])
-      .then((out) => {
-        const m = /File System Name\s*:\s*(\S+)/i.exec(out);
-        if (!m) throw new Error('no file system name in fsutil output');
-        return m[1]!;
-      })
-      .catch(() => run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Volume -DriveLetter ${drive}).FileSystemType`]).then((out) => {
-        const name = out.trim();
-        if (!/^\w+$/.test(name)) throw new Error(`cannot read the file system of drive ${drive}:`);
-        return name;
-      }))
+    const driveRoot = `${drive}:\\`;
+    const [ps, fsutil] = windowsVolumeCommands(real, driveRoot);
+    const run = (c: typeof ps): Promise<string> => new Promise((resolve, reject) => execFile(c!.file, c!.args, c!.options, (err, out) => (err ? reject(err) : resolve(String(out)))));
+    const viaPowerShell = (): Promise<string> => run(ps!).then((out) => {
+      const m = /^(\w+)\|(\w*)\s*$/m.exec(out.trim());
+      if (!m) throw new Error('no file system in Get-Volume output');
+      if (!/^(fixed|removable)$/i.test(m[2]!)) throw new Error(`drive type ${m[2] || 'unknown'}`);
+      return m[1]!;
+    });
+    const viaFsutil = (): Promise<string> => run(fsutil!).then((out) => {
+      const m = /File System Name\s*:\s*(\S+)/i.exec(out);
+      if (!m) throw new Error('no file system name in fsutil output');
+      return m[1]!;
+    });
+    // On the drive root's own volume (same volume serial), `fsutil` on that root names the right
+    // volume and is fast; a path on another volume (a folder mount point) asks `Get-Volume -FilePath`.
+    const sameVolume = await stat(driveRoot).then((st) => Number(st.dev) === dev, () => false);
+    t = (sameVolume ? viaFsutil().catch(() => viaPowerShell()) : viaPowerShell())
       .then((name) => name.toLowerCase());
-    windowsVolumes.set(drive, t);
-    setTimeout(() => windowsVolumes.delete(drive), 2000).unref();
+    windowsVolumes.set(dev, t);
+    t.catch(() => windowsVolumes.delete(dev));
   }
   return t;
 }
