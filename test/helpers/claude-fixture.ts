@@ -8,7 +8,7 @@
  * the adapter unit tests and the end-to-end attribution test.
  */
 
-import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { cpSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -162,4 +162,13 @@ export function fixtureLines(): Array<Record<string, unknown>> {
     .split('\n')
     .filter(Boolean)
     .map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+/**
+ * `objectTime` for the guard in tests: every git object counts as written long before the session.
+ * Test repositories are committed after the synthetic session start, unlike real ones.
+ */
+export async function oldObjects(p: string): Promise<number> {
+  lstatSync(p); // a missing file still throws, as the real clock does
+  return 0;
 }

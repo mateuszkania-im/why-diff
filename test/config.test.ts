@@ -9,6 +9,7 @@ import { renderMarkdown } from '../src/report/index.js';
 import { runGuard } from '../src/guard.js';
 import { buildReport } from '../src/pipeline.js';
 import { tempDir, writeSyntheticTranscript, type SyntheticCall } from './helpers/claude-fixture.js';
+import { oldObjects } from './helpers/claude-fixture.js';
 
 const dirs: string[] = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
@@ -295,7 +296,7 @@ describe('guard with config', () => {
 
   it('protected-path blocks by default', async () => {
     const s = await scenario({ protected: ['migrations/**'] });
-    const r = await runGuard(s.payload, { home: s.home });
+    const r = await runGuard(s.payload, { home: s.home, objectTime: oldObjects });
     expect(r.block).toBe(true);
     expect(r.message).toContain('protected-path');
   });
@@ -303,7 +304,7 @@ describe('guard with config', () => {
   it('config blockOn only adds to the defaults, never removes', async () => {
     for (const blockOn of [[], ['ci-changed']]) {
       const s = await scenario({ protected: ['migrations/**'], blockOn });
-      expect((await runGuard(s.payload, { home: s.home })).block).toBe(true);
+      expect((await runGuard(s.payload, { home: s.home, objectTime: oldObjects })).block).toBe(true);
     }
   });
 
@@ -312,14 +313,14 @@ describe('guard with config', () => {
     const home = s.home;
     const t = writeSyntheticTranscript(home, s.repo, 'sl', [{ prompt: 'lock', at: SESSION_AT, calls: [{ tool: 'Write', at: CALL_AT, input: { file_path: path.join(s.repo, 'package-lock.json'), content: LOCK } }] }]);
     put(s.repo, 'package-lock.json', LOCK);
-    const r = await runGuard({ transcript_path: t, cwd: s.repo, session_id: 'sl' }, { home });
+    const r = await runGuard({ transcript_path: t, cwd: s.repo, session_id: 'sl' }, { home, objectTime: oldObjects });
     expect(r.block).toBe(true);
     expect(r.message).toContain('lockfile');
   });
 
   it('explicit blocking replaces the defaults', async () => {
     const s = await scenario({ protected: ['migrations/**'] });
-    const r = await runGuard(s.payload, { home: s.home, blocking: new Set(['ci-changed']) });
+    const r = await runGuard(s.payload, { home: s.home, blocking: new Set(['ci-changed']), objectTime: oldObjects });
     expect(r.block).toBe(false);
   });
 
@@ -331,7 +332,7 @@ describe('guard with config', () => {
     const home = temp('why-diff-config-home-');
     const t = writeSyntheticTranscript(home, repo, 'si', [{ prompt: 'skip', at: SESSION_AT, calls: [{ tool: 'Edit', at: CALL_AT, input: { file_path: path.join(repo, 'test/f.test.js'), old_string: 'it("a"', new_string: 'it.skip("a"' } }] }]);
     put(repo, 'test/f.test.js', 'it.skip("a",()=>{\n  expect(1).toBe(1);\n});\n');
-    const r = await runGuard({ transcript_path: t, cwd: repo, session_id: 'si' }, { home });
+    const r = await runGuard({ transcript_path: t, cwd: repo, session_id: 'si' }, { home, objectTime: oldObjects });
     expect(r.block).toBe(true);
     expect(r.message).toContain('test-skip-added');
   });
@@ -348,7 +349,7 @@ describe('guard with config', () => {
     ] }]);
     put(repo, 'test/f.test.js', 'it.skip("a",()=>{\n  expect(1).toBe(1);\n});\n');
     put(repo, '.why-diff.json', '{"ignore":["**"]}');
-    const r = await runGuard({ transcript_path: t, cwd: repo, session_id: 'sx' }, { home });
+    const r = await runGuard({ transcript_path: t, cwd: repo, session_id: 'sx' }, { home, objectTime: oldObjects });
     expect(r.block).toBe(true);
     expect(r.message).toContain('test-skip-added');
     expect(r.message).toContain('.why-diff.json');

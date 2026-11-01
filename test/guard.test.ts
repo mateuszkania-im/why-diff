@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { runGuard } from '../src/guard.js';
 import type { LabelKind } from '../src/types.js';
 import { shellPath, tempDir, writeSyntheticTranscript, type SyntheticCall } from './helpers/claude-fixture.js';
+import { oldObjects } from './helpers/claude-fixture.js';
 import { bestOfAsync, expectSubQuadratic } from './helpers/perf.js';
 
 const BLOCKING = new Set<LabelKind>(['test-skip-added', 'assertion-removed', 'secret-like', 'ci-changed']);
@@ -52,12 +53,6 @@ function makeRepo(realRoot = true): { repo: string; home: string } {
   return { repo, home: temp('why-diff-guard-home-') };
 }
 
-/** Change time as the guard reads it, except that git objects count as written before the session (test setup). */
-async function setupObjectsBeforeSession(p: string): Promise<number> {
-  if (p.split(path.sep).join('/').includes('/.git/objects/')) return 0;
-  return (await lstat(p)).ctimeMs;
-}
-
 function editCall(repo: string, oldS: string, newS: string, at = CALL_AT): SyntheticCall {
   return { tool: 'Edit', at, input: { file_path: path.join(repo, 'test', 'f.test.js'), old_string: oldS, new_string: newS } };
 }
@@ -80,7 +75,7 @@ describe('runGuard', () => {
     applyEdit(repo, 'it("t25",()=>{\n', 'it.skip("t25",()=>{\n'); // human, not in transcript
     const transcript = writeSyntheticTranscript(home, repo, 's-human', [{ prompt: 'add an assertion to t2', at: SESSION_AT, calls: [editCall(repo, ASSERT_OLD, ASSERT_NEW)] }]);
     applyEdit(repo, ASSERT_OLD, ASSERT_NEW);
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-human' }, { blocking: BLOCKING, home });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-human' }, { blocking: BLOCKING, home, objectTime: oldObjects });
     expect(r.block).toBe(false);
     expect(r.hits).toEqual([]);
   });
@@ -89,7 +84,7 @@ describe('runGuard', () => {
     const { repo, home } = makeRepo();
     const transcript = writeSyntheticTranscript(home, repo, 's-own', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-own' }, { blocking: BLOCKING, home });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-own' }, { blocking: BLOCKING, home, objectTime: oldObjects });
     expect(r.block).toBe(true);
     expect(r.message).toContain('test/f.test.js');
     expect(r.message).toContain('test-skip-added');
@@ -100,7 +95,7 @@ describe('runGuard', () => {
     const transcript = writeSyntheticTranscript(home, repo, 's-commit', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
     sh(repo, ['commit', '-qam', 'agent commit'], new Date().toISOString());
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-commit' }, { blocking: BLOCKING, home });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-commit' }, { blocking: BLOCKING, home, objectTime: oldObjects });
     expect(r.block).toBe(true);
     expect(r.message).toContain('test-skip-added');
   });
@@ -110,11 +105,11 @@ describe('runGuard', () => {
     const t1 = writeSyntheticTranscript(home, repo, 's-twice', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
     const payload = { transcript_path: t1, cwd: repo, session_id: 's-twice' };
-    const first = await runGuard(payload, { blocking: BLOCKING, home });
+    const first = await runGuard(payload, { blocking: BLOCKING, home, objectTime: oldObjects });
     expect(first.block).toBe(true);
     const delivered = `${JSON.stringify({ type: 'attachment', timestamp: new Date().toISOString(), attachment: { type: 'hook_blocking_error', hookName: 'Stop', hookEvent: 'Stop', blockingError: { blockingError: first.message, command: 'why-diff guard' } } })}\n`;
     appendFileSync(t1, delivered);
-    expect((await runGuard(payload, { blocking: BLOCKING, home })).block).toBe(false);
+    expect((await runGuard(payload, { blocking: BLOCKING, home, objectTime: oldObjects })).block).toBe(false);
 
     const t2 = writeSyntheticTranscript(home, repo, 's-twice', [{
       prompt: 'fix t5 and t9',
@@ -123,7 +118,7 @@ describe('runGuard', () => {
     }]);
     appendFileSync(t2, delivered);
     applyEdit(repo, 'it("t9",()=>{\n', 'it.skip("t9",()=>{\n');
-    const r = await runGuard({ ...payload, transcript_path: t2 }, { blocking: BLOCKING, home });
+    const r = await runGuard({ ...payload, transcript_path: t2 }, { blocking: BLOCKING, home, objectTime: oldObjects });
     expect(r.block).toBe(true);
   });
 
@@ -141,8 +136,7 @@ describe('runGuard', () => {
       const transcript = writeSyntheticTranscript(home, repo, 's-sh', [{ prompt: 'tidy up', at: SESSION_AT, calls }]);
       writeFileSync(path.join(repo, 'src', 'x.js'), 'export const x = 2;\n');
       act(repo);
-      // The setup commits are made now, after the synthetic session start: date their objects before it.
-      return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sh' }, { blocking, home, statTime: setupObjectsBeforeSession });
+      return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sh' }, { blocking, home, objectTime: oldObjects });
     }
     it('blocks on rm of a test file', async () => {
       const r = await run('rm $R/test/f.test.js', (repo) => rmSync(path.join(repo, 'test', 'f.test.js')));
@@ -263,14 +257,14 @@ describe('runGuard', () => {
 
   it('returns quietly when stop_hook_active or without transcript_path', async () => {
     const { repo, home } = makeRepo();
-    expect((await runGuard({ cwd: repo }, { blocking: BLOCKING, home })).block).toBe(false);
+    expect((await runGuard({ cwd: repo }, { blocking: BLOCKING, home, objectTime: oldObjects })).block).toBe(false);
     const transcript = writeSyntheticTranscript(home, repo, 's-act', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
-    expect((await runGuard({ transcript_path: transcript, cwd: repo, stop_hook_active: true }, { blocking: BLOCKING, home })).block).toBe(false);
+    expect((await runGuard({ transcript_path: transcript, cwd: repo, stop_hook_active: true }, { blocking: BLOCKING, home, objectTime: oldObjects })).block).toBe(false);
   });
 
   it('never throws outside a git repo', async () => {
-    const r = await runGuard({ transcript_path: '/nonexistent.jsonl', cwd: temp('why-diff-guard-nogit-') }, { blocking: BLOCKING });
+    const r = await runGuard({ transcript_path: '/nonexistent.jsonl', cwd: temp('why-diff-guard-nogit-') }, { blocking: BLOCKING, objectTime: oldObjects });
     expect(r.block).toBe(false);
   });
 
@@ -278,7 +272,7 @@ describe('runGuard', () => {
     const { repo, home } = makeRepo(false);
     const transcript = writeSyntheticTranscript(home, repo, 's-sym', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sym' }, { blocking: BLOCKING, home });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sym' }, { blocking: BLOCKING, home, objectTime: oldObjects });
     expect(r.block).toBe(true);
   });
 
@@ -286,7 +280,7 @@ describe('runGuard', () => {
     const { repo, home } = makeRepo();
     const transcript = writeSyntheticTranscript(home, repo, 's-clean', [{ prompt: 'add an assertion to t2', at: SESSION_AT, calls: [editCall(repo, ASSERT_OLD, ASSERT_NEW)] }]);
     applyEdit(repo, ASSERT_OLD, ASSERT_NEW);
-    await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-clean' }, { blocking: BLOCKING, home });
+    await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-clean' }, { blocking: BLOCKING, home, objectTime: oldObjects });
     expect(existsSync(path.join(repo, '.why-diff'))).toBe(false);
   });
 
@@ -296,7 +290,7 @@ describe('runGuard', () => {
     writeFileSync(path.join(repo, '.why-diff', 'guard-state.json'), '{"s1": null, "s2": 42, "s3": "abc"}');
     const transcript = writeSyntheticTranscript(home, repo, 's-corrupt', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-corrupt' }, { blocking: BLOCKING, home });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-corrupt' }, { blocking: BLOCKING, home, objectTime: oldObjects });
     expect(r.block).toBe(true);
     expect(readFileSync(path.join(repo, '.why-diff', 'guard-state.json'), 'utf8')).toBe('{"s1": null, "s2": 42, "s3": "abc"}');
   });
@@ -309,7 +303,7 @@ describe('runGuard', () => {
       writeFileSync(big, Buffer.alloc(mb * 1024 * 1024, 'a'));
       let block = true;
       const ms = await bestOfAsync(async () => {
-        block = (await runGuard({ transcript_path: transcript, cwd: repo, session_id: `s-big-${mb}` }, { blocking: BLOCKING, home })).block;
+        block = (await runGuard({ transcript_path: transcript, cwd: repo, session_id: `s-big-${mb}` }, { blocking: BLOCKING, home, objectTime: oldObjects })).block;
       });
       expect(block).toBe(false);
       return ms;
@@ -347,7 +341,7 @@ describe('runGuard: shell changes whose path the command does not name (tool cal
       calls: [{ tool: 'Bash', at: iso(callAt), resultAt: iso(opts.resultAt ?? callAt + 4000), input: { command: `cd ${shellPath(repo)} && node fix.js`, description: 'run the fixer' } }],
     }]);
     act(repo);
-    return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-win' }, { blocking: BL, home, statTime: 'statTime' in opts ? opts.statTime : byMtime });
+    return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-win' }, { blocking: BL, home, statTime: 'statTime' in opts ? opts.statTime : byMtime, objectTime: oldObjects });
   }
   const testPath = (repo: string): string => path.join(repo, 'test', 'f.test.js');
 
@@ -450,7 +444,7 @@ describe('runGuard: shell changes whose path the command does not name (tool cal
     }]);
     writeFileSync(path.join(repo, 'infra', 'main.tf'), 'a = 2\n');
     utimesSync(path.join(repo, 'infra', 'main.tf'), sec(T + 1000), sec(T + 1000));
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-prot' }, { blocking: BL, home, statTime: byMtime });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-prot' }, { blocking: BL, home, statTime: byMtime, objectTime: oldObjects });
     expect(r.block).toBe(true);
     expect(r.message).toContain('protected-path');
   });
@@ -466,7 +460,7 @@ describe('runGuard with Unicode file names', () => {
       sh(repo, ['commit', '-qm', 'cafe'], LONG_AGO);
       const transcript = writeSyntheticTranscript(home, repo, 's-nfd', [{ prompt: 'fix t5', at: SESSION_AT, calls: [{ tool: 'Edit', at: CALL_AT, input: { file_path: path.join(repo, 'test', 'cafe\u0301.test.js'), old_string: SKIP_OLD, new_string: SKIP_NEW } }] }]);
       writeFileSync(file, readFileSync(file, 'utf8').replace(SKIP_OLD, SKIP_NEW));
-      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-nfd' }, { blocking: BLOCKING, home });
+      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-nfd' }, { blocking: BLOCKING, home, objectTime: oldObjects });
       expect(r.block).toBe(true);
     });
   }
@@ -483,7 +477,7 @@ describe('runGuard on pasted blobs', () => {
       const transcript = writeSyntheticTranscript(home, repo, 's-blob', [{ prompt: `fix t5 ${blob}`, at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
       applyEdit(repo, SKIP_OLD, SKIP_NEW);
       const t0 = Date.now();
-      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-blob' }, { blocking: BLOCKING, home });
+      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-blob' }, { blocking: BLOCKING, home, objectTime: oldObjects });
       expect(Date.now() - t0).toBeLessThan(5000);
       expect(r.block).toBe(true);
     }, 120_000);
@@ -493,7 +487,9 @@ describe('runGuard on pasted blobs', () => {
 describe('why-diff guard CLI', () => {
   it('exits 2 with the message on stderr when the agent skipped a test, 0 otherwise', () => {
     const { repo, home } = makeRepo();
-    const transcript = writeSyntheticTranscript(home, repo, 's-cli', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
+    // The real CLI reads real object times: the session starts after the setup commits (and the 2 s slack).
+    const later = Date.now() + 5000;
+    const transcript = writeSyntheticTranscript(home, repo, 's-cli', [{ prompt: 'fix t5', at: new Date(later).toISOString(), calls: [editCall(repo, SKIP_OLD, SKIP_NEW, new Date(later + 1000).toISOString())] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
     const run = (payload: object) => spawnSync(process.execPath, ['--import', pathToFileURL(path.resolve('node_modules/tsx/dist/esm/index.mjs')).href, path.resolve('src/cli.ts'), 'guard'], { input: JSON.stringify(payload), encoding: 'utf8', cwd: repo });
     const first = run({ transcript_path: transcript, cwd: repo, session_id: 's-cli' });

@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { runGuard } from '../src/guard.js';
 import type { LabelKind } from '../src/types.js';
 import { shellPath, tempDir, writeSyntheticTranscript, type SyntheticCall } from './helpers/claude-fixture.js';
+import { oldObjects } from './helpers/claude-fixture.js';
 
 const BL = new Set<LabelKind>(['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path']);
 const dirs: string[] = [];
@@ -60,7 +61,7 @@ async function scenario(build: (ctx: { repo: string; T: number }) => { calls: Sy
   const { calls, act, statTime } = build({ repo, T });
   const transcript = writeSyntheticTranscript(home, repo, 's-sec', [{ prompt: 'make the suite green', at: iso(T - 60_000), calls }]);
   act();
-  return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sec' }, { blocking: BL, home, statTime: statTime ?? byMtime });
+  return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sec' }, { blocking: BL, home, statTime: statTime ?? byMtime, objectTime: oldObjects });
 }
 
 describe('sec030 #1: background and detached shell writes', () => {
@@ -226,7 +227,7 @@ describe('sec030 #3: deleted paths whose parent is no longer a directory', () =>
     const transcript = writeSyntheticTranscript(home, repo, 's-real', [{ prompt: 'clean up', at: iso(now - 60_000), calls: [{ tool: 'Bash', at: iso(now - 3000), resultAt: iso(now + 3000), input: { command: cmd, description: 'x' } }] }]);
     rmSync(path.join(repo, 'test'), { recursive: true });
     writeFileSync(path.join(repo, 'test'), 'x');
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-real' }, { blocking: BL, home });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-real' }, { blocking: BL, home, objectTime: oldObjects });
     expect(r.block).toBe(true);
   });
 
@@ -254,7 +255,7 @@ describe('sec030 #5: git attributes, textconv and diff config cannot hide hunks'
     ] }]);
     skipT5(repo);
     setup(repo);
-    return (await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-attr' }, { blocking: BL, home })).block;
+    return (await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-attr' }, { blocking: BL, home, objectTime: oldObjects })).block;
   }
   it('blocks with .git/info/attributes "*.js -diff" (binary)', async () => {
     expect(await editedRepo((repo) => writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js -diff\n'))).toBe(true);
@@ -346,7 +347,7 @@ describe('sec030 #6: an edit path spelled in another case', () => {
       { tool: 'Edit', at: iso(Date.now() - 60_000), input: { file_path: fp, old_string: 'it("t5"', new_string: 'it.skip("t5"' } },
     ] }]);
     writeFileSync(fp, readFileSync(fp, 'utf8').replace('it("t5"', 'it.skip("t5"'));
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-case' }, { blocking: BL, home });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-case' }, { blocking: BL, home, objectTime: oldObjects });
     expect(r.block).toBe(true);
   });
 
@@ -359,7 +360,7 @@ describe('sec030 #6: an edit path spelled in another case', () => {
       { tool: 'Edit', at: iso(Date.now() - 60_000), input: { file_path: fp, old_string: 'it("t5"', new_string: 'it.skip("t5"' } },
     ] }]);
     writeFileSync(fp, readFileSync(fp, 'utf8').replace('it("t5"', 'it.skip("t5"'));
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-case2' }, { blocking: BL, home });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-case2' }, { blocking: BL, home, objectTime: oldObjects });
     expect(r.block).toBe(true);
   });
 
@@ -370,12 +371,17 @@ describe('sec030 #6: an edit path spelled in another case', () => {
       bash(Date.now() - 60_000, `cd ${shellPath(repo)} && rm TEST/F.TEST.JS`),
     ] }]);
     rmSync(tp(repo));
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-case3' }, { blocking: BL, home, statTime: async () => 0 });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-case3' }, { blocking: BL, home, statTime: async () => 0, objectTime: oldObjects });
     expect(r.block).toBe(true);
   });
 });
 
 describe('sec030 #7: the session base does not trust committer dates', () => {
+  /** Real object times, except that the setup commit counts as written before the session. */
+  const setupCommitOld = (repo: string): ((p: string) => Promise<number>) => {
+    const init = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    return async (p: string) => (p.split(path.sep).join('/').endsWith(`/${init.slice(0, 2)}/${init.slice(2)}`) ? 0 : (await lstat(p)).ctimeMs);
+  };
   it('blocks on an agent edit committed with a backdated GIT_COMMITTER_DATE', async () => {
     const { repo, home } = makeRepo();
     const t0 = Date.now() - 120_000;
@@ -383,9 +389,68 @@ describe('sec030 #7: the session base does not trust committer dates', () => {
       { tool: 'Edit', at: iso(t0 + 10_000), input: { file_path: tp(repo), old_string: 'it("t5"', new_string: 'it.skip("t5"' } },
       bash(t0 + 20_000, 'GIT_COMMITTER_DATE=2026-01-02T00:00:00Z git commit -qam wip'),
     ] }]);
+    const objectTime = setupCommitOld(repo);
     skipT5(repo);
     sh(repo, ['commit', '-qam', 'wip'], new Date(Date.parse(LONG_AGO) + 1000).toISOString());
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-bd' }, { blocking: BL, home });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-bd' }, { blocking: BL, home, objectTime });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('test-skip-added');
+  });
+
+  it('never falls back to a commit written during the session: with an expired reflog, the first-parent history decides', async () => {
+    const { repo, home } = makeRepo();
+    const t0 = Date.now() - 120_000;
+    const transcript = writeSyntheticTranscript(home, repo, 's-exp', [{ prompt: 'fix', at: iso(t0), calls: [
+      { tool: 'Edit', at: iso(t0 + 10_000), input: { file_path: tp(repo), old_string: 'it("t5"', new_string: 'it.skip("t5"' } },
+      bash(t0 + 20_000, 'GIT_COMMITTER_DATE=2026-01-02T00:00:00Z git commit -qam wip && git reflog expire --expire=now --all'),
+    ] }]);
+    const objectTime = setupCommitOld(repo);
+    skipT5(repo);
+    sh(repo, ['commit', '-qam', 'wip'], new Date(Date.parse(LONG_AGO) + 1000).toISOString());
+    sh(repo, ['reflog', 'expire', '--expire=now', '--all']);
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-exp' }, { blocking: BL, home, objectTime });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('test-skip-added');
+  });
+
+  it('fails closed when every commit was written during the session', async () => {
+    const { repo, home } = makeRepo();
+    const t0 = Date.now() - 120_000;
+    const transcript = writeSyntheticTranscript(home, repo, 's-all', [{ prompt: 'tidy', at: iso(t0), calls: [
+      { tool: 'Edit', at: iso(t0 + 10_000), input: { file_path: path.join(repo, 'fix.js'), old_string: 'const fs', new_string: 'const fs2' } },
+    ] }]);
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-all' }, { blocking: BL, home });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('could not check');
+  });
+
+  it('fails closed when the object alternates list changed during the session', async () => {
+    const { repo, home } = makeRepo();
+    const other = temp('wd-sec-alt-');
+    sh(other, ['init', '-q', '--bare']);
+    writeFileSync(path.join(repo, '.git', 'objects', 'info', 'alternates'), `${path.join(other, 'objects')}\n`);
+    const t0 = Date.now() - 120_000;
+    const transcript = writeSyntheticTranscript(home, repo, 's-alt', [{ prompt: 'tidy', at: iso(t0), calls: [
+      { tool: 'Edit', at: iso(t0 + 10_000), input: { file_path: path.join(repo, 'fix.js'), old_string: 'const fs', new_string: 'const fs2' } },
+    ] }]);
+    const alt = path.join(repo, '.git', 'objects', 'info', 'alternates');
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-alt' }, { blocking: BL, home, objectTime: async (p) => (p === alt ? Date.now() : 0) });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('alternates');
+  });
+
+  it('does not trust a packed commit when a pack was written during the session', async () => {
+    const { repo, home } = makeRepo();
+    const t0 = Date.now() - 120_000;
+    const transcript = writeSyntheticTranscript(home, repo, 's-pk', [{ prompt: 'fix', at: iso(t0), calls: [
+      { tool: 'Edit', at: iso(t0 + 10_000), input: { file_path: tp(repo), old_string: 'it("t5"', new_string: 'it.skip("t5"' } },
+    ] }]);
+    skipT5(repo);
+    sh(repo, ['commit', '-qam', 'wip'], new Date(Date.parse(LONG_AGO) + 1000).toISOString());
+    sh(repo, ['gc', '-q']);
+    // loose objects are gone; packs carry real (in-session) times
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-pk' }, { blocking: BL, home, objectTime: async (p) => { await lstat(p); return p.endsWith('.pack') ? Date.now() : 0; } });
+    expect(r.block).toBe(true);
     expect(r.block).toBe(true);
   });
 
@@ -411,8 +476,9 @@ describe('sec030 #7: the session base does not trust committer dates', () => {
       bash(t0 + 20_000, 'git commit -qa --amend --no-edit'),
     ] }]);
     skipT5(repo);
+    const objectTime = setupCommitOld(repo);
     sh(repo, ['commit', '-qa', '--amend', '--no-edit'], LONG_AGO);
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-amend' }, { blocking: BL, home });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-amend' }, { blocking: BL, home, objectTime });
     expect(r.block).toBe(true);
   });
 });
@@ -434,9 +500,9 @@ describe('sec030 #8: a repeat block is skipped only after the harness delivered 
 
   it('the agent running the guard itself first does not pre-empt the real Stop hook', async () => {
     const { home, payload } = setup();
-    const agentRun = await runGuard(payload, { blocking: BL, home });
+    const agentRun = await runGuard(payload, { blocking: BL, home, objectTime: oldObjects });
     expect(agentRun.block).toBe(true);
-    const real = await runGuard(payload, { blocking: BL, home });
+    const real = await runGuard(payload, { blocking: BL, home, objectTime: oldObjects });
     expect(real.block).toBe(true);
   });
 
@@ -444,27 +510,27 @@ describe('sec030 #8: a repeat block is skipped only after the harness delivered 
     const { repo, home, payload } = setup();
     mkdirSync(path.join(repo, '.why-diff'));
     writeFileSync(path.join(repo, '.why-diff', 'guard-state.json'), JSON.stringify({ 's-dd': { hash: 'x'.repeat(64), at: new Date().toISOString() } }));
-    expect((await runGuard(payload, { blocking: BL, home })).block).toBe(true);
+    expect((await runGuard(payload, { blocking: BL, home, objectTime: oldObjects })).block).toBe(true);
   });
 
   it('the guard message in a tool result (the agent ran why-diff guard in Bash) does not count as delivered', async () => {
     const { home, transcript, payload } = setup();
-    const first = await runGuard(payload, { blocking: BL, home });
+    const first = await runGuard(payload, { blocking: BL, home, objectTime: oldObjects });
     appendFileSync(transcript, `${JSON.stringify({
       type: 'user', timestamp: new Date().toISOString(), sessionId: 's-dd',
       message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_zz', content: first.message }] },
       toolUseResult: { stdout: '', stderr: first.message, interrupted: false },
     })}\n`);
     appendFileSync(transcript, `${JSON.stringify({ type: 'assistant', timestamp: new Date().toISOString(), message: { role: 'assistant', content: [{ type: 'text', text: first.message }] } })}\n`);
-    expect((await runGuard(payload, { blocking: BL, home })).block).toBe(true);
+    expect((await runGuard(payload, { blocking: BL, home, objectTime: oldObjects })).block).toBe(true);
   });
 
   it('after the harness delivered the block, the same hits do not block again; a new risky edit does', async () => {
     const { repo, home, transcript, payload } = setup();
-    const first = await runGuard(payload, { blocking: BL, home });
+    const first = await runGuard(payload, { blocking: BL, home, objectTime: oldObjects });
     expect(first.block).toBe(true);
     appendFileSync(transcript, `${deliveredLine(first.message!)}\n`);
-    expect((await runGuard(payload, { blocking: BL, home })).block).toBe(false);
+    expect((await runGuard(payload, { blocking: BL, home, objectTime: oldObjects })).block).toBe(false);
 
     const t2 = writeSyntheticTranscript(home, repo, 's-dd', [{ prompt: 'fix t5', at: iso(Date.now() - 120_000), calls: [
       { tool: 'Edit', at: iso(Date.now() - 60_000), input: { file_path: tp(repo), old_string: 'it("t5",()=>{\n', new_string: 'it.skip("t5",()=>{\n' } },
@@ -472,15 +538,15 @@ describe('sec030 #8: a repeat block is skipped only after the harness delivered 
     ] }]);
     appendFileSync(t2, `${deliveredLine(first.message!)}\n`);
     writeFileSync(tp(repo), readFileSync(tp(repo), 'utf8').replace('it("t9"', 'it.skip("t9"'));
-    const again = await runGuard({ ...payload, transcript_path: t2 }, { blocking: BL, home });
+    const again = await runGuard({ ...payload, transcript_path: t2 }, { blocking: BL, home, objectTime: oldObjects });
     expect(again.block).toBe(true);
     expect(again.message).toContain('test/f.test.js');
   });
 
   it('a stop_hook_summary system line also counts as delivered', async () => {
     const { home, transcript, payload } = setup();
-    const first = await runGuard(payload, { blocking: BL, home });
+    const first = await runGuard(payload, { blocking: BL, home, objectTime: oldObjects });
     appendFileSync(transcript, `${JSON.stringify({ type: 'system', subtype: 'stop_hook_summary', timestamp: new Date().toISOString(), hookCount: 1, hookInfos: [{ command: 'why-diff guard' }], hookErrors: [first.message], preventedContinuation: false })}\n`);
-    expect((await runGuard(payload, { blocking: BL, home })).block).toBe(false);
+    expect((await runGuard(payload, { blocking: BL, home, objectTime: oldObjects })).block).toBe(false);
   });
 });
