@@ -8,13 +8,14 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { lstat } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // Guard runs over real repositories (submodules, CLI children) take seconds on Windows runners.
 vi.setConfig({ testTimeout: 30_000 });
-import { runGuard, type GuardOptions } from '../src/guard.js';
+import { runGuard, windowsVolumeCommands, type GuardOptions } from '../src/guard.js';
 import * as gitModule from '../src/git.js';
 import { recordSessionStart } from '../src/session-start.js';
 import type { LabelKind } from '../src/types.js';
@@ -824,4 +825,31 @@ describe('sec035 fix round 1 (A, B, D): submodule file systems and index flags',
       expect(res.message).toContain('lib/test/a.test.js');
     });
   }
+});
+
+describe('sec035 fix round 1 (E, F): the Windows file system type', () => {
+  it('runs PowerShell and fsutil by absolute path, in the temporary directory, without a shell', () => {
+    const cmds = windowsVolumeCommands("C:\\work\\it's\\repo", 'C:\\');
+    expect(cmds.map((c) => path.basename(c.file).toLowerCase())).toEqual(['powershell.exe', 'fsutil.exe']);
+    for (const c of cmds) {
+      expect(path.isAbsolute(c.file) || /^[A-Za-z]:\\/.test(c.file)).toBe(true);
+      expect(c.file.toLowerCase()).toContain('system32');
+      expect(c.options.cwd).toBe(os.tmpdir());
+      expect(c.options.shell).toBe(false);
+      expect(c.options.windowsHide).toBe(true);
+    }
+    // The path is one single-quoted PowerShell string (quotes doubled).
+    expect(cmds[0]!.args.join(' ')).toContain("-FilePath 'C:\\work\\it''s\\repo'");
+  });
+
+  it.skipIf(posix)('a test directory replaced by a junction is a deletion (junctions are never followed)', async () => {
+    const x = repo();
+    const kept = path.join(temp('wd-s35-junc-'), 'kept');
+    renameSync(path.join(x.repo, 'test'), kept);
+    symlinkSync(kept, path.join(x.repo, 'test'), 'junction');
+    expect((await lstat(path.join(x.repo, 'test'))).isSymbolicLink()).toBe(true);
+    const res = await guardRun(x.repo, x.home, (t) => [bash(t, 'tidy.cmd')]);
+    expect(res.block).toBe(true);
+    expect(res.message).toContain(TEST);
+  });
 });
