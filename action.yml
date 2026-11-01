@@ -49,6 +49,11 @@ outputs:
 runs:
   using: composite
   steps:
+    # Provenance the PR author stored with `why-diff notes` and pushed. Missing notes are fine.
+    - name: Fetch why-diff notes
+      shell: bash
+      run: git fetch --quiet origin '+refs/notes/why-diff:refs/notes/why-diff' 2>/dev/null || true
+
     - id: report
       name: Run why-diff
       shell: bash

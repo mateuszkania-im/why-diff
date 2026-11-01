@@ -183,4 +183,11 @@ describe('action.yml', () => {
     expect(yml).toContain('COMMENT_AUTHOR: ${{ inputs.comment-author }}');
     expect(yml).toContain('>> "$GITHUB_STEP_SUMMARY"');
   });
+
+  it('fetches the why-diff notes ref before the report, never failing when it is missing', () => {
+    const fetch = yml.indexOf("git fetch --quiet origin '+refs/notes/why-diff:refs/notes/why-diff'");
+    expect(fetch).toBeGreaterThan(-1);
+    expect(fetch).toBeLessThan(yml.indexOf('- id: report'));
+    expect(yml.slice(fetch, yml.indexOf('\n', fetch))).toContain('|| true');
+  });
 });

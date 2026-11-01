@@ -4,7 +4,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { lstat, readFile, stat } from 'node:fs/promises';
-import type { Harness, Hunk, Report, Session, SessionAdapter } from './types.js';
+import type { Harness, Hunk, Prompt, Report, Session, SessionAdapter } from './types.js';
 import { getDiff, git, mergeBase, hasHead, repoRoot as findRepoRoot, currentBranch, repoName, resolveDefaultTarget, commitTimes, isShallow, worktreeRoots, SHALLOW_HINT, type DiffTarget } from './git.js';
 import { parseUnifiedDiff } from './diff-parse.js';
 import { attribute, repoRelativePath, rootVariants } from './attribute.js';
@@ -17,6 +17,7 @@ import { opencodeAdapter } from './adapters/opencode.js';
 import { redactReport } from './redact.js';
 import { compileGlobs, configChanged, loadConfig, samePath, CONFIG_FILE, type WhyDiffConfig } from './config.js';
 import { createClassifier, classifyHunks, summarizeIntent, type ClassifierKind } from './classify/index.js';
+import { applyNotes, readNotes, NOTE_MODEL, NOTES_REF } from './notes.js';
 
 export const ADAPTERS: Record<Harness, SessionAdapter> = {
   'claude-code': claudeCodeAdapter,
@@ -175,14 +176,32 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
     attributed = kept;
   }
   // Without any transcript every hunk would be "unattributed": noise, not a finding.
-  const mode: Report['mode'] = sessions.length === 0 ? 'risk-scan' : 'provenance';
+  let mode: Report['mode'] = sessions.length === 0 ? 'risk-scan' : 'provenance';
   const texts = await loadConfigTexts(root, target, [...new Set(hunks.filter((h) => h.status !== 'deleted').map((h) => h.file))]);
   const packages = await pythonPackageDirs(root, baseRev, hunks);
   attributed = labelHunks(attributed, { prompts, repoRoot: root, fileText: (p) => texts.get(p), protectedGlob, riskScan: mode === 'risk-scan', rulesFiles, pythonPackage: (d) => packages.has(d) });
   if (mode === 'risk-scan') attributed = attributed.map((h) => ({ ...h, labels: h.labels.filter((l) => l.kind !== 'unattributed') }));
 
+  // No transcripts here: the author may have left provenance as git notes (`why-diff notes`).
+  // They add prompts to the hunks they cover; labels stay the ones computed above from the diff.
+  let reportSessions: Session[] = sessions;
+  let reportPrompts: Prompt[] = prompts;
+  if (mode === 'risk-scan' && attributed.length) {
+    const notes = await readNotes(root, target).catch(() => []);
+    if (notes.length) {
+      const noted = applyNotes(attributed, notes);
+      if (noted.applied > 0) {
+        attributed = noted.hunks;
+        mode = 'notes';
+        reportSessions = noted.sessions;
+        reportPrompts = noted.prompts;
+        log(`read provenance for ${noted.applied} hunk(s) from git notes (${NOTES_REF})`);
+      }
+    }
+  }
+
   const kind = opts.classify ?? 'none';
-  if (kind !== 'none' && attributed.length && mode === 'risk-scan') {
+  if (kind !== 'none' && attributed.length && mode !== 'provenance') {
     log('no agent transcripts, so there are no prompts to check intent against; skipping intent check');
   } else if (kind !== 'none' && attributed.length) {
     const classifier = createClassifier(kind, { model: opts.model, onProgress: (done: number, total: number) => log(`intent check ${done}/${total} batches`) });
@@ -194,9 +213,10 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
     }
   }
 
-  const summary = summarize(attributed, sessions);
+  const summary = summarize(attributed, reportSessions);
   if (ignoredHunks > 0) summary.ignoredHunks = ignoredHunks;
-  if (attributed.some((h) => h.intent)) summary.intent = summarizeIntent(attributed);
+  // A verdict copied from a note is shown, but it is not an intent check that ran here.
+  if (attributed.some((h) => h.intent && h.intent.model !== NOTE_MODEL)) summary.intent = summarizeIntent(attributed);
 
   const usedPromptIds = new Set(attributed.map((h) => h.prompt?.id).filter(Boolean));
   const contributing = contributingSessionIds(attributed);
@@ -220,10 +240,10 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
     range: rangeLabel,
     includesWorkingTree: typeof target !== 'string',
     mode,
-    sessions: sessions
+    sessions: reportSessions
       .filter((s) => contributing.has(s.id))
       .map(({ id, harness, path: p, startedAt, endedAt, title }) => ({ id, harness, path: tildify(p, home), startedAt, endedAt, title })),
-    prompts: prompts.filter((p) => usedPromptIds.has(p.id)),
+    prompts: reportPrompts.filter((p) => usedPromptIds.has(p.id)),
     edits,
     hunks: reportHunks,
     summary,

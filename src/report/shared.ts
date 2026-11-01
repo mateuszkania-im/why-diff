@@ -139,6 +139,9 @@ export function describeSessions(report: Report): string {
 /** One-line explanation printed under the heading of a risk scan. */
 export const RISK_SCAN_NOTE = 'No agent transcripts here, so lines are not traced to prompts. The PR author can add provenance with `why-diff pr`.';
 
+/** One-line explanation printed under the heading when provenance came from git notes. */
+export const NOTES_NOTE = 'No agent transcripts here: prompts come from the author\'s git notes (refs/notes/why-diff). Labels are computed from the diff; hunks no note covers are only risk-scanned.';
+
 /** What to try when a report has no sessions. */
 export const NO_SESSIONS_HINT = 'check the harness (--harness), the time window (--since), pass --session <file>, or use --scan-all for sessions run from another folder';
 

@@ -183,6 +183,8 @@ export interface AttributedHunk {
   prompt?: Prompt;
   labels: Label[];
   intent?: IntentVerdict;
+  /** `notes`: prompt, match and verdict come from the author's git note (`refs/notes/why-diff`), not from transcripts */
+  source?: 'notes';
 }
 
 /** Aggregates for the report header. */
@@ -252,8 +254,10 @@ export interface Report {
    * `provenance`: agent sessions were found and hunks are traced to prompts.
    * `risk-scan`: no transcripts at all (a reviewer's machine, CI), so only the
    * deterministic labels apply and `unattributed` labels are dropped.
+   * `notes`: no transcripts, but the author's git notes (`refs/notes/why-diff`) attributed some
+   * hunks (marked `source: 'notes'`); the rest is a risk scan. Labels are still computed here.
    */
-  mode: 'provenance' | 'risk-scan';
+  mode: 'provenance' | 'risk-scan' | 'notes';
   /** Sessions that contributed to this diff (see `Summary.sessionsFound` for the number discovered) */
   sessions: Pick<Session, 'id' | 'harness' | 'path' | 'startedAt' | 'endedAt' | 'title'>[];
   /** Prompts that own at least one hunk */

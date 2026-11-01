@@ -19,6 +19,7 @@ import {
   NO_SESSIONS_HINT,
   plural,
   RISK_SCAN_NOTE,
+  NOTES_NOTE,
   shortDateTime,
   shortSession,
   shortTime,
@@ -115,6 +116,10 @@ function build(report: Report, o: BuildOpts): string {
   } else {
     out.push(`${H} Provenance`);
     out.push('');
+    if (report.mode === 'notes') {
+      out.push(text(NOTES_NOTE));
+      out.push('');
+    }
     const headlineBits = [h.noAddedLines ? 'no added lines' : `**${h.tracedPct}%** of added lines trace to a prompt`];
     if (h.intentRan) headlineBits.push(h.unrequestedHunks === 0 ? 'nothing unrequested' : `**${h.unrequestedHunks}** ${h.unrequestedHunks === 1 ? 'hunk' : 'hunks'} nobody asked for`);
     headlineBits.push(h.touchedTests ? '**tests touched**' : 'tests untouched');

@@ -8,8 +8,9 @@ the same comment instead of adding new ones.
 
 CI has no agent transcripts, so the action runs in **risk-scan mode**: lines are
 not traced to prompts and nothing is reported as unattributed. To show reviewers
-which prompt wrote which hunk, the PR author runs `why-diff pr` on their own
-machine, where the transcripts live (see below).
+which prompt wrote which hunk, the PR author either runs `why-diff notes` and
+pushes the notes ref (the action then reads it, see below), or runs `why-diff pr`
+on their own machine, where the transcripts live.
 
 ## Example workflow
 
@@ -91,6 +92,37 @@ Do not switch the workflow to `pull_request_target` to get a write token for
 forks. That event runs with a write token and your secrets, and diffing the PR
 means checking out the fork's code (including its git config, hooks and
 scripts), so untrusted code would run with write access to your repository.
+
+## Provenance from the PR author: `why-diff notes`
+
+The action starts by fetching `refs/notes/why-diff` from `origin`
+(`git fetch origin '+refs/notes/why-diff:refs/notes/why-diff' || true`; a
+missing ref is fine). When the author stored provenance there, the report runs
+in **notes mode**: hunks a note covers show the prompt that produced them, the
+rest of the diff stays a plain risk scan.
+
+On the PR branch, where the transcripts live:
+
+```sh
+npx github:mateuszkania-im/why-diff notes      # git note on HEAD
+git push origin refs/notes/why-diff            # share it
+```
+
+- The note is compact JSON per hunk: file, new line range, match, intent verdict
+  (when `--classify` ran earlier it is not rerun here), label kinds, and the
+  prompt text (cut to 1500 characters, secrets masked; `--redact-prompts`
+  leaves it out) with its session id and harness.
+- `--dry-run` prints the JSON instead of writing it. `--base`, `--harness`,
+  `--session`, `--since` and `--scan-all` work as in the main command.
+- The note sits on the commit that was HEAD. Commit again (or rebase) and run
+  `why-diff notes` again, then push the notes ref again. The newest note in the
+  PR's commits wins for each hunk.
+- Notes are untrusted input to the action: notes over 1 MB are ignored, the
+  shape is validated, text is sanitised. Labels and `fail-on` come only from the
+  diff; a note adds prompt information and never removes a finding.
+  `fail-on: unattributed` still does not apply.
+- Pushing to `refs/notes/why-diff` needs write access to the repository, so a
+  contributor from a fork cannot add notes there; use `why-diff pr` instead.
 
 ## Provenance from the PR author: `why-diff pr`
 

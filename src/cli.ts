@@ -20,6 +20,7 @@ import { git, repoRoot } from './git.js';
 import { runGuard, type GuardPayload } from './guard.js';
 import type { ClassifierKind } from './classify/index.js';
 import { ghRunner, PR_BODY_LIMIT, readPrBody, sectionBudget, upsertSection, writePrBody } from './pr.js';
+import { noteFromReport, writeNote, NOTES_REF } from './notes.js';
 
 const HARNESSES: Harness[] = ['claude-code', 'codex', 'opencode'];
 const CLASSIFIERS: ClassifierKind[] = ['auto', 'claude-cli', 'anthropic', 'openai'];
@@ -124,19 +125,19 @@ program
     if (failChecks.length) {
       const s = report.summary;
       if (failChecks.includes('unrequested') && report.hunks.length > 0 && !s.intent) {
-        const why = report.mode === 'risk-scan'
+        const why = report.mode !== 'provenance'
           ? 'no agent transcripts, so there are no prompts to check against'
           : 'no LLM backend available: install Claude Code, or set ANTHROPIC_API_KEY / OPENAI_API_KEY';
         throw new Error(`--fail-on unrequested: the intent check did not run (${why})`);
       }
-      if (failChecks.includes('unattributed') && report.mode === 'risk-scan') {
-        process.stderr.write(pc.yellow('why-diff: --fail-on unattributed ignored: no agent transcripts here, so nothing can be attributed\n'));
+      if (failChecks.includes('unattributed') && report.mode !== 'provenance') {
+        process.stderr.write(pc.yellow('why-diff: --fail-on unattributed ignored: no agent transcripts here, so nothing can be attributed (git notes are not a gate)\n'));
       }
       const failed = failChecks.filter((c) =>
         (c === 'risk' && report.hunks.some((h) => h.labels.some((l) => l.severity === 'risk'))) ||
         (c === 'unrequested' && (s.intent?.unrequested ?? 0) > 0) ||
         (c === 'tests' && s.touchedTests) ||
-        (c === 'unattributed' && report.mode !== 'risk-scan' && (s.unattributedLines > 0 || s.unattributedBinaryFiles > 0)));
+        (c === 'unattributed' && report.mode === 'provenance' && (s.unattributedLines > 0 || s.unattributedBinaryFiles > 0)));
       if (failed.length) {
         process.stderr.write(pc.red(`why-diff: failing on ${failed.join(', ')}\n`));
         process.exitCode = 1;
@@ -207,6 +208,44 @@ program
     }
     await writePrBody(gh, next);
     progress('updated the pull request body');
+  });
+
+/**
+ * `why-diff notes`: store the branch's provenance as a git note on HEAD (refs/notes/why-diff), so
+ * reviewers and CI without the transcripts see which prompt produced each hunk once the notes ref
+ * is pushed. Never pushes.
+ */
+program
+  .command('notes')
+  .description(`store the branch's provenance as a git note on HEAD (${NOTES_REF}); never pushes`)
+  .option('--base <ref>', 'branch or ref to compare against (default: auto-detected)')
+  .option('--harness <list>', 'comma list of harnesses: claude-code,codex,opencode')
+  .option('-s, --session <files...>', 'explicit transcript file(s) instead of auto-discovery')
+  .option('--since <date>', 'only consider sessions after this date (ISO)')
+  .option('--scan-all', 'also scan transcripts started outside the repo that edited files in it; slower')
+  .option('--redact-prompts', 'omit prompt text from the note (secrets are always masked)')
+  .option('--dry-run', 'print the note JSON instead of writing it')
+  .option('-q, --quiet', 'no progress output')
+  .action(async (o: Record<string, unknown>) => {
+    const progress = (msg: string) => { if (!o.quiet) process.stderr.write(pc.dim(`· ${terminalSafe(msg)}\n`)); };
+    const built = await buildReport({
+      base: o.base as string | undefined,
+      committedOnly: true,
+      harnesses: parseHarnesses(o.harness),
+      sessionFiles: o.session as string[] | undefined,
+      since: parseSince(o.since),
+      scanAll: Boolean(o.scanAll),
+      onProgress: progress,
+    });
+    if (built.mode !== 'provenance') throw new Error('no agent transcripts found for this branch, so there is no provenance to record (try --session, --since or --scan-all)');
+    const note = noteFromReport(o.redactPrompts ? redactReport(built, 'prompts') : built);
+    if (o.dryRun) {
+      process.stdout.write(`${JSON.stringify(note, null, 2)}\n`);
+      return;
+    }
+    const sha = await writeNote(await repoRoot(process.cwd()), note);
+    process.stdout.write(`why-diff: stored provenance for ${note.hunks.length} hunk(s) as a git note on ${sha.slice(0, 12)} (${NOTES_REF})\n`);
+    process.stdout.write(`share it with: git push origin ${NOTES_REF}\n`);
   });
 
 /**

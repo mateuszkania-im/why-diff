@@ -16,6 +16,7 @@ import {
   NO_SESSIONS_HINT,
   plural,
   RISK_SCAN_NOTE,
+  NOTES_NOTE,
   riskRef,
   shortDate,
   shortDateTime,
@@ -138,6 +139,7 @@ export function renderTerminal(untrusted: Report, opts: TerminalOptions = {}): s
     ];
     for (const row of wrapParts(meta.map((m): Seg[] => [[m, dim]]), width - 2)) line(['  ', id], ...row);
   } else {
+    if (report.mode === 'notes') for (const row of wrapWords(NOTES_NOTE, width - 2)) line(['  ', id], [row, c.yellow]);
     const pctStyle: Style = h.tracedPct >= 90 ? c.green : h.tracedPct >= 60 ? c.yellow : c.red;
     const parts: Seg[][] = [];
     parts.push(h.noAddedLines
