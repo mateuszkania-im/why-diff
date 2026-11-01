@@ -10597,12 +10597,12 @@ async function guard(payload, opts, state, notes) {
   if (!gitEntry)
     return await startedInRepository(payload, cwd, opts.statTime ?? changeTime, opts.pathStat ?? lstatOf), NO_BLOCK;
   state.relevant = !0;
-  let statTime = opts.statTime ?? changeTime, pathStat = opts.pathStat ?? lstatOf, metaTimes = await gitMetaTimes(gitEntry, statTime, pathStat), sessionId = payload.session_id, record = sessionId ? await readBaseRecord(sessionId, statTime, pathStat) : void 0, session = await claudeCodeAdapter.parse(payload.transcript_path);
+  let statTime = opts.statTime ?? changeTime, pathStat = opts.pathStat ?? lstatOf, metaTimes = await gitMetaTimes(path12.dirname(gitEntry), gitEntry, statTime, pathStat), sessionId = payload.session_id, record = sessionId ? await readBaseRecord(sessionId, statTime, pathStat) : void 0, session = await claudeCodeAdapter.parse(payload.transcript_path);
   if (state.relevant = session.edits.some((e) => !e.failed) || (session.toolWindows?.length ?? 0) > 0, !state.relevant) return NO_BLOCK;
   let root = await repoRoot(cwd), real = (p) => realpath7(p).catch(() => path12.resolve(p)), commonDir = await gitCommonDir(root), objectTime = onDevice(opts.objectTime ?? changeTime, pathStat, await deviceOf(commonDir, pathStat));
   if (await real(root) !== await real(path12.dirname(gitEntry)))
     throw new FailClosedError(`git reports the work tree at ${root}, not at ${path12.dirname(gitEntry)} where the .git entry is (core.worktree or a .git file points elsewhere)`);
-  let windows = windowCheck(session), recordedHead, indexBase, recordedSubmodules, fsType = opts.fsType ?? fileSystemType, markers = sessionId ? await transcriptMarkers(payload.transcript_path, sessionId).catch(() => ({ ok: !0, failed: !0 })) : { ok: !1, failed: !1 };
+  let windows = windowCheck(session), recordedHead, indexBase, recordedSubmodules, devicesRecorded = !1, fsType = opts.fsType ?? fileSystemType, markers = sessionId ? await transcriptMarkers(payload.transcript_path, sessionId).catch(() => ({ ok: !0, failed: !0 })) : { ok: !1, failed: !1 };
   if (markers.failed) throw new FailClosedError("base record could not be written at session start (the SessionStart hook said so); the session's base cannot be trusted");
   if (record) {
     if (!windows) throw new FailClosedError(`the session's base record cannot be dated: no tool call of this session has a readable time (${record.file})`);
@@ -10616,11 +10616,13 @@ async function guard(payload, opts, state, notes) {
       notes.push(`base record is for another repository (${record.data.root}); this session now works in ${root}, so the base comes from the reflogs`);
     } else {
       let devs = record.data;
-      if (typeof devs.rootDev == "number" && typeof devs.gitDev == "number")
+      if (typeof devs.rootDev == "number" && typeof devs.gitDev == "number") {
         for (let [what, p, was] of [["repository root", await real(root), devs.rootDev], ["git dir", commonDir, devs.gitDev]]) {
           let now = await deviceOf(p, pathStat);
           if (now !== was) throw new FailClosedError(`the ${what} (${p}) is on another file system than at session start (device ${was} then, ${now ?? "unreadable"} now): a file system mounted over it can report any change time`);
         }
+        devicesRecorded = !0;
+      }
       if (typeof devs.dataDirDev == "number") {
         let now = await deviceOf(path12.dirname(record.file), pathStat);
         if (now !== devs.dataDirDev) throw new FailClosedError(`the base record directory (${path12.dirname(record.file)}) is on another file system than at session start (device ${devs.dataDirDev} then, ${now ?? "unreadable"} now)`);
@@ -10645,10 +10647,15 @@ async function guard(payload, opts, state, notes) {
       notes.push("no SessionStart base record; the base comes from the reflogs");
     }
   }
-  record && await trustedFileSystem(record.file, "the base record", fsType), await trustedFileSystem(root, "the repository", fsType), await trustedFileSystem(commonDir, "the git dir", fsType);
+  let userMount = opts.userMount ?? userMountOf, gitDir = await absoluteGitDir(root);
+  if (process.platform === "win32" && !opts.fsType && await prefetchWindowsTypes([root, commonDir, gitDir, ...record ? [record.file] : []]), record && (await trustedFileSystem(record.file, "the base record", fsType, userMount), await trustedFileSystem(path12.dirname(record.file), "the base record directory", fsType, userMount)), await trustedFileSystem(root, "the repository", fsType, userMount), await trustedFileSystem(commonDir, "the git dir", fsType, userMount), gitDir !== commonDir && await trustedFileSystem(gitDir, "the worktree git dir", fsType, userMount), !devicesRecorded)
+    for (let [what, dir] of [["repository root", await real(root)], ["git dir", await real(commonDir)]]) {
+      let [here, up] = await Promise.all([deviceOf(dir, pathStat), deviceOf(path12.dirname(dir), pathStat)]);
+      if (here === void 0 || here !== up) throw new FailClosedError(`unreviewed: the ${what} (${dir}) is the root of its own volume, and no SessionStart record kept its device, so a volume mounted over it during the session cannot be ruled out`);
+    }
   let baseRev = "HEAD", headed = await hasHead(root);
   headed && (baseRev = await sessionBase(root, Date.parse(session.startedAt), objectTime, recordedHead));
-  let config = await loadConfig(root, baseRev).catch(() => ({})), blocking = opts.blocking ?? /* @__PURE__ */ new Set([...DEFAULT_BLOCK_ON, ...config.blockOn ?? []]), protectedGlob = compileGlobs(config.protected), ctx = { payload, opts, session, windows, statTime, pathStat, rawObjectTime: opts.objectTime ?? changeTime, config, blocking, protectedGlob, recordedSubmodules, fsType, gitDev: await deviceOf(commonDir, pathStat) }, hits = await checkRepository(ctx, { root, baseRev, headed, indexBase, metaTimes, prefix: "", depth: 0 });
+  let config = await loadConfig(root, baseRev).catch(() => ({})), blocking = opts.blocking ?? /* @__PURE__ */ new Set([...DEFAULT_BLOCK_ON, ...config.blockOn ?? []]), protectedGlob = compileGlobs(config.protected), ctx = { payload, opts, session, windows, statTime, pathStat, rawObjectTime: opts.objectTime ?? changeTime, config, blocking, protectedGlob, recordedSubmodules, fsType, userMount, gitDev: await deviceOf(commonDir, pathStat) }, hits = await checkRepository(ctx, { root, baseRev, headed, indexBase, metaTimes, prefix: "", depth: 0 });
   return hits.length ? blocked(payload.transcript_path, hits) : NO_BLOCK;
 }
 var MAX_SUBMODULE_DEPTH = 3;
@@ -10793,7 +10800,7 @@ async function checkSubmodules(ctx, repo, layeredActive) {
     }
     let subHeaded = await hasHead(subRoot), prefixed = `${prefix}${p}/`, key = `${prefix}${p}`, subCommon = await gitCommonDir(subRoot);
     try {
-      await trustedFileSystem(subRoot, `submodule ${key}`, ctx.fsType), await trustedFileSystem(subCommon, `the git dir of submodule ${key}`, ctx.fsType);
+      await trustedFileSystem(subRoot, `submodule ${key}`, ctx.fsType, ctx.userMount), await trustedFileSystem(subCommon, `the git dir of submodule ${key}`, ctx.fsType, ctx.userMount);
     } catch (err) {
       unreviewed(p, `is on an untrusted file system (${err.message.replace(/^unreviewed: /, "")})`);
       continue;
@@ -10821,7 +10828,7 @@ async function checkSubmodules(ctx, repo, layeredActive) {
       for (let hit of await checkSubmodules(ctx, unchanged, !1)) hits.includes(hit) || hits.push(hit);
       continue;
     }
-    let metaTimes = await gitMetaTimes(gitEntry, ctx.statTime, ctx.pathStat), w = ctx.windows, quiet = !(w && metaTimes.some((t) => w.inWindow(t) || t > w.lastEnd)), candidates;
+    let metaTimes = await gitMetaTimes(subRoot, gitEntry, ctx.statTime, ctx.pathStat), w = ctx.windows, quiet = !(w && metaTimes.some((t) => w.inWindow(t) || t > w.lastEnd)), candidates;
     if (quiet && (candidates = await candidatePaths(), !candidates.size && !named)) {
       let unchanged = { root: subRoot, baseRev: subHeaded ? "HEAD" : await emptyTree(subRoot), headed: subHeaded, metaTimes, prefix: prefixed, depth: depth + 1 };
       for (let hit of await checkSubmodules(ctx, unchanged, !1)) hits.includes(hit) || hits.push(hit);
@@ -10912,18 +10919,19 @@ async function findGitEntry(dir) {
     if (path12.dirname(d) === d) return null;
   }
 }
-async function gitMetaTimes(gitEntry, statTime, pathStat) {
-  let gitDir = gitEntry;
+async function gitMetaTimes(workTree, gitEntry, statTime, pathStat) {
+  let UNKNOWN = [1 / 0], linkTimes = [];
+  (await lstat4(gitEntry).catch(() => {
+  }))?.isSymbolicLink() && linkTimes.push(await statTime(gitEntry).catch(() => 1 / 0));
+  let gitDir, common;
   try {
-    if (!(await lstat4(gitEntry)).isDirectory()) {
-      let m = /^gitdir:\s*(.+?)\s*$/m.exec(await readFile8(gitEntry, "utf8"));
-      if (!m) return [];
-      gitDir = path12.resolve(path12.dirname(gitEntry), m[1]);
-    }
+    let [g = "", c = ""] = (await git(workTree, ["rev-parse", "--absolute-git-dir", "--git-common-dir"])).split(`
+`);
+    gitDir = await realpath7(path12.resolve(workTree, g)), common = await realpath7(path12.resolve(workTree, c));
   } catch {
-    return [];
+    return UNKNOWN;
   }
-  let common = await readFile8(path12.join(gitDir, "commondir"), "utf8").then((c) => path12.resolve(gitDir, c.trim()), () => gitDir), anchored = async (dir) => {
+  let anchored = async (dir) => {
     let timeOf = onDevice(statTime, pathStat, await deviceOf(dir, pathStat));
     return (p) => timeOf(p).then((t) => t, () => {
     });
@@ -10937,7 +10945,8 @@ async function gitMetaTimes(gitEntry, statTime, pathStat) {
     files.push(t(dir));
     for (let f of await readdir4(dir).catch(() => [])) files.push(t(path12.join(dir, f)));
   }
-  return (await Promise.all(files)).filter((t) => t !== void 0);
+  let times = (await Promise.all(files)).filter((t) => t !== void 0);
+  return times.length ? [...linkTimes, ...times] : UNKNOWN;
 }
 async function transcriptMarkers(transcript, sessionId) {
   let found = { ok: !1, failed: !1 };
@@ -10997,6 +11006,9 @@ async function changeTime(p) {
 async function gitCommonDir(root) {
   return path12.resolve(root, await git(root, ["rev-parse", "--git-common-dir"]));
 }
+async function absoluteGitDir(root) {
+  return path12.resolve(root, await git(root, ["rev-parse", "--absolute-git-dir"]));
+}
 var TRUSTED_FS = /* @__PURE__ */ new Set(["apfs", "hfs", "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "ntfs", "refs", "tmpfs", "overlay"]), LINUX_FS = /* @__PURE__ */ new Map([
   [61267, "ext4"],
   [1481003842, "xfs"],
@@ -11014,22 +11026,59 @@ var TRUSTED_FS = /* @__PURE__ */ new Set(["apfs", "hfs", "ext2", "ext3", "ext4",
   [20859, "smbfs"],
   [4283649346, "cifs"],
   [4266872130, "smb2"]
-]), darwinMounts;
-function darwinMountTypes() {
-  return darwinMounts ??= new Promise((resolve, reject) => execFile3("/sbin/mount", [], { encoding: "utf8" }, (err, out) => err ? reject(err) : resolve(out))).then(async (out) => {
-    let types = /* @__PURE__ */ new Map();
-    for (let line of out.split(`
-`)) {
-      let m = /^(\/dev\/\S+) on .+ \(([^,)]+)/.exec(line);
-      if (!m) continue;
-      let rdev = await stat5(m[1]).then((st) => Number(st.rdev), () => {
+]), mountTable;
+function mounts() {
+  mountTable ??= (async () => {
+    if (process.platform === "darwin")
+      return (await new Promise((resolve, reject) => execFile3("/sbin/mount", [], { encoding: "utf8", cwd: os9.tmpdir(), shell: !1 }, (err, o) => err ? reject(err) : resolve(o)))).split(`
+`).map((line) => /^(.+?) on (.+) \(([^)]*)\)\s*$/.exec(line)).filter((m) => m !== null).map((m) => {
+        let options = m[3].split(",").map((o) => o.trim());
+        return { source: m[1], mountPoint: m[2], type: options[0] ?? "", options: options.slice(1) };
       });
-      rdev !== void 0 && !types.has(rdev) && types.set(rdev, m[2]);
+    if (process.platform === "linux") {
+      let unescape = (v) => v.replace(/\\([0-7]{3})/g, (_, o) => String.fromCharCode(parseInt(o, 8)));
+      return (await readFile8("/proc/self/mountinfo", "utf8")).split(`
+`).filter(Boolean).map((line) => {
+        let [left = "", right = ""] = line.split(" - "), f = left.split(" "), [type = "", source = "", superOptions = ""] = right.split(" ");
+        return { source: unescape(source), mountPoint: unescape(f[4] ?? ""), type, options: [...(f[5] ?? "").split(","), ...superOptions.split(",")] };
+      });
+    }
+    return [];
+  })();
+  let table = mountTable;
+  return setTimeout(() => {
+    mountTable === table && (mountTable = void 0);
+  }, 2e3).unref(), table;
+}
+async function userMountOf(p) {
+  if (process.platform !== "darwin" && process.platform !== "linux") return;
+  let real = await realpath7(p), best;
+  for (let m of await mounts()) {
+    let mp = m.mountPoint;
+    (real === mp || real.startsWith(mp.endsWith("/") ? mp : `${mp}/`)) && (!best || mp.length > best.mountPoint.length) && (best = m);
+  }
+  if (!best) throw new Error(`no mount found for ${real}`);
+  let describe = `${best.source} on ${best.mountPoint} (${[best.type, ...best.options].join(", ")})`;
+  if (process.platform === "darwin")
+    return best.options.some((o) => o.startsWith("mounted by")) || best.options.includes("nobrowse") && !best.mountPoint.startsWith("/System/Volumes/") || /disk image/i.test(best.options.join(",")) ? describe : void 0;
+  if (best.type.startsWith("fuse") || best.options.includes("uhelper=udisks2") || /^\/(run\/)?media\//.test(`${best.mountPoint}/`)) return describe;
+}
+var darwinMounts;
+function darwinMountTypes() {
+  darwinMounts ??= mounts().then(async (table2) => {
+    let types = /* @__PURE__ */ new Map();
+    for (let m of table2) {
+      if (!m.source.startsWith("/dev/")) continue;
+      let rdev = await stat5(m.source).then((st) => Number(st.rdev), () => {
+      });
+      rdev !== void 0 && !types.has(rdev) && types.set(rdev, m.type);
     }
     return types;
-  }), setTimeout(() => {
-    darwinMounts = void 0;
-  }, 2e3).unref(), darwinMounts;
+  });
+  let table = darwinMounts;
+  return setTimeout(() => {
+    darwinMounts === table && (darwinMounts = void 0);
+  }, 2e3).unref(), table;
 }
 var fsTypes = /* @__PURE__ */ new Map();
 function fileSystemType(p) {
@@ -11046,33 +11095,50 @@ async function readFileSystemType(p) {
   let { type } = await statfs(p);
   return LINUX_FS.get(type) ?? `unknown (0x${type.toString(16)})`;
 }
-function windowsVolumeCommand(realPath) {
+function windowsVolumeCommand(realPaths) {
   let system32 = path12.join(process.env.SystemRoot ?? "C:\\Windows", "System32");
   return {
     file: path12.join(system32, "WindowsPowerShell", "v1.0", "powershell.exe"),
     args: ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_VOLUME_SCRIPT],
-    options: { cwd: os9.tmpdir(), windowsHide: !0, shell: !1, encoding: "utf8", timeout: 2e4, env: { ...process.env, WD_PATH: realPath } }
+    options: { cwd: os9.tmpdir(), windowsHide: !0, shell: !1, encoding: "utf8", timeout: 3e4, env: { ...process.env, WD_PATHS: realPaths.join(`
+`) } }
   };
 }
-var WINDOWS_VOLUME_SCRIPT = '$v = Get-Volume -FilePath $env:WD_PATH -ErrorAction Stop; "$($v.FileSystemType)|$($v.DriveType)"', windowsVolumes = /* @__PURE__ */ new Map();
-async function windowsFileSystemType(p) {
+var WINDOWS_VOLUME_SCRIPT = '$env:WD_PATHS -split "`n" | ForEach-Object { try { $v = Get-Volume -FilePath $_ -ErrorAction Stop; "$($v.FileSystemType)|$($v.DriveType)" } catch { "ERROR|" } }', windowsVolumes = /* @__PURE__ */ new Map();
+async function windowsRealPath(p) {
   let real = await new Promise((resolve, reject) => realpathNative(p, (err, out) => err ? reject(err) : resolve(out)));
   if (/^\\\\/.test(real)) throw new Error(`${real} is a UNC or network path`);
   if (!/^[A-Za-z]:[\\/]/.test(real)) throw new Error(`${real} is not on a local drive`);
-  let dev = Number((await stat5(real)).dev), t = windowsVolumes.get(dev);
-  if (!t) {
-    let c = windowsVolumeCommand(real);
-    t = new Promise((resolve, reject) => execFile3(c.file, c.args, c.options, (err, out) => err ? reject(err) : resolve(String(out)))).then((out) => {
-      let m = /^(\w+)\|(\w*)\s*$/m.exec(out.trim());
-      if (!m) throw new Error("no file system in Get-Volume output");
-      if (!/^(fixed|removable)$/i.test(m[2])) throw new Error(`drive type ${m[2] || "unknown"}`);
-      let fs2 = m[1].toLowerCase();
-      return fs2 === "ntfs" || fs2 === "refs" ? fs2 : `${fs2} (Windows)`;
-    }), windowsVolumes.set(dev, t), t.catch(() => windowsVolumes.delete(dev));
-  }
+  return real;
+}
+async function prefetchWindowsTypes(paths) {
+  let reals = [...new Set(await Promise.all(paths.map((p) => windowsRealPath(p).catch(() => {
+  }))))].filter((r) => r !== void 0 && !windowsVolumes.has(r));
+  if (!reals.length) return;
+  let c = windowsVolumeCommand(reals), run = new Promise((resolve, reject) => execFile3(c.file, c.args, c.options, (err, out) => err ? reject(err) : resolve(String(out).split(/\r?\n/).filter((l) => l.includes("|")))));
+  reals.forEach((r, i) => {
+    let t = run.then((lines) => windowsTypeOf(lines[i]));
+    windowsVolumes.set(r, t), t.catch(() => windowsVolumes.delete(r)), setTimeout(() => {
+      windowsVolumes.get(r) === t && windowsVolumes.delete(r);
+    }, 5e3).unref();
+  }), await run.catch(() => {
+  });
+}
+function windowsTypeOf(line) {
+  let m = /^(\w+)\|(\w*)\s*$/.exec((line ?? "").trim());
+  if (!m || m[1] === "ERROR") throw new Error("Get-Volume could not read the volume");
+  if (!/^(fixed|removable)$/i.test(m[2])) throw new Error(`drive type ${m[2] || "unknown"}`);
+  let fs2 = m[1].toLowerCase();
+  return fs2 === "ntfs" || fs2 === "refs" ? fs2 : `${fs2} (Windows)`;
+}
+async function windowsFileSystemType(p) {
+  let real = await windowsRealPath(p);
+  windowsVolumes.has(real) || await prefetchWindowsTypes([real]);
+  let t = windowsVolumes.get(real);
+  if (!t) throw new Error(`Get-Volume could not read the volume of ${real}`);
   return t;
 }
-async function trustedFileSystem(p, what, fsType) {
+async function trustedFileSystem(p, what, fsType, userMount = userMountOf) {
   let type;
   try {
     type = await fsType(p);
@@ -11080,6 +11146,13 @@ async function trustedFileSystem(p, what, fsType) {
     throw new FailClosedError(`unreviewed: cannot tell which file system ${what} is on (${p}: ${err.message}), so its change times cannot be trusted`);
   }
   if (!TRUSTED_FS.has(type.toLowerCase())) throw new FailClosedError(`unreviewed: ${what} (${p}) is on a ${type} file system, whose change times can be set without root, so its changes cannot be dated`);
+  let mounted;
+  try {
+    mounted = await userMount(p);
+  } catch (err) {
+    throw new FailClosedError(`unreviewed: cannot tell who mounted the file system ${what} is on (${p}: ${err.message}), so its change times cannot be trusted`);
+  }
+  if (mounted) throw new FailClosedError(`unreviewed: ${what} (${p}) is on a volume a user mounted (${mounted}), whose change times can be written by that user, so its changes cannot be dated`);
 }
 async function lstatOf(p) {
   let st = await lstat4(p);
