@@ -84,6 +84,35 @@ describe('sec031 #1: an error while checking a session that touched the repo blo
     expect(r.block).toBe(true);
   });
 
+  it('a corrupt .git/HEAD after an it.skip edit blocks (git cannot even find the repository)', async () => {
+    const { repo, home, tp } = makeRepo();
+    skipT5(tp);
+    writeFileSync(path.join(repo, '.git', 'HEAD'), 'garbage\n');
+    const r = await guardRun(repo, home, (t) => [editCall(t, tp), bash(t + 5000, 'echo garbage > .git/HEAD')]);
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('why-diff could not check this session');
+  });
+
+  it('a .git file pointing nowhere after an edit blocks', async () => {
+    const { repo, home, tp } = makeRepo();
+    skipT5(tp);
+    rmSync(path.join(repo, '.git'), { recursive: true, force: true });
+    writeFileSync(path.join(repo, '.git'), 'gitdir: /nonexistent/why-diff\n');
+    const r = await guardRun(repo, home, (t) => [editCall(t, tp)]);
+    expect(r.block).toBe(true);
+  });
+
+  it('a plain directory with no repository at or above it does not block', async () => {
+    const dir = temp('wd-s31-plain-');
+    const home = temp('wd-s31-home-');
+    writeFileSync(path.join(dir, 'f.test.js'), testFile());
+    const tp = path.join(dir, 'f.test.js');
+    skipT5(tp);
+    process.env.GIT_CEILING_DIRECTORIES = path.dirname(dir);
+    const r = await guardRun(dir, home, (t) => [editCall(t, tp)]);
+    expect(r.block).toBe(false);
+  });
+
   it('a session that never touched the repo does not block on a broken index', async () => {
     const { repo, home } = makeRepo();
     const fd = openSync(path.join(repo, '.git', 'index'), 'r+');
@@ -264,6 +293,14 @@ describe('sec031 #4: sparse checkout is trusted only from the repository\'s own 
     expect((await guardRun(repo, home, cmd)).block).toBe(true);
   });
 
+  it('core.sparseCheckout enabled in the local config during the session does not excuse a deletion', async () => {
+    const { repo, home, tp } = sparseRepo();
+    sh(repo, ['config', 'core.sparseCheckout', 'true']);
+    flagAndDelete(repo, tp);
+    const objectTime = async (p: string): Promise<number> => (/[\\/]config(\.worktree)?$/.test(p) ? (await lstat(p)).ctimeMs : oldObjects(p));
+    expect((await guardRun(repo, home, (t) => [bash(t, `git config core.sparseCheckout true && git update-index --skip-worktree ${TEST} && rm ${TEST}`)], { objectTime })).block).toBe(true);
+  });
+
   it('control: the same sparse checkout in the local config, set up before the session, excuses the missing file', async () => {
     const { repo, home, tp } = sparseRepo();
     sh(repo, ['config', 'core.sparseCheckout', 'true']);
@@ -316,7 +353,7 @@ describe('sec031 #5/#6: only files the sparse patterns leave out may be missing'
     expect(r.block).toBe(true);
   });
 
-  it('touching the config and the repo root during the session does not turn out-of-cone files into deletions', async () => {
+  it('touching the repo root during the session does not turn out-of-cone files into deletions', async () => {
     const { repo, home } = makeRepo((r) => {
       mkdirSync(path.join(r, 'vendor', 'pkg'), { recursive: true });
       writeFileSync(path.join(r, 'vendor', 'pkg', 'x.test.js'), testFile());
@@ -325,16 +362,14 @@ describe('sec031 #5/#6: only files the sparse patterns leave out may be missing'
       sh(r, ['sparse-checkout', 'set', '--cone', 'src', 'test']);
     });
     expect(() => readFileSync(path.join(repo, 'vendor', 'pkg', 'x.test.js'))).toThrow();
-    sh(repo, ['config', 'core.editor', 'vi']);
     let callAt = 0;
-    // The config file and the repo root (where notes.md was written) changed during the call.
-    const objectTime = async (p: string): Promise<number> => (/[\\/]config(\.worktree)?$/.test(p) ? callAt + 1000 : oldObjects(p));
+    // The repo root (where notes.md was written) changed during the call.
     const statTime = async (p: string): Promise<number> => (path.resolve(p) === path.resolve(repo) ? callAt + 1000 : (await lstat(p)).ctimeMs);
     writeFileSync(path.join(repo, 'notes.md'), 'x\n');
     const r = await guardRun(repo, home, (t) => {
       callAt = t;
-      return [bash(t, 'git config core.editor vi && touch notes.md')];
-    }, { objectTime, statTime });
+      return [bash(t, 'touch notes.md')];
+    }, { statTime });
     expect(r.hits).toEqual([]);
     expect(r.block).toBe(false);
   });

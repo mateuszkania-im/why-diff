@@ -602,13 +602,11 @@ async function pathspecMatcher(root: string, pathspecs: readonly string[], rev: 
  * git's sparse matcher does, and no per-directory `.gitignore`).
  *
  * With `trust` (the guard), only the repository's own config counts: `core.sparseCheckout` and
- * `core.sparseCheckoutCone` from the local or worktree scope, where a file included into that config
- * must have changed before `trust.before`; and the patterns file too. The repository's own config
- * file is exempt from the time check: every `git config`, `git remote`, `git branch -u` rewrites it,
- * and what it can switch on is limited to files the earlier patterns leave out.
+ * `core.sparseCheckoutCone` from the local or worktree scope, whose file (the repository's config,
+ * `config.worktree`, or a file included into it) last changed before `trust.before`; and the
+ * patterns file too. Otherwise no sparse exclusion is honoured: a missing file is a deletion.
  */
 export async function sparseExcluded(root: string, trust?: SparseTrust): Promise<((file: string) => boolean) | null> {
-  const own = trust ? await Promise.all(['config', 'config.worktree'].map(async (n) => samePathKey(path.resolve(root, await git(root, ['rev-parse', '--git-path', n]))))) : [];
   const setting = async (key: string): Promise<{ value: boolean; trusted: boolean } | undefined> => {
     let out: string;
     try {
@@ -621,7 +619,6 @@ export async function sparseExcluded(root: string, trust?: SparseTrust): Promise
     if (!trust) return { value: value === 'true', trusted: true };
     if ((scope !== 'local' && scope !== 'worktree') || !origin.startsWith('file:')) return { value: value === 'true', trusted: false };
     const file = path.resolve(root, origin.slice('file:'.length));
-    if (own.includes(samePathKey(file))) return { value: value === 'true', trusted: true };
     const t = await trust.timeOf(file).catch(() => Infinity);
     return { value: value === 'true', trusted: t < trust.before };
   };
@@ -648,12 +645,6 @@ export async function sparseExcluded(root: string, trust?: SparseTrust): Promise
   // Every tracked file the patterns match (are checked out); the rest are left out.
   const included = new Set((await git(root, ['-c', `core.ignoreCase=${icase}`, 'ls-files', '-z', '--cached', '--ignored', '--exclude-from', file], { trim: false })).split('\0').filter(Boolean));
   return (f) => !included.has(f);
-}
-
-/** Path comparison key: case-insensitive and slash-agnostic on Windows. */
-function samePathKey(p: string): string {
-  const r = path.resolve(p);
-  return process.platform === 'win32' ? r.toLowerCase() : r;
 }
 
 /**

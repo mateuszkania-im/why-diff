@@ -76,13 +76,18 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   if (payload.stop_hook_active) return NO_BLOCK; // already blocked once this turn: let the agent explain and stop
   if (!payload.transcript_path) return NO_BLOCK;
 
-  const root = await repoRoot(payload.cwd ?? process.cwd()); // not a git repository: nothing to check
+  // Not a repository only when no `.git` (directory or file) exists at or above the cwd: asked of the
+  // file system, since the agent can break what git needs to find the repository (`.git/HEAD`, the
+  // config, a `.git` file pointing nowhere).
+  const cwd = payload.cwd ?? process.cwd();
+  if (!(await hasGitEntry(cwd))) return NO_BLOCK;
   // From here on an error blocks: an unreadable transcript could hide what the session did.
   state.relevant = true;
   const session = await claudeCodeAdapter.parse(payload.transcript_path);
   // A session with no edits and no tool calls cannot have touched the repository.
   state.relevant = session.edits.some((e) => !e.failed) || (session.toolWindows?.length ?? 0) > 0;
   if (!state.relevant) return NO_BLOCK;
+  const root = await repoRoot(cwd);
   const roots = [root, ...(await worktreeRoots(root))].flatMap(rootVariants).sort((a, b) => b.length - a.length);
   const cwdVariants = rootVariants(session.cwd);
   const icase = await isCaseInsensitive(root);
@@ -223,6 +228,19 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
       'Before finishing: if you skipped, weakened or removed tests (or changed CI/secrets), either revert that change ' +
       'or tell the user explicitly what you changed and why, so they can decide. Do not hide it.\n',
   };
+}
+
+/** Is there a `.git` entry (directory, file or link) in `dir` or any directory above it? */
+async function hasGitEntry(dir: string): Promise<boolean> {
+  for (let d = path.resolve(dir); ; d = path.dirname(d)) {
+    try {
+      await lstat(path.join(d, '.git'));
+      return true;
+    } catch (err) {
+      if (!GONE.has((err as NodeJS.ErrnoException).code ?? '')) return true; // unreadable: assume a repository
+    }
+    if (path.dirname(d) === d) return false;
+  }
 }
 
 const SHELL_GLOB = /[*?[]/;

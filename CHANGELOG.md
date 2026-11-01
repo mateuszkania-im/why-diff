@@ -6,15 +6,15 @@
 
 Guard bypasses found in a security review of 0.3.1 (the agent is treated as the adversary):
 
-- Fail closed: once the session has touched the repository, any error while checking it (a truncated or corrupt `.git/index`, a temporary index that cannot be built, a git failure) blocks with "why-diff could not check this session: <reason>". It used to let the agent finish. Errors are no longer swallowed while listing changed, untracked or flagged files.
+- Fail closed: a cwd with a `.git` entry at or above it (checked on the file system, so a corrupt `.git/HEAD` or a `.git` file pointing nowhere cannot make it look like no repository) is checked; once the session has touched it, any error while checking it (a truncated or corrupt `.git/index`, a temporary index that cannot be built, a git failure) blocks with "why-diff could not check this session: <reason>". It used to let the agent finish. Errors are no longer swallowed while listing changed, untracked or flagged files.
 - A forged index entry (the old blob id with the new file's stat data) no longer hides a change: the guard diffs every file of the session through a temporary index rebuilt from blob ids alone, without stat data or flags, so git hashes the working tree content. If that index cannot be built, the guard blocks (it used to mark the files `unreviewed` without a hunk, which blocked nothing). Tracked files whose change time falls in a tool call window are checked whatever `git diff` reports.
 - No unbounded argv: thousands of paths (an agent writing many files) made git fail with E2BIG and the guard pass. Path lists are split to fit the command line, `update-index` reads paths on stdin, and a long list is matched once over the whole tree instead of per chunk.
-- Sparse checkout: a missing skip-worktree file is excused only when the sparse patterns leave it out (cone directories in cone mode, the full patterns otherwise), so flagging and deleting an in-cone test file blocks. `core.sparseCheckout` and `core.sparseCheckoutCone` count only from the repository's own config (local or worktree scope; a file included into it must predate the session), never from `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` or the environment, and the patterns file must predate the session.
+- Sparse checkout: a missing skip-worktree file is excused only when the sparse patterns leave it out (cone directories in cone mode, the full patterns otherwise), so flagging and deleting an in-cone test file blocks. `core.sparseCheckout` and `core.sparseCheckoutCone` count only from the repository's own config (local or worktree scope, and the file holding the setting, the repository's config or a file included into it, must predate the session), never from `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` or the environment, and the patterns file must predate the session.
 - Inherited `GIT_*` environment variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`...) are dropped from every git process why-diff starts; only the ones it sets itself reach git.
 
 ### Fixed
 
-- Sparse checkouts: touching `.git/config` during a session (`git config core.editor vi`) no longer turns every file outside the cone into a deletion.
+- Sparse checkouts: files outside the sparse patterns are no longer taken as deleted when the session merely touched the repository root.
 - The temporary index never writes a shared index into `.git` when `core.splitIndex` is on.
 - Missing files are checked one directory at a time and in parallel batches: the guard takes about 0.5 s on a 100,000-entry sparse index.
 

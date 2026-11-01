@@ -3130,7 +3130,7 @@ async function pathspecMatcher(root, pathspecs, rev) {
   };
 }
 async function sparseExcluded(root, trust) {
-  let own = trust ? await Promise.all(["config", "config.worktree"].map(async (n) => samePathKey(path2.resolve(root, await git(root, ["rev-parse", "--git-path", n]))))) : [], setting = async (key) => {
+  let setting = async (key) => {
     let out;
     try {
       out = await git(root, ["config", "--show-origin", "--show-scope", "-z", "--bool", key], { trim: !1 });
@@ -3141,9 +3141,7 @@ async function sparseExcluded(root, trust) {
     let [scope = "", origin = "", value = ""] = out.split("\0");
     if (!trust) return { value: value === "true", trusted: !0 };
     if (scope !== "local" && scope !== "worktree" || !origin.startsWith("file:")) return { value: value === "true", trusted: !1 };
-    let file2 = path2.resolve(root, origin.slice(5));
-    if (own.includes(samePathKey(file2))) return { value: value === "true", trusted: !0 };
-    let t = await trust.timeOf(file2).catch(() => 1 / 0);
+    let file2 = path2.resolve(root, origin.slice(5)), t = await trust.timeOf(file2).catch(() => 1 / 0);
     return { value: value === "true", trusted: t < trust.before };
   }, enabled = await setting("core.sparseCheckout");
   if (!enabled?.value || !enabled.trusted) return null;
@@ -3165,10 +3163,6 @@ async function sparseExcluded(root, trust) {
   if (conePredicate) return conePredicate;
   let included = new Set((await git(root, ["-c", `core.ignoreCase=${icase}`, "ls-files", "-z", "--cached", "--ignored", "--exclude-from", file], { trim: !1 })).split("\0").filter(Boolean));
   return (f) => !included.has(f);
-}
-function samePathKey(p) {
-  let r = path2.resolve(p);
-  return process.platform === "win32" ? r.toLowerCase() : r;
 }
 function coneExcluded(text2, icase) {
   let norm = (p) => icase ? p.toLowerCase() : p, positive = /* @__PURE__ */ new Set(), negated = /* @__PURE__ */ new Set(), top = !1;
@@ -10146,11 +10140,12 @@ Tell the user that why-diff could not check the changes you made in this session
 var MAX_REASON = 400;
 async function guard(payload, opts, state) {
   if (payload.stop_hook_active || !payload.transcript_path) return NO_BLOCK;
-  let root = await repoRoot(payload.cwd ?? process.cwd());
+  let cwd = payload.cwd ?? process.cwd();
+  if (!await hasGitEntry(cwd)) return NO_BLOCK;
   state.relevant = !0;
   let session = await claudeCodeAdapter.parse(payload.transcript_path);
   if (state.relevant = session.edits.some((e) => !e.failed) || (session.toolWindows?.length ?? 0) > 0, !state.relevant) return NO_BLOCK;
-  let roots = [root, ...await worktreeRoots(root)].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdVariants = rootVariants(session.cwd), icase = await isCaseInsensitive(root), paths = [...new Set(session.edits.filter((e) => !e.failed).map((e) => {
+  let root = await repoRoot(cwd), roots = [root, ...await worktreeRoots(root)].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdVariants = rootVariants(session.cwd), icase = await isCaseInsensitive(root), paths = [...new Set(session.edits.filter((e) => !e.failed).map((e) => {
     let rel = repoRelativePath(e.filePath, roots, session.cwd, cwdVariants);
     if (!rel) return null;
     let p = rel.split(path11.sep).join("/"), magic = `:(${e.kind === "bash" && SHELL_GLOB.test(p) ? "glob" : "literal"}${icase ? ",icase" : ""})`;
@@ -10219,6 +10214,16 @@ Tell the user about these changes, or revert them.
 Before finishing: if you skipped, weakened or removed tests (or changed CI/secrets), either revert that change or tell the user explicitly what you changed and why, so they can decide. Do not hide it.
 `
   } : NO_BLOCK;
+}
+async function hasGitEntry(dir) {
+  for (let d = path11.resolve(dir); ; d = path11.dirname(d)) {
+    try {
+      return await lstat3(path11.join(d, ".git")), !0;
+    } catch (err) {
+      if (!GONE2.has(err.code ?? "")) return !0;
+    }
+    if (path11.dirname(d) === d) return !1;
+  }
 }
 var SHELL_GLOB = /[*?[]/, WINDOW_SLACK_MS = 2e3, LSTAT_BATCH = 256, GONE2 = /* @__PURE__ */ new Set(["ENOENT", "ENOTDIR", "ELOOP"]);
 async function changeTime(p) {
