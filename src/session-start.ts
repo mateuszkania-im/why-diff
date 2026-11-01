@@ -27,8 +27,8 @@ export interface BaseRecord {
   gitDev?: number;
   /** Device of the directory holding the record */
   dataDirDev?: number;
-  /** HEAD of each checked-out submodule at session start, by path from the root (up to 3 levels deep) */
-  submodules?: Record<string, string>;
+  /** Each checked-out submodule at session start, by path from the root (up to 3 levels deep): its HEAD and the devices of its root and git common dir */
+  submodules?: Record<string, { head: string; rootDev?: number; gitDev?: number }>;
 }
 
 /** `$CLAUDE_PLUGIN_DATA` (set by Claude Code for plugin hooks), else `~/.cache/why-diff`. */
@@ -121,17 +121,23 @@ async function writeRecord(id: string, root: string): Promise<void> {
   }
 }
 
-/** HEAD of every checked-out submodule of `root` (gitlinks in its index), by path from the top, recursively up to depth 3. */
-async function submoduleHeads(root: string, prefix: string, depth: number): Promise<Record<string, string>> {
-  const out: Record<string, string> = {};
+/** Every checked-out submodule of `root` (gitlinks in its index), by path from the top, recursively up to depth 3: its HEAD and devices. */
+async function submoduleHeads(root: string, prefix: string, depth: number): Promise<NonNullable<BaseRecord['submodules']>> {
+  const out: NonNullable<BaseRecord['submodules']> = {};
   if (depth > 3) return out;
+  const dev = (p: string): Promise<number | undefined> => lstat(p).then((st) => Number(st.dev), () => undefined);
   for (const e of await indexEntries(root)) {
     if (e.mode !== '160000') continue;
     const abs = path.join(root, ...e.path.split('/'));
     const sub = await repoRoot(abs).then((r) => realpath(r), () => undefined);
     if (!sub || sub !== (await realpath(abs).catch(() => abs))) continue;
     const head = await git(sub, ['rev-parse', '--verify', '-q', 'HEAD^{commit}']).catch(() => '');
-    if (/^[0-9a-f]{40,64}$/.test(head)) out[`${prefix}${e.path}`] = head;
+    if (/^[0-9a-f]{40,64}$/.test(head)) {
+      const common = await git(sub, ['rev-parse', '--git-common-dir']).then((d) => path.resolve(sub, d), () => undefined);
+      const rootDev = await dev(sub);
+      const gitDev = common ? await dev(common) : undefined;
+      out[`${prefix}${e.path}`] = { head, ...(rootDev !== undefined ? { rootDev } : {}), ...(gitDev !== undefined ? { gitDev } : {}) };
+    }
     Object.assign(out, await submoduleHeads(sub, `${prefix}${e.path}/`, depth + 1).catch(() => ({})));
   }
   return out;

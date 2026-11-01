@@ -176,9 +176,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // the transcript says was written (the hook's marker) must still be there.
   let recordedHead: string | undefined;
   let indexBase: string | undefined;
-  let recordedSubmodules: Record<string, string> | undefined;
-  // Whether the repository root and git dir are proven to be on the file systems they were on at session start.
-  let devicesChecked = false;
+  let recordedSubmodules: Record<string, RecordedSubmodule> | undefined;
   const fsType = opts.fsType ?? fileSystemType;
   const markers = sessionId ? await transcriptMarkers(payload.transcript_path, sessionId).catch(() => ({ ok: true, failed: true })) : { ok: false, failed: false };
   if (markers.failed) throw new FailClosedError(`base record could not be written at session start (the SessionStart hook said so); the session's base cannot be trusted`);
@@ -202,14 +200,18 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
           const now = await deviceOf(p, pathStat);
           if (now !== was) throw new FailClosedError(`the ${what} (${p}) is on another file system than at session start (device ${was} then, ${now ?? 'unreadable'} now): a file system mounted over it can report any change time`);
         }
-        devicesChecked = true;
       }
       if (typeof devs.dataDirDev === 'number') {
         const now = await deviceOf(path.dirname(record.file), pathStat);
         if (now !== devs.dataDirDev) throw new FailClosedError(`the base record directory (${path.dirname(record.file)}) is on another file system than at session start (device ${devs.dataDirDev} then, ${now ?? 'unreadable'} now)`);
       }
       if (devs.submodules && typeof devs.submodules === 'object') {
-        recordedSubmodules = Object.fromEntries(Object.entries(devs.submodules).filter(([, h]) => typeof h === 'string' && /^[0-9a-f]{40,64}$/.test(h)));
+        recordedSubmodules = {};
+        for (const [k, v] of Object.entries(devs.submodules as Record<string, unknown>)) {
+          const e = (typeof v === 'string' ? { head: v } : v) as Partial<RecordedSubmodule> | null;
+          if (!e || typeof e.head !== 'string' || !/^[0-9a-f]{40,64}$/.test(e.head)) continue;
+          recordedSubmodules[k] = { head: e.head, ...(typeof e.rootDev === 'number' ? { rootDev: e.rootDev } : {}), ...(typeof e.gitDev === 'number' ? { gitDev: e.gitDev } : {}) };
+        }
       }
       if (record.data.head) {
         recordedHead = record.data.head;
@@ -238,12 +240,10 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
 
   // A record (once trusted by its time) only proves anything if its own file system cannot forge times.
   if (record) await trustedFileSystem(record.file, 'the base record', fsType);
-  // Without devices recorded at session start, the repository's file systems must be ones whose
-  // change times cannot be forged without root.
-  if (!devicesChecked) {
-    await trustedFileSystem(root, 'the repository', fsType);
-    await trustedFileSystem(commonDir, 'the git dir', fsType);
-  }
+  // The repository's file systems must be ones whose change times cannot be forged without root,
+  // whether or not the devices match the recorded ones (a remount can reuse the same device).
+  await trustedFileSystem(root, 'the repository', fsType);
+  await trustedFileSystem(commonDir, 'the git dir', fsType);
 
   let baseRev = 'HEAD';
   const headed = await hasHead(root);
@@ -254,9 +254,16 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   const config: WhyDiffConfig = await loadConfig(root, baseRev).catch(() => ({}));
   const blocking = opts.blocking ?? new Set<LabelKind>([...DEFAULT_BLOCK_ON, ...(config.blockOn ?? [])]);
   const protectedGlob = compileGlobs(config.protected);
-  const ctx: SessionCheck = { payload, opts, session, windows, statTime, pathStat, rawObjectTime: opts.objectTime ?? changeTime, config, blocking, protectedGlob, recordedSubmodules };
+  const ctx: SessionCheck = { payload, opts, session, windows, statTime, pathStat, rawObjectTime: opts.objectTime ?? changeTime, config, blocking, protectedGlob, recordedSubmodules, fsType, gitDev: await deviceOf(commonDir, pathStat) };
   const hits = await checkRepository(ctx, { root, baseRev, headed, indexBase, metaTimes, prefix: '', depth: 0 });
   return hits.length ? blocked(payload.transcript_path, hits) : NO_BLOCK;
+}
+
+/** A submodule as the SessionStart record kept it: its HEAD and the devices of its root and git common dir. */
+interface RecordedSubmodule {
+  head: string;
+  rootDev?: number;
+  gitDev?: number;
 }
 
 /** What one guard run knows about the session, shared by the repository and its submodules. */
@@ -270,7 +277,10 @@ interface SessionCheck {
   /** Object write times as read (each repository anchors them to its own git common dir, see onDevice) */
   rawObjectTime: (p: string) => Promise<number>;
   /** Submodule heads from the SessionStart record, by path from the session's repository */
-  recordedSubmodules?: Record<string, string>;
+  recordedSubmodules?: Record<string, RecordedSubmodule>;
+  fsType: (p: string) => Promise<string>;
+  /** Device of the session repository's git common dir */
+  gitDev?: number;
   config: WhyDiffConfig;
   blocking: Set<LabelKind>;
   protectedGlob: (file: string) => string | undefined;
@@ -566,8 +576,50 @@ async function checkSubmodules(ctx: SessionCheck, repo: RepoUnderCheck, layeredA
       continue;
     }
     const subHeaded = await hasHead(subRoot);
-    const metaTimes = await gitMetaTimes(gitEntry, ctx.statTime, ctx.pathStat);
     const prefixed = `${prefix}${p}/`;
+    const key = `${prefix}${p}`;
+    // Its times prove something only on a trusted file system, on the devices it had at session start.
+    const subCommon = await gitCommonDir(subRoot);
+    try {
+      await trustedFileSystem(subRoot, `submodule ${key}`, ctx.fsType);
+      await trustedFileSystem(subCommon, `the git dir of submodule ${key}`, ctx.fsType);
+    } catch (err) {
+      unreviewed(p, `is on an untrusted file system (${(err as Error).message.replace(/^unreviewed: /, '')})`);
+      continue;
+    }
+    const rec = ctx.recordedSubmodules?.[key];
+    const subGitDev = await deviceOf(subCommon, ctx.pathStat);
+    if (rec?.rootDev !== undefined || rec?.gitDev !== undefined) {
+      const rootNow = await deviceOf(await real(subRoot), ctx.pathStat);
+      if ((rec.rootDev !== undefined && rec.rootDev !== rootNow) || (rec.gitDev !== undefined && rec.gitDev !== subGitDev)) {
+        unreviewed(p, 'or its git dir is on another file system than at session start');
+        continue;
+      }
+    }
+    const subRoots = rootVariants(subRoot);
+    const named = ctx.session.edits.some((e) => !e.failed && repoRelativePath(e.filePath, subRoots, ctx.session.cwd) !== null);
+    // `git status` lists changed files from the index's stat data; entries flagged assume-unchanged or
+    // skip-worktree are never compared, so they are always candidates.
+    const candidatePaths = async (): Promise<Set<string>> => {
+      const set = statusPaths(await git(subRoot, ['status', '--porcelain=v2', '-z', '--untracked-files=all'], { trim: false }));
+      for (const e of await indexEntries(subRoot)) if (e.tag === 'S' || e.tag === 's' || (e.tag >= 'a' && e.tag <= 'z')) set.add(e.path);
+      return set;
+    };
+    if (rec?.gitDev === undefined && subGitDev !== ctx.gitDev) {
+      // Its git dir (index, refs, objects) on another device than the repository's, with no device
+      // recorded for it: none of its times can be trusted. Unchanged and clean (by `git status`, the
+      // flagged entries and every tracked file's own change time in its work tree) costs nothing;
+      // anything else is unreviewed.
+      const walk = await toolWindowFiles(subRoot, undefined, ctx.windows, ctx.opts.statTime ? ctx.statTime : undefined, ctx.pathStat, null);
+      if (changed || named || (await candidatePaths()).size || walk.written.size || walk.removed.size || walk.foreign.size) {
+        unreviewed(p, 'has its git dir on another file system than the repository\'s, with no device recorded at session start, and it changed');
+        continue;
+      }
+      const unchanged: RepoUnderCheck = { root: subRoot, baseRev: subHeaded ? 'HEAD' : await emptyTree(subRoot), headed: subHeaded, metaTimes: [], prefix: prefixed, depth: depth + 1 };
+      for (const hit of await checkSubmodules(ctx, unchanged, false)) if (!hits.includes(hit)) hits.push(hit);
+      continue;
+    }
+    const metaTimes = await gitMetaTimes(gitEntry, ctx.statTime, ctx.pathStat);
     // Its index and refs unchanged during the session: HEAD is where it was at session start, and the
     // index's stat data can be trusted (change times compared, which a command cannot set on a
     // trusted file system), so `git status` lists every changed file and only those are dated. None,
@@ -576,9 +628,7 @@ async function checkSubmodules(ctx: SessionCheck, repo: RepoUnderCheck, layeredA
     const quiet = !(w && metaTimes.some((t) => w.inWindow(t) || t > w.lastEnd));
     let candidates: Set<string> | undefined;
     if (quiet) {
-      candidates = statusPaths(await git(subRoot, ['status', '--porcelain=v2', '-z', '--untracked-files=all'], { trim: false }));
-      const subRoots = rootVariants(subRoot);
-      const named = ctx.session.edits.some((e) => !e.failed && repoRelativePath(e.filePath, subRoots, ctx.session.cwd) !== null);
+      candidates = await candidatePaths();
       if (!candidates.size && !named) {
         const unchanged: RepoUnderCheck = { root: subRoot, baseRev: subHeaded ? 'HEAD' : await emptyTree(subRoot), headed: subHeaded, metaTimes, prefix: prefixed, depth: depth + 1 };
         for (const hit of await checkSubmodules(ctx, unchanged, false)) if (!hits.includes(hit)) hits.push(hit);
@@ -589,10 +639,10 @@ async function checkSubmodules(ctx: SessionCheck, repo: RepoUnderCheck, layeredA
     // pre-session commit (reflogs and first-parent history, by object write times), as for the
     // repository itself. Not the superproject's gitlink: a checkout behind it (a pull without
     // `git submodule update`) would otherwise read as the agent's change.
-    const objectTime = onDevice(ctx.rawObjectTime, ctx.pathStat, await deviceOf(await gitCommonDir(subRoot), ctx.pathStat));
+    const objectTime = onDevice(ctx.rawObjectTime, ctx.pathStat, subGitDev);
     let subBase: string;
     try {
-      subBase = subHeaded ? await sessionBase(subRoot, Date.parse(ctx.session.startedAt), objectTime, ctx.recordedSubmodules?.[`${prefix}${p}`]) : await emptyTree(subRoot);
+      subBase = subHeaded ? await sessionBase(subRoot, Date.parse(ctx.session.startedAt), objectTime, ctx.recordedSubmodules?.[`${prefix}${p}`]?.head) : await emptyTree(subRoot);
     } catch (err) {
       if (!(err instanceof FailClosedError)) throw err;
       if (l.base || l.index !== l.head) {
@@ -880,7 +930,7 @@ async function gitCommonDir(root: string): Promise<string> {
  * the kernel's own. Not: FAT and exFAT (ctime is the stored mtime, `touch` sets it), FUSE, network
  * file systems (the server reports times), and anything unknown.
  */
-const TRUSTED_FS: ReadonlySet<string> = new Set(['apfs', 'hfs', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'zfs', 'ntfs', 'tmpfs', 'overlay']);
+const TRUSTED_FS: ReadonlySet<string> = new Set(['apfs', 'hfs', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'zfs', 'ntfs', 'refs', 'tmpfs', 'overlay']);
 /** Linux `statfs` `f_type` magic numbers, by name (ext2/3/4 share one). */
 const LINUX_FS: ReadonlyMap<number, string> = new Map([
   [0xef53, 'ext4'], [0x58465342, 'xfs'], [0x9123683e, 'btrfs'], [0x2fc12fc1, 'zfs'], [0x5346544e, 'ntfs'], [0x01021994, 'tmpfs'], [0x794c7630, 'overlay'],
@@ -900,11 +950,23 @@ function darwinMountTypes(): Promise<Map<number, string>> {
       }
       return types;
     });
+  setTimeout(() => { darwinMounts = undefined; }, 2000).unref();
   return darwinMounts;
 }
-/** The type of the file system holding `p` (`apfs`, `ext4`, `msdos`...); throws when it cannot be told. */
-async function fileSystemType(p: string): Promise<string> {
-  if (process.platform === 'win32') return 'ntfs';
+const fsTypes = new Map<string, Promise<string>>();
+/** The type of the file system holding `p` (`apfs`, `ext4`, `msdos`...), once per path; throws when it cannot be told. */
+function fileSystemType(p: string): Promise<string> {
+  let t = fsTypes.get(p);
+  if (!t) {
+    t = readFileSystemType(p);
+    fsTypes.set(p, t);
+    // One guard run is short; a long-lived process (the library) must see a later mount.
+    setTimeout(() => fsTypes.delete(p), 2000).unref();
+  }
+  return t;
+}
+async function readFileSystemType(p: string): Promise<string> {
+  if (process.platform === 'win32') return windowsFileSystemType(p);
   if (process.platform === 'darwin') {
     const dev = Number((await lstat(p)).dev);
     const type = (await darwinMountTypes()).get(dev);
@@ -913,6 +975,35 @@ async function fileSystemType(p: string): Promise<string> {
   }
   const { type } = await statfs(p);
   return LINUX_FS.get(type) ?? `unknown (0x${type.toString(16)})`;
+}
+const windowsVolumes = new Map<string, Promise<string>>();
+/**
+ * Windows: the file system of the volume holding `p`, by drive letter, from `fsutil fsinfo volumeinfo`
+ * (or, when that cannot run, PowerShell's `Get-Volume`). A UNC or network path, or anything that
+ * cannot be read, throws.
+ */
+function windowsFileSystemType(p: string): Promise<string> {
+  const drive = /^([A-Za-z]):[\\/]/.exec(path.resolve(p))?.[1]?.toUpperCase();
+  if (!drive) return Promise.reject(new Error(`${p} is not on a local drive (a UNC or network path)`));
+  let t = windowsVolumes.get(drive);
+  if (!t) {
+    const run = (file: string, args: string[]): Promise<string> => new Promise((resolve, reject) => execFile(file, args, { encoding: 'utf8', windowsHide: true, timeout: 10_000 }, (err, out) => (err ? reject(err) : resolve(out))));
+    t = run('fsutil', ['fsinfo', 'volumeinfo', `${drive}:\\`])
+      .then((out) => {
+        const m = /File System Name\s*:\s*(\S+)/i.exec(out);
+        if (!m) throw new Error('no file system name in fsutil output');
+        return m[1]!;
+      })
+      .catch(() => run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Volume -DriveLetter ${drive}).FileSystemType`]).then((out) => {
+        const name = out.trim();
+        if (!/^\w+$/.test(name)) throw new Error(`cannot read the file system of drive ${drive}:`);
+        return name;
+      }))
+      .then((name) => name.toLowerCase());
+    windowsVolumes.set(drive, t);
+    setTimeout(() => windowsVolumes.delete(drive), 2000).unref();
+  }
+  return t;
 }
 /** Throw {@link FailClosedError} unless `p` sits on a file system type from {@link TRUSTED_FS}. */
 async function trustedFileSystem(p: string, what: string, fsType: (p: string) => Promise<string>): Promise<void> {
