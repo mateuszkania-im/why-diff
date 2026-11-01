@@ -55,6 +55,11 @@ export interface DiffOptions {
   unified?: number;
   /** Git pathspecs limiting both the tracked diff and the untracked files (e.g. `:(literal)src/a.ts`). */
   paths?: string[];
+  /**
+   * In a sparse checkout, leave out skip-worktree files missing from the working tree (default true).
+   * The guard passes false when the sparse checkout setup changed during the session.
+   */
+  honourSparseCheckout?: boolean;
 }
 
 /** Output of `resolveDefaultTarget`. */
@@ -319,7 +324,7 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
   // Files flagged assume-unchanged or skip-worktree: git diff takes their index entry for the
   // working tree file, so a change to them would not show. Diff them again through a copy of the
   // index with the flags cleared (the real index is never touched).
-  const hidden = await indexFlagged(cwd, opts.paths).catch(() => null);
+  const hidden = await indexFlagged(cwd, opts.paths, opts.honourSparseCheckout ?? true).catch(() => null);
   if (hidden === null) throw new FailClosedError('cannot list index entries flagged assume-unchanged or skip-worktree');
   if (hidden.length) {
     const own = await diffWithoutIndexFlags(cwd, [...common, baseRev], hidden).catch(() => null);
@@ -350,12 +355,12 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
 /**
  * Index entries flagged assume-unchanged (lowercase tag in `git ls-files -v`) or skip-worktree
  * (`S`). In a sparse checkout (`core.sparseCheckout`), a skip-worktree file missing from the working
- * tree is expected and left out.
+ * tree is expected and left out, unless `honourSparse` is false.
  */
-async function indexFlagged(cwd: string, paths?: string[]): Promise<string[]> {
+export async function indexFlagged(cwd: string, paths?: string[], honourSparse = true): Promise<string[]> {
   const root = await repoRoot(cwd);
   const out = await git(root, ['ls-files', '-v', '-z', ...(paths?.length ? ['--', ...paths] : [])], { trim: false });
-  const sparse = (await git(root, ['config', '--bool', 'core.sparseCheckout']).catch(() => '')) === 'true';
+  const sparse = honourSparse && (await git(root, ['config', '--bool', 'core.sparseCheckout']).catch(() => '')) === 'true';
   const flagged: string[] = [];
   for (const entry of out.split('\0')) {
     if (entry.length < 3 || entry[1] !== ' ') continue;

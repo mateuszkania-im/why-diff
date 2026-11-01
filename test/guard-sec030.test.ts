@@ -565,6 +565,37 @@ describe('sec030 #7: the session base does not trust committer dates', () => {
 });
 
 describe('sec030: index flags (assume-unchanged, skip-worktree) cannot hide a change', () => {
+  it('credits by time an unnamed script write to a file flagged skip-worktree', async () => {
+    const r = await scenario(({ repo, T }) => ({
+      calls: [bash(T, `cd ${shellPath(repo)} && node fix.js`)],
+      act: () => {
+        sh(repo, ['update-index', '--skip-worktree', 'test/f.test.js']);
+        skipT5(repo);
+        utimesSync(tp(repo), at(T + 2000), at(T + 2000));
+      },
+    }));
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('test-skip-added');
+  });
+
+  async function sparseDelete(objectTime: (p: string) => Promise<number>): Promise<boolean> {
+    const { repo, home } = makeRepo();
+    const callAt = Date.now() - 60_000;
+    const transcript = writeSyntheticTranscript(home, repo, 's-sparse', [{ prompt: 'tidy', at: iso(callAt - 60_000), calls: [
+      bash(callAt, 'git config core.sparseCheckout true && git update-index --skip-worktree test/f.test.js && rm test/f.test.js'),
+    ] }]);
+    sh(repo, ['config', 'core.sparseCheckout', 'true']);
+    sh(repo, ['update-index', '--skip-worktree', 'test/f.test.js']);
+    rmSync(tp(repo));
+    return (await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sparse' }, { blocking: BL, home, objectTime })).block;
+  }
+  it('blocks when the agent enabled sparse checkout during the session and deleted a skip-worktree test file', async () => {
+    expect(await sparseDelete(async (p) => (/[\\/]config(\.worktree)?$|sparse-checkout$/.test(p) ? (await lstat(p)).ctimeMs : oldObjects(p)))).toBe(true);
+  });
+  it('honours a sparse checkout set up before the session: a skip-worktree file missing from the working tree is no deletion', async () => {
+    expect(await sparseDelete(oldObjects)).toBe(false);
+  });
+
   for (const flag of ['--skip-worktree', '--assume-unchanged']) {
     it(`blocks on an agent it.skip in a test file flagged ${flag}`, async () => {
       const { repo, home } = makeRepo();

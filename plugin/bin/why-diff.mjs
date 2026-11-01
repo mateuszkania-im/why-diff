@@ -2993,7 +2993,7 @@ async function getDiffUnwrapped(cwd, target, opts) {
   }
   let baseRev;
   target.baseRev && await hasHead(cwd) ? baseRev = target.baseRev : await hasHead(cwd) ? baseRev = target.base ? await mergeBase(cwd, target.base, "HEAD") : "HEAD" : baseRev = await emptyTree(cwd);
-  let pathspec = opts.paths?.length ? ["--", ...opts.paths] : [], revealed = await revealTextMarkedBinary(cwd, [...common, baseRev], await git(cwd, [...common, baseRev, ...pathspec], { trim: !1 })), diff = revealed.diff, unreviewed = [...revealed.unreviewed], hidden = await indexFlagged(cwd, opts.paths).catch(() => null);
+  let pathspec = opts.paths?.length ? ["--", ...opts.paths] : [], revealed = await revealTextMarkedBinary(cwd, [...common, baseRev], await git(cwd, [...common, baseRev, ...pathspec], { trim: !1 })), diff = revealed.diff, unreviewed = [...revealed.unreviewed], hidden = await indexFlagged(cwd, opts.paths, opts.honourSparseCheckout ?? !0).catch(() => null);
   if (hidden === null) throw new FailClosedError("cannot list index entries flagged assume-unchanged or skip-worktree");
   if (hidden.length) {
     let own = await diffWithoutIndexFlags(cwd, [...common, baseRev], hidden).catch(() => null);
@@ -3016,8 +3016,8 @@ async function getDiffUnwrapped(cwd, target, opts) {
   }
   return { diff, unreviewed };
 }
-async function indexFlagged(cwd, paths) {
-  let root = await repoRoot(cwd), out = await git(root, ["ls-files", "-v", "-z", ...paths?.length ? ["--", ...paths] : []], { trim: !1 }), sparse = await git(root, ["config", "--bool", "core.sparseCheckout"]).catch(() => "") === "true", flagged = [];
+async function indexFlagged(cwd, paths, honourSparse = !0) {
+  let root = await repoRoot(cwd), out = await git(root, ["ls-files", "-v", "-z", ...paths?.length ? ["--", ...paths] : []], { trim: !1 }), sparse = honourSparse && await git(root, ["config", "--bool", "core.sparseCheckout"]).catch(() => "") === "true", flagged = [];
   for (let entry of out.split("\0")) {
     if (entry.length < 3 || entry[1] !== " ") continue;
     let tag = entry[0], file = entry.slice(2), skipWorktree = tag === "S" || tag === "s";
@@ -8584,7 +8584,7 @@ async function buildReport(opts = {}) {
   }
   let baseRev = await policyRev(root, target), config = opts.config ?? await loadConfig(root, baseRev, log), protectedGlob = compileGlobs(config.protected), ignoredGlob = compileGlobs(config.ignore);
   log(`diffing ${rangeLabel}`);
-  let detailed = await getDiffDetailed(root, target, { paths: opts.paths }), allHunks = parseUnifiedDiff(detailed.diff), unreviewed = new Set(detailed.unreviewed), rulesFiles = /* @__PURE__ */ new Set();
+  let detailed = await getDiffDetailed(root, target, { paths: opts.paths, honourSparseCheckout: opts.honourSparseCheckout }), allHunks = parseUnifiedDiff(detailed.diff), unreviewed = new Set(detailed.unreviewed), rulesFiles = /* @__PURE__ */ new Set();
   for (let h of allHunks)
     (samePath(h.file, CONFIG_FILE2) || h.oldFile !== void 0 && samePath(h.oldFile, CONFIG_FILE2)) && rulesFiles.add(h.file);
   let pkgHunks = allHunks.filter((h) => samePath(h.file, "package.json"));
@@ -9985,7 +9985,7 @@ async function guard(payload, opts) {
     return [.../* @__PURE__ */ new Set([p, p.normalize("NFD")])].map((v) => `${magic}${v}`);
   }).flatMap((p) => p ?? []))], baseRev = "HEAD", headed = await hasHead(root);
   headed && (baseRev = await sessionBase(root, Date.parse(session.startedAt), opts.objectTime ?? changeTime));
-  let byWindow = await toolWindowFiles(root, headed ? baseRev : void 0, session, opts.statTime ?? changeTime);
+  let honourSparse = await sparseSetupBefore(root, Date.parse(session.startedAt), opts.objectTime ?? changeTime), byWindow = await toolWindowFiles(root, headed ? baseRev : void 0, session, opts.statTime ?? changeTime, honourSparse);
   for (let f of [...byWindow.written, ...byWindow.removed]) paths.push(`:(literal)${f}`);
   if (!paths.length) return NO_BLOCK;
   let config = await loadConfig(root, baseRev).catch(() => ({})), blocking = opts.blocking ?? /* @__PURE__ */ new Set([...DEFAULT_BLOCK_ON, ...config.blockOn ?? []]), protectedGlob = compileGlobs(config.protected), report = await buildReport({
@@ -9997,7 +9997,8 @@ async function guard(payload, opts) {
     harnesses: ["claude-code"],
     home: opts.home,
     config,
-    keepAgentIgnored: !0
+    keepAgentIgnored: !0,
+    honourSparseCheckout: honourSparse
   }), shellTargets = (ops) => new Set(session.edits.filter((e) => !e.failed && e.kind === "bash" && ops.has(e.bashOp ?? "")).map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants)).filter((p) => !!p).map((p) => p.split(path11.sep).join("/").replace(/^(\.\/)+/, "").replace(/\/+$/, ""))), removedByShell = shellTargets(REMOVE_OPS), rewrittenByShell = shellTargets(REWRITE_OPS), targeted = (targets, file, dirs) => {
     let f = file.normalize("NFC").replace(/^(\.\/)+/, "");
     icase && (f = f.toLowerCase());
@@ -10049,10 +10050,10 @@ var SHELL_GLOB = /[*?[]/, WINDOW_SLACK_MS = 2e3, LSTAT_BATCH = 64, GONE = /* @__
 async function changeTime(p) {
   return (await lstat3(p)).ctimeMs;
 }
-async function toolWindowFiles(root, rev, session, timeOf) {
+async function toolWindowFiles(root, rev, session, timeOf, honourSparse) {
   let written = /* @__PURE__ */ new Set(), removed = /* @__PURE__ */ new Set(), now = Date.now(), windows = (session.toolWindows ?? []).map((w) => ({ start: Date.parse(w.start), end: w.open ? Math.max(now, Date.parse(w.end)) : Date.parse(w.end) })).filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end >= w.start).map((w) => ({ start: w.start - WINDOW_SLACK_MS, end: w.end + WINDOW_SLACK_MS }));
   if (!windows.length) return { written, removed };
-  let inWindow = (ms) => windows.some((w) => ms >= w.start && ms <= w.end), changed = await git(root, ["diff", "--name-only", "--no-renames", "-z", rev ?? await emptyTree(root), "--"], { trim: !1 }).catch(() => ""), files = [.../* @__PURE__ */ new Set([...changed.split("\0").filter(Boolean), ...await listUntracked(root).catch(() => [])])].filter((f) => !f.startsWith(".why-diff/")), top = path11.resolve(root);
+  let inWindow = (ms) => windows.some((w) => ms >= w.start && ms <= w.end), changed = await git(root, ["diff", "--name-only", "--no-renames", "-z", rev ?? await emptyTree(root), "--"], { trim: !1 }).catch(() => ""), flagged = await indexFlagged(root, void 0, honourSparse).catch(() => []), files = [.../* @__PURE__ */ new Set([...changed.split("\0").filter(Boolean), ...await listUntracked(root).catch(() => []), ...flagged])].filter((f) => !f.startsWith(".why-diff/")), top = path11.resolve(root);
   for (let i = 0; i < files.length; i += LSTAT_BATCH)
     await Promise.all(files.slice(i, i + LSTAT_BATCH).map(async (f) => {
       let abs = path11.join(top, ...f.split("/"));
@@ -10114,6 +10115,15 @@ async function sessionBase(root, startedAt, timeOf) {
   }
   if (!base) throw new FailClosedError("no commit from before the session start was found to compare against (every candidate was written during the session)");
   return await git(root, ["merge-base", "--is-ancestor", base, "HEAD"]).then(() => !0, () => !1) || (base = await git(root, ["merge-base", base, "HEAD"]).catch(() => base)), base;
+}
+async function sparseSetupBefore(root, startedAt, timeOf) {
+  if (!Number.isFinite(startedAt)) return !1;
+  let cutoff = startedAt - WINDOW_SLACK_MS;
+  for (let name of ["config", "config.worktree", "info/sparse-checkout"]) {
+    let file = path11.resolve(root, await git(root, ["rev-parse", "--git-path", name]).catch(() => name));
+    if (await timeOf(file).catch((err) => err.code === "ENOENT" ? -1 / 0 : 1 / 0) >= cutoff) return !1;
+  }
+  return !0;
 }
 async function packIndexHas(idxPath, sha) {
   let buf = await readFile7(idxPath).catch(() => {

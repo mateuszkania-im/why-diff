@@ -13,7 +13,7 @@ import readline from 'node:readline';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
-import { emptyTree, FailClosedError, git, hasHead, isCaseInsensitive, listUntracked, repoRoot, worktreeRoots } from './git.js';
+import { emptyTree, FailClosedError, git, hasHead, indexFlagged, isCaseInsensitive, listUntracked, repoRoot, worktreeRoots } from './git.js';
 import { globToRegExp, repoRelativePath, rootVariants } from './attribute.js';
 import { compileGlobs, loadConfig, type WhyDiffConfig } from './config.js';
 import type { Hunk, LabelKind, Session } from './types.js';
@@ -91,7 +91,9 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   // Files a shell command changed without naming them (a script computing the path, `rsync --delete`,
   // a path from the environment, a background process): credited when the file (or, once deleted,
   // the nearest path above it) last changed (ctime) while one of this session's tool calls ran.
-  const byWindow = await toolWindowFiles(root, headed ? baseRev : undefined, session, opts.statTime ?? changeTime);
+  // A sparse checkout set up (or changed) during the session cannot excuse a missing file.
+  const honourSparse = await sparseSetupBefore(root, Date.parse(session.startedAt), opts.objectTime ?? changeTime);
+  const byWindow = await toolWindowFiles(root, headed ? baseRev : undefined, session, opts.statTime ?? changeTime, honourSparse);
   for (const f of [...byWindow.written, ...byWindow.removed]) paths.push(`:(literal)${f}`);
   if (!paths.length) return NO_BLOCK;
 
@@ -111,6 +113,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
     home: opts.home,
     config,
     keepAgentIgnored: true,
+    honourSparseCheckout: honourSparse,
   });
 
   // Paths the session's own shell commands targeted literally (or by a glob), by kind of operation:
@@ -224,7 +227,7 @@ async function changeTime(p: string): Promise<number> {
  * credited; a human edit while an agent tool call is running is (the one edge; long calls, subagents
  * and background processes widen it).
  */
-async function toolWindowFiles(root: string, rev: string | undefined, session: Session, timeOf: (p: string) => Promise<number>): Promise<{ written: Set<string>; removed: Set<string> }> {
+async function toolWindowFiles(root: string, rev: string | undefined, session: Session, timeOf: (p: string) => Promise<number>, honourSparse: boolean): Promise<{ written: Set<string>; removed: Set<string> }> {
   const written = new Set<string>();
   const removed = new Set<string>();
   const now = Date.now();
@@ -238,7 +241,9 @@ async function toolWindowFiles(root: string, rev: string | undefined, session: S
   const inWindow = (ms: number): boolean => windows.some((w) => ms >= w.start && ms <= w.end);
 
   const changed = await git(root, ['diff', '--name-only', '--no-renames', '-z', rev ?? (await emptyTree(root)), '--'], { trim: false }).catch(() => '');
-  const files = [...new Set([...changed.split('\0').filter(Boolean), ...(await listUntracked(root).catch(() => []))])]
+  // Files flagged assume-unchanged or skip-worktree are missing from `git diff --name-only`.
+  const flagged = await indexFlagged(root, undefined, honourSparse).catch(() => []);
+  const files = [...new Set([...changed.split('\0').filter(Boolean), ...(await listUntracked(root).catch(() => [])), ...flagged])]
     .filter((f) => !f.startsWith('.why-diff/'));
   // `git rev-parse --show-toplevel` prints `C:/x` on Windows: resolve it so the walk below compares like with like.
   const top = path.resolve(root);
@@ -340,6 +345,22 @@ async function sessionBase(root: string, startedAt: number, timeOf: (p: string) 
   const ancestor = await git(root, ['merge-base', '--is-ancestor', base, 'HEAD']).then(() => true, () => false);
   if (!ancestor) base = await git(root, ['merge-base', base, 'HEAD']).catch(() => base!);
   return base;
+}
+
+/**
+ * Was the sparse checkout setup (the config, `config.worktree`, `info/sparse-checkout`) last changed
+ * before the session started? Only then may a skip-worktree file missing from the working tree be
+ * taken as sparse rather than deleted.
+ */
+async function sparseSetupBefore(root: string, startedAt: number, timeOf: (p: string) => Promise<number>): Promise<boolean> {
+  if (!Number.isFinite(startedAt)) return false;
+  const cutoff = startedAt - WINDOW_SLACK_MS;
+  for (const name of ['config', 'config.worktree', 'info/sparse-checkout']) {
+    const file = path.resolve(root, await git(root, ['rev-parse', '--git-path', name]).catch(() => name));
+    const t = await timeOf(file).catch((err: NodeJS.ErrnoException) => (err.code === 'ENOENT' ? -Infinity : Infinity));
+    if (t >= cutoff) return false;
+  }
+  return true;
 }
 
 /** Is `sha` listed in this pack index (version 2: magic, version, 256-entry fan-out, sorted names)? */

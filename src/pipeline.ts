@@ -41,6 +41,8 @@ export interface BuildOptions {
   baseRev?: string;
   /** Git pathspecs limiting the diff to these paths (tracked and untracked) */
   paths?: string[];
+  /** See {@link DiffOptions.honourSparseCheckout} */
+  honourSparseCheckout?: boolean;
   /** Harnesses to read; default all */
   harnesses?: Harness[];
   /** Explicit transcript files (skips discovery) */
@@ -118,7 +120,7 @@ export async function buildReport(opts: BuildOptions = {}): Promise<Report> {
   const ignoredGlob = compileGlobs(config.ignore);
 
   log(`diffing ${rangeLabel}`);
-  const detailed = await getDiffDetailed(root, target, { paths: opts.paths });
+  const detailed = await getDiffDetailed(root, target, { paths: opts.paths, honourSparseCheckout: opts.honourSparseCheckout });
   const allHunks = parseUnifiedDiff(detailed.diff);
   const unreviewed = new Set(detailed.unreviewed);
 
