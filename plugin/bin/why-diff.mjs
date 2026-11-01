@@ -2625,7 +2625,7 @@ var program = new Command();
 // src/cli.ts
 var import_picocolors2 = __toESM(require_picocolors(), 1);
 import { mkdir as mkdir3, mkdtemp as mkdtemp2, rm as rm2, writeFile as writeFile3 } from "node:fs/promises";
-import os9 from "node:os";
+import os10 from "node:os";
 import path13 from "node:path";
 import { spawn as spawn4 } from "node:child_process";
 
@@ -10446,10 +10446,11 @@ function renderReport(report, format, opts = {}) {
 }
 
 // src/guard.ts
-import { constants as fsConstants2, createReadStream as createReadStream4 } from "node:fs";
+import { constants as fsConstants2, createReadStream as createReadStream4, realpath as realpathCb } from "node:fs";
 import { access, lstat as lstat4, readdir as readdir4, readFile as readFile8, realpath as realpath7, stat as stat5, statfs } from "node:fs/promises";
 import { execFile as execFile3 } from "node:child_process";
 import readline2 from "node:readline";
+import os9 from "node:os";
 import path12 from "node:path";
 
 // src/session-start.ts
@@ -10535,7 +10536,7 @@ async function submoduleHeads(root, prefix, depth) {
 }
 
 // src/guard.ts
-var DEFAULT_BLOCK_ON = ["test-skip-added", "tests-disabled", "assertion-removed", "secret-like", "ci-changed", "protected-path", "unreviewed"], NO_BLOCK = { block: !1, hits: [] }, DEADLINE_MS = 2e4;
+var realpathNative = realpathCb.native, DEFAULT_BLOCK_ON = ["test-skip-added", "tests-disabled", "assertion-removed", "secret-like", "ci-changed", "protected-path", "unreviewed"], NO_BLOCK = { block: !1, hits: [] }, DEADLINE_MS = 2e4;
 function guardDeadlineMs() {
   let env = Number(process.env.WHY_DIFF_GUARD_DEADLINE_MS);
   return Number.isFinite(env) && env > 0 ? env : DEADLINE_MS;
@@ -11045,22 +11046,29 @@ async function readFileSystemType(p) {
   let { type } = await statfs(p);
   return LINUX_FS.get(type) ?? `unknown (0x${type.toString(16)})`;
 }
-var windowsVolumes = /* @__PURE__ */ new Map();
-function windowsFileSystemType(p) {
-  let drive = /^([A-Za-z]):[\\/]/.exec(path12.resolve(p))?.[1]?.toUpperCase();
-  if (!drive) return Promise.reject(new Error(`${p} is not on a local drive (a UNC or network path)`));
-  let t = windowsVolumes.get(drive);
+function windowsVolumeCommand(realPath) {
+  let system32 = path12.join(process.env.SystemRoot ?? "C:\\Windows", "System32");
+  return {
+    file: path12.join(system32, "WindowsPowerShell", "v1.0", "powershell.exe"),
+    args: ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_VOLUME_SCRIPT],
+    options: { cwd: os9.tmpdir(), windowsHide: !0, shell: !1, encoding: "utf8", timeout: 2e4, env: { ...process.env, WD_PATH: realPath } }
+  };
+}
+var WINDOWS_VOLUME_SCRIPT = '$v = Get-Volume -FilePath $env:WD_PATH -ErrorAction Stop; "$($v.FileSystemType)|$($v.DriveType)"', windowsVolumes = /* @__PURE__ */ new Map();
+async function windowsFileSystemType(p) {
+  let real = await new Promise((resolve, reject) => realpathNative(p, (err, out) => err ? reject(err) : resolve(out)));
+  if (/^\\\\/.test(real)) throw new Error(`${real} is a UNC or network path`);
+  if (!/^[A-Za-z]:[\\/]/.test(real)) throw new Error(`${real} is not on a local drive`);
+  let dev = Number((await stat5(real)).dev), t = windowsVolumes.get(dev);
   if (!t) {
-    let run = (file, args) => new Promise((resolve, reject) => execFile3(file, args, { encoding: "utf8", windowsHide: !0, timeout: 1e4 }, (err, out) => err ? reject(err) : resolve(out)));
-    t = run("fsutil", ["fsinfo", "volumeinfo", `${drive}:\\`]).then((out) => {
-      let m = /File System Name\s*:\s*(\S+)/i.exec(out);
-      if (!m) throw new Error("no file system name in fsutil output");
-      return m[1];
-    }).catch(() => run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Volume -DriveLetter ${drive}).FileSystemType`]).then((out) => {
-      let name = out.trim();
-      if (!/^\w+$/.test(name)) throw new Error(`cannot read the file system of drive ${drive}:`);
-      return name;
-    })).then((name) => name.toLowerCase()), windowsVolumes.set(drive, t), setTimeout(() => windowsVolumes.delete(drive), 2e3).unref();
+    let c = windowsVolumeCommand(real);
+    t = new Promise((resolve, reject) => execFile3(c.file, c.args, c.options, (err, out) => err ? reject(err) : resolve(String(out)))).then((out) => {
+      let m = /^(\w+)\|(\w*)\s*$/m.exec(out.trim());
+      if (!m) throw new Error("no file system in Get-Volume output");
+      if (!/^(fixed|removable)$/i.test(m[2])) throw new Error(`drive type ${m[2] || "unknown"}`);
+      let fs2 = m[1].toLowerCase();
+      return fs2 === "ntfs" || fs2 === "refs" ? fs2 : `${fs2} (Windows)`;
+    }), windowsVolumes.set(dev, t), t.catch(() => windowsVolumes.delete(dev));
   }
   return t;
 }
@@ -11505,7 +11513,7 @@ function killTree(pid, posix2, fallback) {
   });
 }
 async function guardInChild(raw, on) {
-  let ms = guardDeadlineMs(), tmp = await mkdtemp2(path13.join(os9.tmpdir(), "why-diff-guard-")), posix2 = process.platform !== "win32", env = { ...process.env, TMPDIR: tmp, TMP: tmp, TEMP: tmp }, child = spawn4(process.execPath, [...process.execArgv, process.argv[1], GUARD_CHILD, ...on === void 0 ? [] : ["--on", on]], { env, stdio: ["pipe", "pipe", "ignore"], detached: posix2, windowsHide: !0 }), out = "";
+  let ms = guardDeadlineMs(), tmp = await mkdtemp2(path13.join(os10.tmpdir(), "why-diff-guard-")), posix2 = process.platform !== "win32", env = { ...process.env, TMPDIR: tmp, TMP: tmp, TEMP: tmp }, child = spawn4(process.execPath, [...process.execArgv, process.argv[1], GUARD_CHILD, ...on === void 0 ? [] : ["--on", on]], { env, stdio: ["pipe", "pipe", "ignore"], detached: posix2, windowsHide: !0 }), out = "";
   child.stdout.setEncoding("utf8"), child.stdout.on("data", (c) => {
     out += c;
   }), child.stdin.on("error", () => {
