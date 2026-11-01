@@ -102,6 +102,14 @@ describe('sec030 #1: background and detached shell writes', () => {
     ['setsid', 'setsid node fix.js'],
     ['disown', 'node fix.js & disown'],
     ['at', 'echo "node fix.js" | at now + 1 minute'],
+    ['a single & with no space after it', 'node fix.js &echo started'],
+    ['an escaped launcher', '\\nohup node fix.js'],
+    ['a launcher by full path behind a wrapper', 'env -i /usr/bin/setsid node fix.js'],
+    ['coproc', 'coproc node fix.js'],
+    ['docker run -d', 'docker run -d -v $PWD:/w node node /w/fix.js'],
+    ['docker compose up -d', 'docker compose up -d'],
+    ['systemctl start', 'systemctl --user start fixer'],
+    ['pm2 start', 'pm2 start fix.js'],
     ['crontab', 'crontab job.txt'],
     ['systemd-run', 'systemd-run --user node fix.js'],
     ['launchctl', 'launchctl load fix.plist'],
@@ -122,7 +130,7 @@ describe('sec030 #1: background and detached shell writes', () => {
     ['&& and 2>&1', 'node fix.js 2>&1 && echo ok'],
     ['& inside a URL query', 'curl -s "https://example.com/?a=1&b=2" && node fix.js'],
     ['&> redirect', 'node fix.js &> out.log'],
-    ['the word "at" as an argument', 'git log --format=%an at'],
+    ['& inside single quotes', "echo 'a & b' && node fix.js"],
   ];
   for (const [name, cmd] of foreground) {
     it(`a foreground command (${name}) does not open its window: a later human edit is not credited`, async () => {

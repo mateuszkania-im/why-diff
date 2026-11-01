@@ -978,7 +978,7 @@ export function tokenize(input: string): Token[] {
     }
     if (ch === '&' && next !== '>') {
       flush();
-      tokens.push({ kind: 'op', text: ';' });
+      tokens.push({ kind: 'op', text: '&' }); // backgrounds the command before it; ends it like `;`
       i++;
       continue;
     }
@@ -1058,7 +1058,7 @@ function matchParen(s: string, open: number): number {
   return s.length - 1;
 }
 
-/** Group tokens into simple commands at `&&`, `||`, `;`, `|`, `(`, `)`. */
+/** Group tokens into simple commands at `&&`, `||`, `;`, `&`, `|`, `(`, `)`. */
 export function splitSimpleCommands(tokens: Token[]): SimpleCommand[] {
   const commands: SimpleCommand[] = [];
   let current: SimpleCommand = { words: [], masks: [], redirects: [] };
@@ -1077,4 +1077,66 @@ export function splitSimpleCommands(tokens: Token[]): SimpleCommand[] {
   }
   close(false);
   return commands;
+}
+
+// ---------------------------------------------------------------------------
+// Detached processes
+// ---------------------------------------------------------------------------
+
+/** Commands that start something that outlives them, matched by basename in any word position. */
+const DETACH_WORDS: ReadonlySet<string> = new Set([
+  'nohup', 'setsid', 'disown', 'at', 'batch', 'crontab', 'systemd-run', 'launchctl', 'tmux', 'screen', 'coproc',
+  'daemonize', 'start-stop-daemon', 'start-process', 'start-job',
+]);
+const SHELLS: ReadonlySet<string> = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish']);
+const MAX_DETACH_DEPTH = 4;
+
+/**
+ * Does the command leave a process running after the tool call returns? True for a single `&`
+ * outside quotes (`&&`, `>&`, `<&`, `&>`, `&>>` and `|&` are not), also inside `sh -c` / `eval`
+ * scripts and command substitutions, and for a detaching launcher anywhere in a simple command,
+ * by basename and after quotes and escapes are removed (`/usr/bin/nohup`, `\nohup`, `sudo setsid`):
+ * nohup, setsid, disown, at, batch, crontab, systemd-run, launchctl, tmux, screen, coproc,
+ * `docker|podman [container] run -d`, `docker compose up -d`, `systemctl start|restart|reload`,
+ * `pm2 start`, `forever start`, PowerShell Start-Process / Start-Job, cmd `start`. Over-matching
+ * only widens the call's time window. A command the lexer cannot read counts as detaching.
+ */
+export function detachesProcess(command: string, depth = 0): boolean {
+  let tokens: Token[];
+  try {
+    tokens = tokenize(command);
+  } catch {
+    return true;
+  }
+  if (tokens.some((t) => t.kind === 'op' && t.text === '&')) return true;
+  for (const cmd of splitSimpleCommands(tokens)) {
+    const names = cmd.words.map((w) => path.basename(w.replace(/\\/g, '/')).toLowerCase());
+    if (names.some((n) => DETACH_WORDS.has(n))) return true;
+    if (names[0] === 'start' && cmd.words.length > 1) return true; // cmd.exe `start /b x`
+    const at = (word: string): number => names.indexOf(word);
+    const has = (...flags: RegExp[]): boolean => cmd.words.some((w) => flags.some((f) => f.test(w)));
+    for (const engine of ['docker', 'podman']) {
+      const e = at(engine);
+      if (e === -1) continue;
+      const rest = names.slice(e + 1);
+      if (rest.includes('run') && has(/^-[A-Za-z]*d[A-Za-z]*$/, /^--detach(=true)?$/)) return true;
+      if (rest.includes('compose') && rest.includes('up') && has(/^-[A-Za-z]*d[A-Za-z]*$/, /^--detach$/)) return true;
+    }
+    if (at('docker-compose') !== -1 && names.includes('up') && has(/^-[A-Za-z]*d[A-Za-z]*$/, /^--detach$/)) return true;
+    if (at('systemctl') !== -1 && names.some((n) => n === 'start' || n === 'restart' || n === 'reload' || n === '--now')) return true;
+    if ((at('pm2') !== -1 || at('forever') !== -1) && names.some((n) => n === 'start' || n === 'restart')) return true;
+    if (depth >= MAX_DETACH_DEPTH) continue;
+    // Nested scripts: `sh -c '...'`, `eval '...'`, and every command substitution.
+    for (const [i, n] of names.entries()) {
+      const c = SHELLS.has(n) ? cmd.words.indexOf('-c', i) : -1;
+      const script = n === 'eval' ? cmd.words.slice(i + 1).join(' ') : c !== -1 ? cmd.words[c + 1] : undefined;
+      if (script && detachesProcess(script, depth + 1)) return true;
+    }
+    for (const [i, w] of cmd.words.entries()) {
+      const mask = cmd.masks[i] ?? '';
+      if (!mask.includes('c')) continue;
+      for (const m of w.matchAll(/\$\(([\s\S]*)\)|`([\s\S]*?)`/g)) if (detachesProcess(m[1] ?? m[2] ?? '', depth + 1)) return true;
+    }
+  }
+  return false;
 }

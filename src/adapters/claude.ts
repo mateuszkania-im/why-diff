@@ -27,7 +27,9 @@ import readline from 'node:readline';
 
 import type { DiscoverOptions, EditKind, FileEdit, Harness, Prompt, Session, SessionAdapter, ToolWindow } from '../types.js';
 import { DRIVE_PATH, driveKey, fileMentions, filePathNeedles, pathWithin } from './scan.js';
-import { detectBashMutations } from './bash-mutations.js';
+import { detachesProcess, detectBashMutations } from './bash-mutations.js';
+
+export { detachesProcess };
 
 // ---------------------------------------------------------------------------
 // Transcript line shapes (only the fields we read; everything is optional
@@ -135,17 +137,6 @@ const TOOL_USE_ID = Buffer.from('"tool_use_id":"');
 const BACKGROUND_TASK = Buffer.from('"backgroundTaskId"');
 const RAW_TIMESTAMP = /"timestamp":"(\d{4}-\d\d-\d\dT[\d:.]+Z)"/g;
 
-/**
- * Commands that leave a process running after the call returns: a bare `&` (not `&&`, `2>&1`,
- * `&>`, `|&`), or a detaching launcher in command position (`nohup`, `setsid`, `disown`, `at`,
- * `batch`, `crontab`, `systemd-run`, `launchctl`, `tmux`, `screen`, PowerShell `Start-Process` /
- * `Start-Job`, cmd `start`). Erring towards "detaches" only widens the call's window.
- */
-const BARE_AMPERSAND = /(?<![&|<>])&(?=\s|$|[;)}'"`!])/;
-const DETACH_LAUNCHER = /(?:^|[;&|({\n`'"]|\$\()\s*(?:(?:sudo|exec|env|command|nice|time|xargs)\s+(?:-\S+\s+)*)*(?:\w+=\S*\s+)*(?:nohup|setsid|disown|at|batch|crontab|systemd-run|launchctl|tmux|screen|daemonize|start-stop-daemon|start|Start-Process|Start-Job)(?=$|[\s;&|)}'"`])/i;
-export function detachesProcess(command: string): boolean {
-  return BARE_AMPERSAND.test(command) || DETACH_LAUNCHER.test(command);
-}
 
 /** Tools whose result can turn into FileEdits (see emitEdits). */
 function mayEdit(name: string): boolean {

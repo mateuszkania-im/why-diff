@@ -527,9 +527,19 @@ describe('ClaudeCodeAdapter.parse: tool windows', () => {
 });
 
 describe('detachesProcess', () => {
-  const yes = ['node a.js &', 'node a.js & echo started', '(sleep 9; x) &', "sh -c 'x &'", 'nohup x', 'setsid x', 'x & disown', 'echo x | at now', 'sudo -n at now', 'crontab f', 'systemd-run x',
-    'launchctl load f', "tmux new -d 'x'", 'screen -dm x', 'FOO=1 nohup x', 'Start-Process node', 'start /b node a.js', 'x &!'];
-  const no = ['a && b', 'a 2>&1', 'a &> log', 'a |& tee log', 'a >&2', 'curl "https://x/?a=1&b=2"', 'git log --format=%an at', 'npm start', 'echo screen', 'cat <&3'];
+  const yes = [
+    'node a.js &', 'node a.js & echo started', '(sleep 9; x) &', "sh -c 'x &'", 'bash -c "x & y"', 'eval "x &"', 'x & disown', 'x &!',
+    // a single & is detaching whatever follows it
+    'x &y', 'x&y', 'a&b', 'x &# comment', 'x &\ny', 'echo $(x &)', 'echo `x &`',
+    // launchers by basename, escaped, behind wrappers or other words
+    'nohup x', '/usr/bin/nohup x', '\\nohup x', 'n\\ohup x', "'nohup' x", 'FOO=1 nohup x', 'sudo -n nohup x', 'env -i /usr/bin/setsid x', 'time timeout 5 nohup x',
+    'setsid x', 'x | setsid y', 'echo x | at now', 'crontab f', 'systemd-run x', 'launchctl load f', "tmux new -d 'x'", 'screen -dm x', 'coproc x',
+    'Start-Process node', 'start /b node a.js',
+    'docker run -d img', 'docker run --detach img', 'podman run -dit img', 'docker container run -d img', 'docker compose up -d', 'docker-compose up --detach',
+    'systemctl start x', 'systemctl --user restart x', 'pm2 start a.js', 'forever start a.js',
+  ];
+  const no = ['a && b', 'a 2>&1', 'a &> log', 'a &>> log', 'a |& tee log', 'a >&2', 'cat <&3', 'curl "https://x/?a=1&b=2"', "echo 'a & b'", 'echo a\\&b',
+    'npm start', 'docker run img', 'docker compose up', 'systemctl status x', 'pm2 logs'];
   for (const c of yes) it(`detaches: ${c}`, () => expect(detachesProcess(c)).toBe(true));
   for (const c of no) it(`stays in the foreground: ${c}`, () => expect(detachesProcess(c)).toBe(false));
 });
