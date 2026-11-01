@@ -7,8 +7,9 @@
  * hunks that the session's edits exactly explain can block. A human's uncommitted change in the
  * same file never does. Every internal error means "do not block".
  */
-import { createHash, randomBytes } from 'node:crypto';
-import { lstat, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { lstat, readdir } from 'node:fs/promises';
+import readline from 'node:readline';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
@@ -32,8 +33,6 @@ export interface GuardOptions {
   blocking?: Set<LabelKind>;
   /** Home dir for transcript discovery (tests) */
   home?: string;
-  /** Where guard-state.json lives; default `<repo>/.why-diff` */
-  stateDir?: string;
   /** Change time of a path in ms (tests); default: lstat ctime */
   statTime?: (absPath: string) => Promise<number>;
 }
@@ -184,25 +183,16 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
     }
   }
 
-  const stateDir = opts.stateDir ?? path.join(root, '.why-diff');
-  const stateFile = path.join(stateDir, 'guard-state.json');
-  const sessionKey = payload.session_id ?? session.id;
-  const hash = createHash('sha256').update(keys.sort().join('\n')).digest('hex');
-  // State only dedupes repeat blocks: any failure here must never change the decision below.
-  try {
-    const prev = (await readState(stateFile))[sessionKey];
-    if (prev?.hash === hash) return { block: false, hits };
-    if (hits.length || prev) await recordState(stateDir, stateFile, sessionKey, { hash, at: new Date().toISOString() });
-  } catch {
-    // fall through with the computed decision
-  }
-
   if (!hits.length) return NO_BLOCK;
+  // Block once per finding list: skip it only when Claude Code itself already delivered this exact
+  // list to the agent (its own record of a Stop hook block in the transcript). Nothing the agent
+  // can write from a tool call (a state file, a guard run of its own, tool output) counts.
+  if (await alreadyDelivered(payload.transcript_path, hits)) return { block: false, hits };
   return {
     block: true,
     hits,
     message:
-      `why-diff guard: your changes in this session include risky edits:\n${hits.join('\n')}\n\n` +
+      `${MESSAGE_HEAD}${hits.join('\n')}\n\n` +
       'Before finishing: if you skipped, weakened or removed tests (or changed CI/secrets), either revert that change ' +
       'or tell the user explicitly what you changed and why, so they can decide. Do not hide it.\n',
   };
@@ -333,114 +323,42 @@ function shellOnly(hunk: Hunk): boolean {
   return false;
 }
 
-type GuardState = Record<string, { hash: string; at: string }>;
-const STATE_TTL_MS = 30 * 86_400_000;
-
-async function readState(file: string): Promise<GuardState> {
-  try {
-    const parsed: unknown = JSON.parse(await readFile(file, 'utf8'));
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    const out: GuardState = {};
-    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-      const e = v as { hash?: unknown; at?: unknown } | null;
-      if (e && typeof e === 'object' && typeof e.hash === 'string' && typeof e.at === 'string') out[k] = { hash: e.hash, at: e.at };
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
+const MESSAGE_HEAD = 'why-diff guard: your changes in this session include risky edits:\n';
 
 /**
- * Store one session's entry. Guards of parallel sessions write the same file, so the update runs
- * under an exclusive lock file (`wx` create; a lock older than {@link LOCK_STALE} is taken
- * over), merges into the latest on-disk state, and lands with an atomic temp-file + rename.
- * If the lock cannot be had, nothing is written (a possible repeat block, never a hang).
+ * Did Claude Code already deliver a block with exactly these hits? Only harness-written transcript
+ * lines count: a `hook_blocking_error` attachment of the Stop event, or a `stop_hook_summary` system
+ * line. Tool results, assistant text and anything in the working tree do not.
  */
-async function recordState(dir: string, file: string, key: string, entry: { hash: string; at: string }): Promise<void> {
+async function alreadyDelivered(transcript: string, hits: string[]): Promise<boolean> {
+  const needle = `${MESSAGE_HEAD}${hits.join('\n')}\n\n`;
+  const stream = createReadStream(transcript, { encoding: 'utf8' });
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
   try {
-    await mkdir(dir, { recursive: true });
-    if (path.basename(dir) === '.why-diff') {
-      await writeFile(path.join(dir, '.gitignore'), '*\n', { flag: 'wx' }).catch(() => {});
-    }
-    const lock = `${file}.lock`;
-    // No lock, no write: the state only dedupes repeat blocks, so skipping it is always safe.
-    const token = await acquireLock(lock);
-    if (!token) return;
-    try {
-      const state = await readState(file);
-      state[key] = entry;
-      const cutoff = Date.now() - STATE_TTL_MS;
-      for (const [k, v] of Object.entries(state)) if (!(Date.parse(v.at) >= cutoff)) delete state[k];
-      const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+    for await (const raw of lines) {
+      if (!raw.includes('why-diff guard') || !(raw.includes('hook_blocking_error') || raw.includes('stop_hook_summary'))) continue;
+      let line: { type?: unknown; subtype?: unknown; attachment?: { type?: unknown; hookEvent?: unknown } } & Record<string, unknown>;
       try {
-        await writeFile(tmp, JSON.stringify(state));
-        await rename(tmp, file);
-      } finally {
-        await rm(tmp, { force: true }).catch(() => {});
+        line = JSON.parse(raw) as typeof line;
+      } catch {
+        continue;
       }
-    } finally {
-      await releaseLock(lock, token);
+      const harnessLine =
+        (line.type === 'attachment' && line.attachment?.type === 'hook_blocking_error' && line.attachment.hookEvent === 'Stop') ||
+        (line.type === 'system' && line.subtype === 'stop_hook_summary');
+      if (!harnessLine) continue;
+      const source = line.type === 'attachment' ? line.attachment : line;
+      if (strings(source).some((t) => t.includes(needle))) return true;
     }
-  } catch {
-    // state is best effort; a failed write only means a possible repeat block
+  } finally {
+    lines.close();
+    stream.destroy();
   }
+  return false;
 }
 
-const LOCK_WAIT_MS = 3000;
-const LOCK_STALE = 10_000;
-
-const pause = (): Promise<void> => new Promise((r) => setTimeout(r, 5 + Math.floor(Math.random() * 20)));
-
-/**
- * Take the state lock: exclusive `wx` create of a regular file. A lock older than `staleMs` is
- * removed and retried. Every iteration checks the deadline first and every retry sleeps, so this
- * always returns within about `waitMs`: a random owner token, or null (no lock) on timeout, on a
- * lock path that is not a regular file, on a stale lock that cannot be removed, or on any
- * unexpected error. The guard must never hang; without the lock the dedupe state is not written.
- *
- * Known race, accepted: two waiters can both judge the same lock stale, and the second can remove
- * the lock the first just took over. Both then write; the worst outcome is a lost dedupe entry, so
- * one repeat block, never a missed one. The owner token keeps a writer from removing a lock that
- * is no longer its own on release.
- */
-export async function acquireLock(lock: string, opts: { waitMs?: number; staleMs?: number } = {}): Promise<string | null> {
-  const deadline = Date.now() + (opts.waitMs ?? LOCK_WAIT_MS);
-  const staleMs = opts.staleMs ?? LOCK_STALE;
-  const token = `${process.pid}-${randomBytes(8).toString('hex')}`;
-  for (;;) {
-    if (Date.now() > deadline) return null;
-    try {
-      await writeFile(lock, token, { flag: 'wx' });
-      return token;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') return null;
-    }
-    let info;
-    try {
-      info = await lstat(lock);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
-      await pause(); // released between our attempts
-      continue;
-    }
-    if (!info.isFile()) return null; // a directory, symlink or device is never our lock
-    if (Date.now() - info.mtimeMs > staleMs) {
-      try {
-        await rm(lock);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
-      }
-    }
-    await pause();
-  }
-}
-
-/** Remove the lock only while it still holds our token (it may have been taken over as stale). */
-export async function releaseLock(lock: string, token: string): Promise<void> {
-  try {
-    if ((await readFile(lock, 'utf8')) === token) await rm(lock, { force: true });
-  } catch {
-    // gone already, or unreadable: leave it; it goes stale and is taken over
-  }
+function strings(v: unknown, depth = 0): string[] {
+  if (typeof v === 'string') return [v];
+  if (depth > 4 || !v || typeof v !== 'object') return [];
+  return Object.values(v as Record<string, unknown>).flatMap((x) => strings(x, depth + 1));
 }

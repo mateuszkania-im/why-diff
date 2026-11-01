@@ -1,11 +1,11 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { lstat } from 'node:fs/promises';
 import { afterEach, describe, expect, it } from 'vitest';
-import { acquireLock, releaseLock, runGuard } from '../src/guard.js';
+import { runGuard } from '../src/guard.js';
 import type { LabelKind } from '../src/types.js';
 import { shellPath, tempDir, writeSyntheticTranscript, type SyntheticCall } from './helpers/claude-fixture.js';
 import { bestOfAsync, expectSubQuadratic } from './helpers/perf.js';
@@ -41,7 +41,7 @@ function testFile(): string {
   return s;
 }
 
-function makeRepo(realRoot = true): { repo: string; home: string; stateDir: string } {
+function makeRepo(realRoot = true): { repo: string; home: string } {
   const repo = realRoot ? temp('why-diff-guard-repo-') : mkdtempSync(path.join(os.tmpdir(), 'why-diff-guard-sym-'));
   if (!realRoot) dirs.push(repo);
   mkdirSync(path.join(repo, 'test'));
@@ -49,7 +49,7 @@ function makeRepo(realRoot = true): { repo: string; home: string; stateDir: stri
   sh(repo, ['init', '-q', '-b', 'main']);
   sh(repo, ['add', '-A']);
   sh(repo, ['commit', '-qm', 'init'], LONG_AGO);
-  return { repo, home: temp('why-diff-guard-home-'), stateDir: temp('why-diff-guard-state-') };
+  return { repo, home: temp('why-diff-guard-home-') };
 }
 
 /** Change time as the guard reads it, except that git objects count as written before the session (test setup). */
@@ -76,57 +76,61 @@ const ASSERT_NEW = '  expect(f(2)).toBe(2);\n  expect(f(2)).not.toBe(3);\n';
 
 describe('runGuard', () => {
   it("does not block on a human's uncommitted it.skip in a file the agent also edited", async () => {
-    const { repo, home, stateDir } = makeRepo();
+    const { repo, home } = makeRepo();
     applyEdit(repo, 'it("t25",()=>{\n', 'it.skip("t25",()=>{\n'); // human, not in transcript
     const transcript = writeSyntheticTranscript(home, repo, 's-human', [{ prompt: 'add an assertion to t2', at: SESSION_AT, calls: [editCall(repo, ASSERT_OLD, ASSERT_NEW)] }]);
     applyEdit(repo, ASSERT_OLD, ASSERT_NEW);
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-human' }, { blocking: BLOCKING, home, stateDir });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-human' }, { blocking: BLOCKING, home });
     expect(r.block).toBe(false);
     expect(r.hits).toEqual([]);
   });
 
   it("blocks when the agent's own edit adds it.skip", async () => {
-    const { repo, home, stateDir } = makeRepo();
+    const { repo, home } = makeRepo();
     const transcript = writeSyntheticTranscript(home, repo, 's-own', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-own' }, { blocking: BLOCKING, home, stateDir });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-own' }, { blocking: BLOCKING, home });
     expect(r.block).toBe(true);
     expect(r.message).toContain('test/f.test.js');
     expect(r.message).toContain('test-skip-added');
   });
 
   it('blocks on an agent edit that was committed during the session', async () => {
-    const { repo, home, stateDir } = makeRepo();
+    const { repo, home } = makeRepo();
     const transcript = writeSyntheticTranscript(home, repo, 's-commit', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
     sh(repo, ['commit', '-qam', 'agent commit'], new Date().toISOString());
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-commit' }, { blocking: BLOCKING, home, stateDir });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-commit' }, { blocking: BLOCKING, home });
     expect(r.block).toBe(true);
     expect(r.message).toContain('test-skip-added');
   });
 
-  it('does not block twice for the same hits; a new risky edit blocks again', async () => {
-    const { repo, home, stateDir } = makeRepo();
+  it('does not block twice once Claude Code delivered the same hits; a new risky edit blocks again', async () => {
+    const { repo, home } = makeRepo();
     const t1 = writeSyntheticTranscript(home, repo, 's-twice', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
     const payload = { transcript_path: t1, cwd: repo, session_id: 's-twice' };
-    expect((await runGuard(payload, { blocking: BLOCKING, home, stateDir })).block).toBe(true);
-    expect((await runGuard(payload, { blocking: BLOCKING, home, stateDir })).block).toBe(false);
+    const first = await runGuard(payload, { blocking: BLOCKING, home });
+    expect(first.block).toBe(true);
+    const delivered = `${JSON.stringify({ type: 'attachment', timestamp: new Date().toISOString(), attachment: { type: 'hook_blocking_error', hookName: 'Stop', hookEvent: 'Stop', blockingError: { blockingError: first.message, command: 'why-diff guard' } } })}\n`;
+    appendFileSync(t1, delivered);
+    expect((await runGuard(payload, { blocking: BLOCKING, home })).block).toBe(false);
 
     const t2 = writeSyntheticTranscript(home, repo, 's-twice', [{
       prompt: 'fix t5 and t9',
       at: SESSION_AT,
       calls: [editCall(repo, SKIP_OLD, SKIP_NEW), editCall(repo, 'it("t9",()=>{\n', 'it.skip("t9",()=>{\n')],
     }]);
+    appendFileSync(t2, delivered);
     applyEdit(repo, 'it("t9",()=>{\n', 'it.skip("t9",()=>{\n');
-    const r = await runGuard({ ...payload, transcript_path: t2 }, { blocking: BLOCKING, home, stateDir });
+    const r = await runGuard({ ...payload, transcript_path: t2 }, { blocking: BLOCKING, home });
     expect(r.block).toBe(true);
   });
 
   describe('shell deletes and renames of tests', () => {
     const BL = new Set<LabelKind>(['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path']);
     async function run(cmd: string | null, act: (repo: string) => void, blocking = BL, seed?: (repo: string) => void): Promise<{ block: boolean; message?: string }> {
-      const { repo, home, stateDir } = makeRepo();
+      const { repo, home } = makeRepo();
       mkdirSync(path.join(repo, 'src'), { recursive: true });
       writeFileSync(path.join(repo, 'src', 'x.js'), 'export const x = 1;\n');
       seed?.(repo);
@@ -138,7 +142,7 @@ describe('runGuard', () => {
       writeFileSync(path.join(repo, 'src', 'x.js'), 'export const x = 2;\n');
       act(repo);
       // The setup commits are made now, after the synthetic session start: date their objects before it.
-      return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sh' }, { blocking, home, stateDir, statTime: setupObjectsBeforeSession });
+      return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sh' }, { blocking, home, statTime: setupObjectsBeforeSession });
     }
     it('blocks on rm of a test file', async () => {
       const r = await run('rm $R/test/f.test.js', (repo) => rmSync(path.join(repo, 'test', 'f.test.js')));
@@ -257,92 +261,12 @@ describe('runGuard', () => {
     });
   });
 
-  it('keeps every session entry when guards for different sessions run in parallel', async () => {
-    const { repo, home, stateDir } = makeRepo();
-    const ids = ['s-par-1', 's-par-2', 's-par-3', 's-par-4', 's-par-5', 's-par-6'];
-    applyEdit(repo, SKIP_OLD, SKIP_NEW);
-    const transcripts = ids.map((id) => writeSyntheticTranscript(home, repo, id, [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]));
-    const results = await Promise.all(ids.map((id, i) => runGuard({ transcript_path: transcripts[i], cwd: repo, session_id: id }, { blocking: BLOCKING, home, stateDir })));
-    expect(results.every((r) => r.block)).toBe(true);
-    const state = JSON.parse(readFileSync(path.join(stateDir, 'guard-state.json'), 'utf8')) as Record<string, unknown>;
-    expect(Object.keys(state).sort()).toEqual(ids);
-  });
-
-  describe('state lock never hangs the guard', () => {
-    const old = new Date(Date.now() - 3600_000);
-    it('a lock path that is a directory: the decision comes back quickly', async () => {
-      const { repo, home, stateDir } = makeRepo();
-      mkdirSync(path.join(stateDir, 'guard-state.json.lock'));
-      utimesSync(path.join(stateDir, 'guard-state.json.lock'), old, old);
-      const transcript = writeSyntheticTranscript(home, repo, 's-lockdir', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
-      applyEdit(repo, SKIP_OLD, SKIP_NEW);
-      const t0 = Date.now();
-      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-lockdir' }, { blocking: BLOCKING, home, stateDir });
-      expect(r.block).toBe(true);
-      expect(Date.now() - t0).toBeLessThan(5000);
-    }, 10_000);
-
-    // chmod 0o555 does not stop deleting files on Windows.
-    it.skipIf(process.platform === 'win32')('a stale lock that cannot be removed: acquireLock gives up instead of looping', async () => {
-      const dir = temp('why-diff-guard-lockro-');
-      const lock = path.join(dir, 'state.lock');
-      writeFileSync(lock, '1');
-      utimesSync(lock, old, old);
-      chmodSync(dir, 0o555);
-      try {
-        const t0 = Date.now();
-        expect(await acquireLock(lock, { waitMs: 200, staleMs: 1000 })).toBeNull();
-        expect(Date.now() - t0).toBeLessThan(2000);
-      } finally {
-        chmodSync(dir, 0o755);
-      }
-    }, 10_000);
-
-    it('releases only its own lock: a lock taken over by another writer is left alone', async () => {
-      const dir = temp('why-diff-guard-lockown-');
-      const lock = path.join(dir, 'state.lock');
-      const token = await acquireLock(lock);
-      expect(token).toEqual(expect.any(String));
-      writeFileSync(lock, 'someone-else');
-      await releaseLock(lock, token!);
-      expect(readFileSync(lock, 'utf8')).toBe('someone-else');
-      writeFileSync(lock, token!);
-      await releaseLock(lock, token!);
-      expect(existsSync(lock)).toBe(false);
-    });
-
-    it('a stale lock that is re-created all the time: acquireLock stops at the deadline', async () => {
-      const dir = temp('why-diff-guard-lockre-');
-      const lock = path.join(dir, 'state.lock');
-      // Another writer keeps putting back a stale-looking lock (a hostile or broken peer).
-      const keep = setInterval(() => {
-        try { writeFileSync(lock, '1'); utimesSync(lock, old, old); } catch { /* racing */ }
-      }, 0);
-      try {
-        const t0 = Date.now();
-        await acquireLock(lock, { waitMs: 300, staleMs: 1000 });
-        expect(Date.now() - t0).toBeLessThan(3000);
-      } finally {
-        clearInterval(keep);
-      }
-    }, 10_000);
-  });
-
-  it('creates the state dir with a * .gitignore', async () => {
-    const { repo, home } = makeRepo();
-    const transcript = writeSyntheticTranscript(home, repo, 's-ign', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
-    applyEdit(repo, SKIP_OLD, SKIP_NEW);
-    await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-ign' }, { blocking: BLOCKING, home });
-    expect(readFileSync(path.join(repo, '.why-diff', '.gitignore'), 'utf8')).toBe('*\n');
-    expect(existsSync(path.join(repo, '.why-diff', 'guard-state.json'))).toBe(true);
-  });
-
   it('returns quietly when stop_hook_active or without transcript_path', async () => {
-    const { repo, home, stateDir } = makeRepo();
-    expect((await runGuard({ cwd: repo }, { blocking: BLOCKING, home, stateDir })).block).toBe(false);
+    const { repo, home } = makeRepo();
+    expect((await runGuard({ cwd: repo }, { blocking: BLOCKING, home })).block).toBe(false);
     const transcript = writeSyntheticTranscript(home, repo, 's-act', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
-    expect((await runGuard({ transcript_path: transcript, cwd: repo, stop_hook_active: true }, { blocking: BLOCKING, home, stateDir })).block).toBe(false);
+    expect((await runGuard({ transcript_path: transcript, cwd: repo, stop_hook_active: true }, { blocking: BLOCKING, home })).block).toBe(false);
   });
 
   it('never throws outside a git repo', async () => {
@@ -351,10 +275,10 @@ describe('runGuard', () => {
   });
 
   it('blocks when the transcript uses a symlinked (non-realpath) location of the repo', async () => {
-    const { repo, home, stateDir } = makeRepo(false);
+    const { repo, home } = makeRepo(false);
     const transcript = writeSyntheticTranscript(home, repo, 's-sym', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sym' }, { blocking: BLOCKING, home, stateDir });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-sym' }, { blocking: BLOCKING, home });
     expect(r.block).toBe(true);
   });
 
@@ -366,21 +290,7 @@ describe('runGuard', () => {
     expect(existsSync(path.join(repo, '.why-diff'))).toBe(false);
   });
 
-  it('keeps an existing .why-diff/.gitignore and prunes state entries older than 30 days', async () => {
-    const { repo, home } = makeRepo();
-    mkdirSync(path.join(repo, '.why-diff'));
-    writeFileSync(path.join(repo, '.why-diff', '.gitignore'), 'custom\n');
-    const old = new Date(Date.now() - 31 * 86_400_000).toISOString();
-    writeFileSync(path.join(repo, '.why-diff', 'guard-state.json'), JSON.stringify({ stale: { hash: 'x', at: old } }));
-    const transcript = writeSyntheticTranscript(home, repo, 's-prune', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
-    applyEdit(repo, SKIP_OLD, SKIP_NEW);
-    await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-prune' }, { blocking: BLOCKING, home });
-    expect(readFileSync(path.join(repo, '.why-diff', '.gitignore'), 'utf8')).toBe('custom\n');
-    const state = JSON.parse(readFileSync(path.join(repo, '.why-diff', 'guard-state.json'), 'utf8')) as Record<string, unknown>;
-    expect(Object.keys(state)).toEqual(['s-prune']);
-  });
-
-  it('a corrupt state file cannot turn the guard off', async () => {
+  it('writes no state: a forged or corrupt .why-diff/guard-state.json changes nothing', async () => {
     const { repo, home } = makeRepo();
     mkdirSync(path.join(repo, '.why-diff'));
     writeFileSync(path.join(repo, '.why-diff', 'guard-state.json'), '{"s1": null, "s2": 42, "s3": "abc"}');
@@ -388,19 +298,18 @@ describe('runGuard', () => {
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
     const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-corrupt' }, { blocking: BLOCKING, home });
     expect(r.block).toBe(true);
-    const state = JSON.parse(readFileSync(path.join(repo, '.why-diff', 'guard-state.json'), 'utf8')) as Record<string, unknown>;
-    expect(Object.keys(state)).toEqual(['s-corrupt']);
+    expect(readFileSync(path.join(repo, '.why-diff', 'guard-state.json'), 'utf8')).toBe('{"s1": null, "s2": 42, "s3": "abc"}');
   });
 
   it('skips a huge untracked file the agent wrote (2 MB cap): cost does not grow with its size', async () => {
-    const { repo, home, stateDir } = makeRepo();
+    const { repo, home } = makeRepo();
     const big = path.join(repo, 'dump.log');
     const transcript = writeSyntheticTranscript(home, repo, 's-big', [{ prompt: 'write a dump', at: SESSION_AT, calls: [{ tool: 'Write', at: CALL_AT, input: { file_path: big, content: 'it.skip("x")\n' } }] }]);
     const timeWith = async (mb: number): Promise<number> => {
       writeFileSync(big, Buffer.alloc(mb * 1024 * 1024, 'a'));
       let block = true;
       const ms = await bestOfAsync(async () => {
-        block = (await runGuard({ transcript_path: transcript, cwd: repo, session_id: `s-big-${mb}` }, { blocking: BLOCKING, home, stateDir })).block;
+        block = (await runGuard({ transcript_path: transcript, cwd: repo, session_id: `s-big-${mb}` }, { blocking: BLOCKING, home })).block;
       });
       expect(block).toBe(false);
       return ms;
@@ -427,7 +336,7 @@ describe('runGuard: shell changes whose path the command does not name (tool cal
   // Tests date files by their mtime (settable with utimes); the guard itself uses ctime on POSIX.
   const byMtime = async (p: string): Promise<number> => (await lstat(p)).mtimeMs;
   async function run(act: (repo: string) => void, opts: { resultAt?: number; sessionAt?: number; callAt?: number; statTime?: (p: string) => Promise<number> } = {}): Promise<{ block: boolean; message?: string }> {
-    const { repo, home, stateDir } = makeRepo();
+    const { repo, home } = makeRepo();
     writeFileSync(path.join(repo, 'fix.js'), FIX_JS);
     sh(repo, ['add', '-A']);
     sh(repo, ['commit', '-qm', 'script'], LONG_AGO);
@@ -438,7 +347,7 @@ describe('runGuard: shell changes whose path the command does not name (tool cal
       calls: [{ tool: 'Bash', at: iso(callAt), resultAt: iso(opts.resultAt ?? callAt + 4000), input: { command: `cd ${shellPath(repo)} && node fix.js`, description: 'run the fixer' } }],
     }]);
     act(repo);
-    return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-win' }, { blocking: BL, home, stateDir, statTime: 'statTime' in opts ? opts.statTime : byMtime });
+    return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-win' }, { blocking: BL, home, statTime: 'statTime' in opts ? opts.statTime : byMtime });
   }
   const testPath = (repo: string): string => path.join(repo, 'test', 'f.test.js');
 
@@ -529,7 +438,7 @@ describe('runGuard: shell changes whose path the command does not name (tool cal
   });
 
   it('credits a change under a protected path the same way', async () => {
-    const { repo, home, stateDir } = makeRepo();
+    const { repo, home } = makeRepo();
     mkdirSync(path.join(repo, 'infra'));
     writeFileSync(path.join(repo, 'infra', 'main.tf'), 'a = 1\n');
     writeFileSync(path.join(repo, '.why-diff.json'), JSON.stringify({ protected: ['infra/**'] }));
@@ -541,7 +450,7 @@ describe('runGuard: shell changes whose path the command does not name (tool cal
     }]);
     writeFileSync(path.join(repo, 'infra', 'main.tf'), 'a = 2\n');
     utimesSync(path.join(repo, 'infra', 'main.tf'), sec(T + 1000), sec(T + 1000));
-    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-prot' }, { blocking: BL, home, stateDir, statTime: byMtime });
+    const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-prot' }, { blocking: BL, home, statTime: byMtime });
     expect(r.block).toBe(true);
     expect(r.message).toContain('protected-path');
   });
@@ -550,14 +459,14 @@ describe('runGuard: shell changes whose path the command does not name (tool cal
 describe('runGuard with Unicode file names', () => {
   for (const [name, form] of [['NFD', 'NFD'], ['NFC', 'NFC']] as const) {
     it(`blocks on an it.skip the agent wrote into a test file named in ${name}`, async () => {
-      const { repo, home, stateDir } = makeRepo();
+      const { repo, home } = makeRepo();
       const file = path.join(repo, 'test', 'caf\u00e9.test.js'.normalize(form));
       writeFileSync(file, testFile());
       sh(repo, ['add', '-A']);
       sh(repo, ['commit', '-qm', 'cafe'], LONG_AGO);
       const transcript = writeSyntheticTranscript(home, repo, 's-nfd', [{ prompt: 'fix t5', at: SESSION_AT, calls: [{ tool: 'Edit', at: CALL_AT, input: { file_path: path.join(repo, 'test', 'cafe\u0301.test.js'), old_string: SKIP_OLD, new_string: SKIP_NEW } }] }]);
       writeFileSync(file, readFileSync(file, 'utf8').replace(SKIP_OLD, SKIP_NEW));
-      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-nfd' }, { blocking: BLOCKING, home, stateDir });
+      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-nfd' }, { blocking: BLOCKING, home });
       expect(r.block).toBe(true);
     });
   }
@@ -570,11 +479,11 @@ describe('runGuard on pasted blobs', () => {
     ['unclosed reminder tags', '<system-reminder>'.repeat(18_000)],
   ] as const) {
     it(`blocks on a 300 KB prompt of ${name} well within the hook timeout`, async () => {
-      const { repo, home, stateDir } = makeRepo();
+      const { repo, home } = makeRepo();
       const transcript = writeSyntheticTranscript(home, repo, 's-blob', [{ prompt: `fix t5 ${blob}`, at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
       applyEdit(repo, SKIP_OLD, SKIP_NEW);
       const t0 = Date.now();
-      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-blob' }, { blocking: BLOCKING, home, stateDir });
+      const r = await runGuard({ transcript_path: transcript, cwd: repo, session_id: 's-blob' }, { blocking: BLOCKING, home });
       expect(Date.now() - t0).toBeLessThan(5000);
       expect(r.block).toBe(true);
     }, 120_000);
@@ -590,6 +499,9 @@ describe('why-diff guard CLI', () => {
     const first = run({ transcript_path: transcript, cwd: repo, session_id: 's-cli' });
     expect(first.status).toBe(2);
     expect(first.stderr).toContain('test-skip-added');
+    // Not delivered yet (an agent running the guard itself looks like this): blocks again.
+    expect(run({ transcript_path: transcript, cwd: repo, session_id: 's-cli' }).status).toBe(2);
+    appendFileSync(transcript, `${JSON.stringify({ type: 'attachment', attachment: { type: 'hook_blocking_error', hookEvent: 'Stop', blockingError: { blockingError: `Stop hook blocking error from command "why-diff guard": ${first.stderr}`, command: 'why-diff guard' } } })}\n`);
     expect(run({ transcript_path: transcript, cwd: repo, session_id: 's-cli' }).status).toBe(0);
     expect(run({ cwd: repo }).status).toBe(0);
   });
