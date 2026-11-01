@@ -6,8 +6,8 @@
  * of `git add -N`).
  */
 
-import { execFile } from 'node:child_process';
-import { lstat, readFile, readlink, realpath, stat } from 'node:fs/promises';
+import { execFile, spawn } from 'node:child_process';
+import { lstat, open, readFile, readlink, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { parseUnifiedDiff } from './diff-parse.js';
@@ -97,7 +97,36 @@ const SAFE_CONFIG = [
   'diff.noprefix=false',
   'diff.mnemonicPrefix=false',
   'diff.relative=false',
+  'core.bigFileThreshold=512m',
 ].flatMap((c) => ['-c', c]);
+
+const filterOverrides = new Map<string, Promise<string[]>>();
+
+/**
+ * `-c` arguments that switch off every filter driver configured for the repository at `cwd`
+ * (`filter.<name>.clean` / `process` / `smudge`): a clean filter rewrites working tree content
+ * before git compares it, so `*.js filter=x` plus `filter.x.clean = sed s/it.skip/it/` would
+ * hide a change. Names come from the config as data and only ever travel as single arguments.
+ */
+function filterArgs(cwd: string): Promise<string[]> {
+  let found = filterOverrides.get(cwd);
+  if (!found) {
+    found = execFileAsync('git', ['config', '-z', '--name-only', '--get-regexp', '^filter\\.'], { cwd, encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } })
+      .then(({ stdout }) => stdout, () => '')
+      .then((out) => {
+        const names = new Set<string>();
+        for (const key of out.split('\0')) {
+          const m = /^filter\.(.+)\.[^.]+$/s.exec(key);
+          if (m && !/[\0\n=]/.test(m[1]!)) names.add(m[1]!);
+        }
+        return [...names].flatMap((n) => ['-c', `filter.${n}.clean=`, '-c', `filter.${n}.process=`, '-c', `filter.${n}.smudge=`, '-c', `filter.${n}.required=false`]);
+      });
+    filterOverrides.set(cwd, found);
+    // Config can change between runs in one process (tests); a guard run is short.
+    setTimeout(() => filterOverrides.delete(cwd), 1000).unref();
+  }
+  return found;
+}
 
 /**
  * Run git in `cwd` without a shell. Resolves with trimmed-right stdout.
@@ -105,7 +134,7 @@ const SAFE_CONFIG = [
  */
 export async function git(cwd: string, args: string[], opts: { trim?: boolean } = {}): Promise<string> {
   try {
-    const { stdout } = await execFileAsync('git', [...SAFE_CONFIG, ...args], {
+    const { stdout } = await execFileAsync('git', [...SAFE_CONFIG, ...(await filterArgs(cwd)), ...args], {
       cwd,
       maxBuffer: MAX_BUFFER,
       encoding: 'utf8',
@@ -224,16 +253,16 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
   return diff;
 }
 
-/** Files git showed as binary above this size (either side) stay binary: never re-diffed as text. */
-const MAX_TEXT_REDIFF_BYTES = 2 * 1024 * 1024;
-const MAX_TEXT_REDIFF_FILES = 500;
+/** Git's binary sniff: a NUL byte within the first this many bytes of either side. */
+const BINARY_SNIFF = 8000;
 
 /**
- * Git shows a file as binary when its content is (a NUL byte in the first 8000 bytes), but also
- * when attributes say so (`*.js -diff` in `.gitattributes` or `.git/info/attributes`, a diff driver
- * with `binary = true`). Attributes cannot be switched off for a diff, so every file shown as binary
- * is diffed again with `--text`, and its text replaces the binary stub unless the text holds a NUL
- * byte (a real binary) or either side is over {@link MAX_TEXT_REDIFF_BYTES}.
+ * Git shows a file as binary when its content is (a NUL byte in the first 8000 bytes of either
+ * side), but also when attributes say so (`*.js -diff` in `.gitattributes` or `.git/info/attributes`,
+ * a diff driver with `binary = true`). Attributes cannot be switched off for a diff, so every file
+ * shown as binary whose content git would call text is diffed again with `--text`, and that text
+ * replaces the binary stub. NUL bytes later in such a file are shown as U+2400. There is no file or
+ * size cap: if the content cannot be checked, the file is re-diffed as text (fail closed).
  */
 async function revealTextMarkedBinary(cwd: string, args: string[], diff: string): Promise<string> {
   if (!diff.includes('Binary files ') && !diff.includes('GIT binary patch')) return diff;
@@ -241,48 +270,109 @@ async function revealTextMarkedBinary(cwd: string, args: string[], diff: string)
   const binary = new Map<number, string[]>();
   for (const [i, section] of sections.entries()) {
     const h = parseUnifiedDiff(section)[0];
-    if (h?.header !== BINARY_HUNK_HEADER) continue;
-    binary.set(i, [...new Set([h.file, ...(h.oldFile ? [h.oldFile] : [])])]);
-    if (binary.size >= MAX_TEXT_REDIFF_FILES) break;
+    if (h?.header === BINARY_HUNK_HEADER) binary.set(i, [...new Set([h.file, ...(h.oldFile ? [h.oldFile] : [])])]);
   }
   if (!binary.size) return diff;
   const files = [...new Set([...binary.values()].flat())];
-  const literal = files.map((f) => `:(literal)${f}`);
-  // Sizes first, from the raw diff's blob ids (all zeros: the working tree file).
-  const sizes = new Map<string, number>();
-  try {
-    const raw = (await git(cwd, [...args.filter((a) => !a.startsWith('--unified')), '--raw', '-z', '--no-abbrev', '--', ...literal], { trim: false })).split('\0');
-    const root = await repoRoot(cwd);
-    for (let i = 0; i + 1 < raw.length; ) {
-      const meta = raw[i]!;
-      if (!meta.startsWith(':')) { i++; continue; }
-      const [, , oldSha = '', newSha = '', status = ''] = meta.slice(1).split(' ');
-      const twoPaths = /^[RC]/.test(status);
-      const paths = twoPaths ? [raw[i + 1]!, raw[i + 2]!] : [raw[i + 1]!];
-      i += twoPaths ? 3 : 2;
-      let biggest = 0;
-      for (const sha of [oldSha, newSha]) {
-        if (/^0+$/.test(sha)) continue;
-        biggest = Math.max(biggest, Number(await git(cwd, ['cat-file', '-s', sha]).catch(() => 'Infinity')));
-      }
-      if (/^0+$/.test(newSha)) biggest = Math.max(biggest, await stat(path.join(root, paths[paths.length - 1]!)).then((st) => st.size, () => 0));
-      for (const p of paths) sizes.set(p, Math.max(sizes.get(p) ?? 0, biggest));
-    }
-  } catch {
-    return diff;
-  }
-  const small = literal.filter((_, i) => (sizes.get(files[i]!) ?? Infinity) <= MAX_TEXT_REDIFF_BYTES);
-  if (!small.length) return diff;
-  const text = await git(cwd, [...args, '--text', '--', ...small], { trim: false }).catch(() => '');
+  const realBinary = await binaryByContent(cwd, args, files).catch(() => new Set<string>());
+  const text = files.filter((f) => !realBinary.has(f));
+  if (!text.length) return diff;
+  const out = await git(cwd, [...args, '--text', '--', ...text.map((f) => `:(literal)${f}`)], { trim: false }).catch(() => '');
   const byFile = new Map<string, string>();
-  for (const section of splitSections(text)) {
+  for (const section of splitSections(out)) {
     const h = parseUnifiedDiff(section)[0];
-    if (h && !section.includes('\0')) byFile.set(h.file, section);
+    if (h) byFile.set(h.file, section.replace(/\0/g, '\u2400'));
   }
   return sections.map((section, i) => {
     const names = binary.get(i);
     return (names && byFile.get(names[0]!)) ?? section;
   }).join('');
+}
+
+/**
+ * Of `files` (paths on either side of the diff `args` describes), those whose content is binary by
+ * git's own rule, ignoring attributes: a NUL byte in the first 8000 bytes of the old or the new side.
+ */
+async function binaryByContent(cwd: string, args: string[], files: string[]): Promise<Set<string>> {
+  const raw = (await git(cwd, [...args.filter((a) => !a.startsWith('--unified')), '--raw', '-z', '--no-abbrev', '--', ...files.map((f) => `:(literal)${f}`)], { trim: false })).split('\0');
+  const root = await repoRoot(cwd);
+  const entries: Array<{ shas: string[]; paths: string[] }> = [];
+  for (let i = 0; i < raw.length; ) {
+    const meta = raw[i]!;
+    if (!meta.startsWith(':')) { i++; continue; }
+    const [, , oldSha = '', newSha = '', status = ''] = meta.slice(1).split(' ');
+    const n = /^[RC]/.test(status) ? 2 : 1;
+    entries.push({ shas: [oldSha, newSha], paths: raw.slice(i + 1, i + 1 + n) });
+    i += 1 + n;
+  }
+  const heads = await blobHeads(cwd, [...new Set(entries.flatMap((e) => e.shas).filter((s) => !/^0+$/.test(s)))], BINARY_SNIFF);
+  const out = new Set<string>();
+  for (const e of entries) {
+    let isBinary = false;
+    for (const sha of e.shas) {
+      // All zeros: no blob (added or deleted side) or the working tree file (new side).
+      const head = /^0+$/.test(sha)
+        ? sha === e.shas[1] ? await readHead(path.join(root, e.paths[e.paths.length - 1]!), BINARY_SNIFF) : undefined
+        : heads.get(sha);
+      if (head?.includes(0)) isBinary = true;
+    }
+    if (isBinary) for (const p of e.paths) out.add(p);
+  }
+  return out;
+}
+
+async function readHead(file: string, n: number): Promise<Buffer | undefined> {
+  const fh = await open(file, 'r').catch(() => undefined);
+  if (!fh) return undefined;
+  try {
+    const buf = Buffer.alloc(n);
+    const { bytesRead } = await fh.read(buf, 0, n, 0);
+    return buf.subarray(0, bytesRead);
+  } finally {
+    await fh.close();
+  }
+}
+
+/** The first `n` bytes of each blob, read through one `git cat-file --batch` (contents streamed, not kept). */
+function blobHeads(cwd: string, shas: string[], n: number): Promise<Map<string, Buffer>> {
+  const heads = new Map<string, Buffer>();
+  if (!shas.length) return Promise.resolve(heads);
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', [...SAFE_CONFIG, 'cat-file', '--batch'], { cwd, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' }, stdio: ['pipe', 'pipe', 'ignore'] });
+    let pending: Buffer = Buffer.alloc(0);
+    let current: { sha: string; left: number; head: Buffer[]; kept: number } | null = null;
+    child.stdout.on('data', (chunk: Buffer) => {
+      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+      for (;;) {
+        if (!current) {
+          const nl = pending.indexOf(0x0a);
+          if (nl === -1) return;
+          const [sha = '', type = '', size = ''] = pending.subarray(0, nl).toString('latin1').split(' ');
+          pending = pending.subarray(nl + 1);
+          if (type === 'missing' || !size) continue;
+          current = { sha, left: Number(size) + 1, head: [], kept: 0 };
+        }
+        if (!pending.length) return;
+        const take = Math.min(current.left, pending.length);
+        const part = pending.subarray(0, take);
+        if (current.kept < n) {
+          const keep = part.subarray(0, n - current.kept);
+          current.head.push(Buffer.from(keep));
+          current.kept += keep.length;
+        }
+        current.left -= take;
+        pending = pending.subarray(take);
+        if (current.left === 0) {
+          heads.set(current.sha, Buffer.concat(current.head).subarray(0, n));
+          current = null;
+        }
+      }
+    });
+    child.on('error', reject);
+    child.on('close', (code) => (code === 0 ? resolve(heads) : reject(new Error(`git cat-file exited ${code}`))));
+    child.stdin.on('error', () => {});
+    child.stdin.end(`${shas.join('\n')}\n`);
+  });
 }
 
 /** A diff split into its per-file sections (each starting with `diff --git`). */

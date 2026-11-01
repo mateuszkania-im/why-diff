@@ -272,6 +272,22 @@ describe('sec030 #5: git attributes, textconv and diff config cannot hide hunks'
       sh(repo, ['config', 'diff.external', 'true']);
     })).toBe(true);
   });
+  it('blocks with a clean filter that cleans it.skip away', async () => {
+    expect(await editedRepo((repo) => {
+      writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js filter=hide\n');
+      sh(repo, ['config', 'filter.hide.clean', 'sed s/it.skip/it/']);
+    })).toBe(true);
+  });
+  it('blocks behind 600 decoy files marked -diff', async () => {
+    expect(await editedRepo((repo) => {
+      mkdirSync(path.join(repo, 'aa'));
+      for (let i = 0; i < 600; i++) writeFileSync(path.join(repo, 'aa', `d${String(i).padStart(3, '0')}.js`), `x${i}\n`);
+      sh(repo, ['add', 'aa']);
+      sh(repo, ['commit', '-qm', 'decoys'], LONG_AGO);
+      for (let i = 0; i < 600; i++) writeFileSync(path.join(repo, 'aa', `d${String(i).padStart(3, '0')}.js`), `y${i}\n`);
+      writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js -diff\n');
+    })).toBe(true);
+  }, 60_000);
   it('blocks with diff.noprefix, diff.mnemonicPrefix and diff.relative set', async () => {
     expect(await editedRepo((repo) => {
       sh(repo, ['config', 'diff.noprefix', 'true']);

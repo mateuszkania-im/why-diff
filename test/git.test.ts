@@ -549,5 +549,45 @@ describe('getDiff: attributes, textconv and fsmonitor cannot hide changes', () =
     sh(repo, 'commit', '-qm', 'hide');
     expect(added(await getDiff(repo, 'HEAD~1..HEAD'), 'a.test.js')).toEqual(['it.skip("a", () => {});']);
   });
+
+  it('ignores clean and process filter drivers', async () => {
+    const repo = repoWithChange();
+    writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js filter=hide\n');
+    sh(repo, 'config', 'filter.hide.clean', 'sed s/it.skip/it/');
+    sh(repo, 'config', 'filter.hide.required', 'true');
+    sh(repo, 'config', 'filter.odd.name.with.dots.clean', 'cat');
+    expect(added(await getDiff(repo, { workingTree: true }), 'a.test.js')).toEqual(['it.skip("a", () => {});']);
+  });
+
+  it('keeps the text of a -diff file whose first 8000 bytes have no NUL, with later NULs made visible', async () => {
+    const repo = freshRepo();
+    const body = (skip: string): string => `${'// pad\n'.repeat(1200)}${skip}("a", () => {});\nconst s = "\0";\n`;
+    put(repo, 'a.test.js', body('it'));
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-qm', 'init');
+    put(repo, 'a.test.js', body('it.skip'));
+    writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js -diff\n');
+    const diff = await getDiff(repo, { workingTree: true });
+    expect(added(diff, 'a.test.js')).toEqual(['it.skip("a", () => {});']);
+    expect(diff).not.toContain('\0');
+  });
+
+  it('has no file cap: hundreds of decoy -diff files do not hide the real one', async () => {
+    const repo = freshRepo();
+    for (let i = 0; i < 600; i++) put(repo, `aa/decoy${String(i).padStart(3, '0')}.js`, `x${i}\n`);
+    put(repo, 'zz/a.test.js', 'it("a", () => {});\n');
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-qm', 'init');
+    for (let i = 0; i < 600; i++) put(repo, `aa/decoy${String(i).padStart(3, '0')}.js`, `y${i}\n`);
+    put(repo, 'zz/a.test.js', 'it.skip("a", () => {});\n');
+    writeFileSync(path.join(repo, '.git', 'info', 'attributes'), '*.js -diff\n');
+    expect(added(await getDiff(repo, { workingTree: true }), 'zz/a.test.js')).toEqual(['it.skip("a", () => {});']);
+  }, 60_000);
+
+  it('ignores a core.bigFileThreshold that would make every file binary', async () => {
+    const repo = repoWithChange();
+    sh(repo, 'config', 'core.bigFileThreshold', '1');
+    expect(added(await getDiff(repo, { workingTree: true }), 'a.test.js')).toEqual(['it.skip("a", () => {});']);
+  });
 });
 
