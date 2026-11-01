@@ -59,7 +59,7 @@ Claude Code's Code Review tab and AI pull request reviewers answer "is this code
 The same session in the terminal (`why-diff --classify`). One git hunk in `src/cart.js` mixed both prompts and my manual line; why-diff splits it:
 
 ```
-why-diff  why-diff-demo  working tree                 fix/discount · 31 Oct 2026
+why-diff  why-diff-demo  working tree                 fix/discount · 1 Nov 2026
 
   91% of added lines trace to a prompt · 1 hunk nobody asked for
   tests touched ⚠ · 1 unattributed hunk
@@ -90,7 +90,7 @@ UNATTRIBUTED (1)  no agent edit explains these
     src/cart.js:L18-20  +1
       none · ✗ unrequested · ▲ unattributed
 
-why-diff v0.2.1 · generated 31 Oct 2026, 21:47 UTC
+why-diff v0.3.0 · generated 1 Nov 2026, 03:12 UTC
 ```
 
 - **Per-line provenance.** Each added line is owned by the edit that *introduced* it (not the one that merely had it as context). Hunks that mix several prompts, or your own manual edits, are split into segments.
