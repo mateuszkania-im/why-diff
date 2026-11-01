@@ -275,7 +275,37 @@ function touchedByShell(raw: string, index: EditIndex): boolean {
   return shell.globs.some((g) => globToRegExp(g).test(file));
 }
 
-const PATH_TOKEN_SEPARATOR = /[^\w./-]+/;
+const PATH_TOKEN_SEPARATOR = /[^\w./:\\-]+/;
+const DRIVE_TOKEN = /^[A-Za-z]:\//;
+
+/** Path-like tokens of a command: `C:\\x` and `C:/x` stay whole (as `C:/x`); other `:` split as before. */
+function pathTokens(command: string): string[] {
+  const out: string[] = [];
+  for (const raw of command.split(PATH_TOKEN_SEPARATOR)) {
+    if (!raw) continue;
+    const t = raw.includes('\\') && DRIVE_PATH.test(raw) ? raw.replace(/\\/g, '/') : raw;
+    if (DRIVE_TOKEN.test(t)) out.push(t);
+    else for (const part of t.split(/[:\\]+/)) if (part) out.push(part);
+  }
+  return out;
+}
+
+/**
+ * Prefixes that make a command token absolute under a root, compared case-insensitively for
+ * Windows roots: `C:/r/`, and on the current drive the drive-less `/r/` and Git Bash's `/c/r/`.
+ */
+function rootPrefixes(roots: string[]): Array<{ prefix: string; fold: boolean }> {
+  const out: Array<{ prefix: string; fold: boolean }> = [];
+  for (const r of roots) {
+    if (!DRIVE_TOKEN.test(`${r}/`)) {
+      out.push({ prefix: `${r}/`, fold: false });
+      continue;
+    }
+    const rest = r.slice(2);
+    for (const p of [`${r}/`, `${rest}/`, `/${r.charAt(0)}${rest}/`]) out.push({ prefix: p.toLowerCase(), fold: true });
+  }
+  return out;
+}
 
 /** Index the in-window shell commands once: path-like tokens of their text plus the paths detected for them. */
 function buildShellIndex(index: EditIndex): ShellIndex {
@@ -283,7 +313,7 @@ function buildShellIndex(index: EditIndex): ShellIndex {
   const tokens = new Set<string>();
   const rels = new Set<string>();
   const globs: string[] = [];
-  const prefixes = index.roots.map((r) => `${r}/`);
+  const prefixes = rootPrefixes(index.roots);
   for (const s of index.shell) {
     if (since !== undefined && s.atMs !== 0 && s.atMs < since) continue;
     for (const rel of s.rels) {
@@ -291,11 +321,10 @@ function buildShellIndex(index: EditIndex): ShellIndex {
       else rels.add(rel);
     }
     if (!s.contentOps) continue; // chmod/chown/touch only: naming a file does not change it
-    for (const raw of s.command.split(PATH_TOKEN_SEPARATOR)) {
-      if (!raw) continue;
+    for (const raw of pathTokens(s.command)) {
       let token = raw;
-      for (const prefix of prefixes) {
-        if (token.startsWith(prefix)) {
+      for (const { prefix, fold } of prefixes) {
+        if ((fold ? token.toLowerCase() : token).startsWith(prefix)) {
           token = token.slice(prefix.length);
           break;
         }
@@ -311,7 +340,7 @@ function buildShellIndex(index: EditIndex): ShellIndex {
 const NESTED_WORKTREE = /(?:^|\/)\.?(?:claude\/)?worktrees\/[^/]+\//;
 
 function absoluteEditPath(edit: FileEdit, cwd: string): string | null {
-  if (path.isAbsolute(edit.filePath)) return path.normalize(edit.filePath);
+  if (path.isAbsolute(edit.filePath)) return path.resolve(edit.filePath);
   return cwd ? path.resolve(cwd, edit.filePath) : null;
 }
 

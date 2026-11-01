@@ -906,7 +906,8 @@ async function isAncestor(cwd: string, roots: string[]): Promise<boolean> {
 }
 
 function absolutePath(p: string, cwd: string): string {
-  if (path.isAbsolute(p)) return path.normalize(p);
+  // resolve, not normalize: on Windows a drive-less `/x` lies on the current drive, like the repo root.
+  if (path.isAbsolute(p)) return path.resolve(p);
   if (p === '~' || p.startsWith('~/')) return path.join(os.homedir(), p.slice(1));
   return cwd ? path.resolve(cwd, p) : p;
 }

@@ -3196,19 +3196,40 @@ function touchedByShell(raw, index) {
     if (shell.rels.has(file.slice(0, slash))) return !0;
   return shell.globs.some((g) => globToRegExp(g).test(file));
 }
-var PATH_TOKEN_SEPARATOR = /[^\w./-]+/;
+var PATH_TOKEN_SEPARATOR = /[^\w./:\\-]+/, DRIVE_TOKEN = /^[A-Za-z]:\//;
+function pathTokens(command) {
+  let out = [];
+  for (let raw of command.split(PATH_TOKEN_SEPARATOR)) {
+    if (!raw) continue;
+    let t = raw.includes("\\") && DRIVE_PATH.test(raw) ? raw.replace(/\\/g, "/") : raw;
+    if (DRIVE_TOKEN.test(t)) out.push(t);
+    else for (let part of t.split(/[:\\]+/)) part && out.push(part);
+  }
+  return out;
+}
+function rootPrefixes(roots) {
+  let out = [];
+  for (let r of roots) {
+    if (!DRIVE_TOKEN.test(`${r}/`)) {
+      out.push({ prefix: `${r}/`, fold: !1 });
+      continue;
+    }
+    let rest = r.slice(2);
+    for (let p of [`${r}/`, `${rest}/`, `/${r.charAt(0)}${rest}/`]) out.push({ prefix: p.toLowerCase(), fold: !0 });
+  }
+  return out;
+}
 function buildShellIndex(index) {
-  let since = index.sinceMs, tokens = /* @__PURE__ */ new Set(), rels = /* @__PURE__ */ new Set(), globs = [], prefixes = index.roots.map((r) => `${r}/`);
+  let since = index.sinceMs, tokens = /* @__PURE__ */ new Set(), rels = /* @__PURE__ */ new Set(), globs = [], prefixes = rootPrefixes(index.roots);
   for (let s of index.shell)
     if (!(since !== void 0 && s.atMs !== 0 && s.atMs < since)) {
       for (let rel of s.rels)
         /[*?[]/.test(rel) ? globs.push(rel) : rels.add(rel);
       if (s.contentOps)
-        for (let raw of s.command.split(PATH_TOKEN_SEPARATOR)) {
-          if (!raw) continue;
+        for (let raw of pathTokens(s.command)) {
           let token = raw;
-          for (let prefix of prefixes)
-            if (token.startsWith(prefix)) {
+          for (let { prefix, fold } of prefixes)
+            if ((fold ? token.toLowerCase() : token).startsWith(prefix)) {
               token = token.slice(prefix.length);
               break;
             }
@@ -3219,7 +3240,7 @@ function buildShellIndex(index) {
 }
 var NESTED_WORKTREE = /(?:^|\/)\.?(?:claude\/)?worktrees\/[^/]+\//;
 function absoluteEditPath(edit, cwd) {
-  return path3.isAbsolute(edit.filePath) ? path3.normalize(edit.filePath) : cwd ? path3.resolve(cwd, edit.filePath) : null;
+  return path3.isAbsolute(edit.filePath) ? path3.resolve(edit.filePath) : cwd ? path3.resolve(cwd, edit.filePath) : null;
 }
 function nestedWorktreeRoots(sessions, resolved, diffFiles) {
   let byBase = /* @__PURE__ */ new Map();
@@ -4767,13 +4788,13 @@ function sameArea(a, b) {
   let ka = a.split("/").slice(0, 2), kb = b.split("/").slice(0, 2);
   return ka.length === 2 && kb.length === 2 && ka.join("/") === kb.join("/");
 }
-function pathTokens(path13) {
+function pathTokens2(path13) {
   let base = posix.basename(path13), stem = base.replace(/\.[^.]+$/, ""), segments = posix.dirname(path13).split("/").filter((s) => s.length >= 4 && s !== ".");
   return [base, ...stem.length >= 4 ? [stem] : [], ...segments];
 }
 function anchoredBy(path13, id, scope) {
   let text2 = scope.promptTexts.get(id) ?? "";
-  if (pathTokens(path13).some((t) => mentioned(t, text2))) return !0;
+  if (pathTokens2(path13).some((t) => mentioned(t, text2))) return !0;
   let dir = posix.dirname(path13);
   for (let d of scope.promptDirs.get(id) ?? []) if (d !== "." && sameArea(d, dir)) return !0;
   return !1;
@@ -4812,7 +4833,7 @@ function poolsOf(ids, scope) {
 function outOfScopeReason(path13, scope, ids) {
   if (!scope.promptText || isLockfile(path13) || isSnapshotFile(path13)) return null;
   let dir = posix.dirname(path13);
-  if (pathTokens(path13).some((t) => mentioned(t, scope.promptText)) || ids.some((id) => anchoredBy(path13, id, scope))) return null;
+  if (pathTokens2(path13).some((t) => mentioned(t, scope.promptText)) || ids.some((id) => anchoredBy(path13, id, scope))) return null;
   let agentFiles = scope.agentFiles;
   if (agentFiles.length === 0 || agentFiles.length === 1 && agentFiles[0] === path13) return null;
   let pools = poolsOf(ids, scope), size = (c) => c.files.size - (c.files.has(path13) ? 1 : 0), pool = size(pools.anchored) > 0 ? pools.anchored : pools.all, poolSize = size(pool);
@@ -6116,7 +6137,7 @@ async function isAncestor(cwd, roots) {
   return !1;
 }
 function absolutePath(p, cwd) {
-  return path5.isAbsolute(p) ? path5.normalize(p) : p === "~" || p.startsWith("~/") ? path5.join(os2.homedir(), p.slice(1)) : cwd ? path5.resolve(cwd, p) : p;
+  return path5.isAbsolute(p) ? path5.resolve(p) : p === "~" || p.startsWith("~/") ? path5.join(os2.homedir(), p.slice(1)) : cwd ? path5.resolve(cwd, p) : p;
 }
 function truncate(s, max) {
   return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}\u2026`;
