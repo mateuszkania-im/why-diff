@@ -63,6 +63,48 @@ async function guardRun(repo: string, home: string, calls: (t: number) => Synthe
   return runGuard({ transcript_path: transcript, cwd: repo, session_id: 's31' }, { blocking: BL, home, objectTime: oldObjects, ...opts });
 }
 
+describe('sec031 #2: no unbounded path list on a git command line', () => {
+  // Long paths so a few thousand of them overflow ARG_MAX (1 MiB on macOS, 2 MiB on Linux, 32K chars on Windows).
+  const win = process.platform === 'win32';
+  const n = win ? 1500 : 7000;
+  const seg = win ? 'd' : 'd'.repeat(120);
+  const name = (i: number): string => (win ? `f${i}.json` : `${'f'.repeat(120)}-${i}.json`);
+  function generated(repo: string): void {
+    const dir = path.join(repo, 'fixtures', seg, seg);
+    mkdirSync(dir, { recursive: true });
+    for (let i = 0; i < n; i++) writeFileSync(path.join(dir, name(i)), '{}\n');
+  }
+
+  it('an it.skip edit plus thousands of files written by an unnamed script still blocks', async () => {
+    const { repo, home, tp } = makeRepo();
+    skipT5(tp);
+    generated(repo);
+    let callAt = 0;
+    const r = await guardRun(repo, home, (t) => {
+      callAt = t;
+      return [editCall(t, tp), bash(t + 5000, 'node gen-fixtures.js', 20_000)];
+    }, { statTime: async (p) => { await lstat(p); return callAt + 6000; } });
+    expect(r.block).toBe(true);
+    expect(r.message).toContain('test-skip-added');
+  }, 120_000);
+
+  it('a lowered argv budget splits the pathspecs and still diffs every file', async () => {
+    process.env.WHY_DIFF_ARGV_BUDGET = '600';
+    const { repo } = makeRepo((r) => {
+      for (let i = 0; i < 60; i++) writeFileSync(path.join(r, 'src', `m${i}.js`), `export const m${i} = ${i};\n`);
+      sh(r, ['add', '-A']);
+      sh(r, ['commit', '-qm', 'more']);
+    });
+    for (let i = 0; i < 60; i++) writeFileSync(path.join(repo, 'src', `m${i}.js`), `export const m${i} = ${i + 1};\n`);
+    for (let i = 0; i < 40; i++) writeFileSync(path.join(repo, 'src', `new${i}.js`), `export const n${i} = ${i};\n`);
+    sh(repo, ['update-index', '--assume-unchanged', ...Array.from({ length: 30 }, (_, i) => `src/m${i}.js`)]);
+    const paths = [...Array.from({ length: 60 }, (_, i) => `:(literal)src/m${i}.js`), ...Array.from({ length: 40 }, (_, i) => `:(literal)src/new${i}.js`)];
+    const { diff } = await getDiffDetailed(repo, { workingTree: true }, { paths, contentIndex: true });
+    const files = new Set(parseUnifiedDiff(diff).map((h) => h.file));
+    expect(files.size).toBe(100);
+  });
+});
+
 describe('sec031 #7: inherited GIT_* variables do not steer the guard', () => {
   it('GIT_DIR and GIT_WORK_TREE pointing at another repository are ignored', async () => {
     const { repo, home, tp } = makeRepo();

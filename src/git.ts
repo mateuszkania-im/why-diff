@@ -186,22 +186,60 @@ async function gitEnv(cwd: string): Promise<NodeJS.ProcessEnv> {
 /**
  * Run git in `cwd` without a shell. Resolves with trimmed-right stdout.
  * `-c core.quotePath=false` keeps non-ASCII paths readable in diff headers; see {@link SAFE_CONFIG}.
+ * `input` is written to git's standard input.
  */
-export async function git(cwd: string, args: string[], opts: { trim?: boolean; maxBuffer?: number; env?: Record<string, string> } = {}): Promise<string> {
+export async function git(cwd: string, args: string[], opts: { trim?: boolean; maxBuffer?: number; env?: Record<string, string>; input?: string } = {}): Promise<string> {
   const env = { ...(await gitEnv(cwd)), ...opts.env };
-  try {
-    const { stdout } = await execFileAsync('git', [...SAFE_CONFIG, ...args], {
-      cwd,
-      maxBuffer: opts.maxBuffer ?? MAX_BUFFER,
-      encoding: 'utf8',
-      env,
+  const stdout = await new Promise<string>((resolve, reject) => {
+    const child = execFile('git', [...SAFE_CONFIG, ...args], { cwd, maxBuffer: opts.maxBuffer ?? MAX_BUFFER, encoding: 'utf8', env }, (err, out, stderr) => {
+      if (!err) return resolve(out);
+      const e = err as NodeJS.ErrnoException & { code?: number | string };
+      if (e.code === 'ENOENT') return reject(new Error('git executable not found on PATH'));
+      reject(new GitError(args, String(stderr || e.message), typeof e.code === 'number' ? e.code : null));
     });
-    return opts.trim === false ? stdout : stdout.replace(/\s+$/, '');
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException & { stderr?: string; code?: number | string };
-    if (e.code === 'ENOENT') throw new Error('git executable not found on PATH');
-    throw new GitError(args, String(e.stderr ?? e.message), typeof e.code === 'number' ? e.code : null);
+    child.stdin?.on('error', () => {});
+    child.stdin?.end(opts.input ?? '');
+  });
+  return opts.trim === false ? stdout : stdout.replace(/\s+$/, '');
+}
+
+/** Default size of the path arguments on one git command line (Windows caps a whole command line at 32767 characters). */
+const ARGV_BUDGET = process.platform === 'win32' ? 12_000 : 96_000;
+
+/**
+ * Split `paths` into groups whose arguments fit one command line (`WHY_DIFF_ARGV_BUDGET`, in bytes,
+ * overrides the budget, for tests). `git diff` and `git ls-files` cannot read pathspecs from stdin,
+ * so a long list (thousands of files a session touched) is run in several calls instead of one that
+ * fails with E2BIG.
+ */
+export function chunkPaths(paths: readonly string[]): string[][] {
+  const budget = Number(process.env.WHY_DIFF_ARGV_BUDGET) > 0 ? Number(process.env.WHY_DIFF_ARGV_BUDGET) : ARGV_BUDGET;
+  const chunks: string[][] = [];
+  let cur: string[] = [];
+  let size = 0;
+  for (const p of paths) {
+    const n = Buffer.byteLength(p) + 3; // separator and quoting
+    if (cur.length && size + n > budget) {
+      chunks.push(cur);
+      cur = [];
+      size = 0;
+    }
+    cur.push(p);
+    size += n;
   }
+  if (cur.length) chunks.push(cur);
+  return chunks;
+}
+
+/**
+ * `git <args> -- <paths>`, split by {@link chunkPaths} when the list is long, outputs joined in order.
+ * No paths (undefined or empty) means no pathspec at all: the whole tree.
+ */
+export async function gitPaths(cwd: string, args: string[], paths: readonly string[] | undefined, opts: { maxBuffer?: number; env?: Record<string, string> } = {}): Promise<string> {
+  if (!paths?.length) return git(cwd, args, { ...opts, trim: false });
+  let out = '';
+  for (const chunk of chunkPaths(paths)) out += await git(cwd, [...args, '--', ...chunk], { ...opts, trim: false });
+  return out;
 }
 
 /** Absolute path of the repository top level containing `cwd`. */
@@ -322,8 +360,7 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
   } else {
     baseRev = await emptyTree(cwd); // unborn branch: everything tracked is "added"
   }
-  const pathspec = opts.paths?.length ? ['--', ...opts.paths] : [];
-  const revealed = await revealTextMarkedBinary(cwd, [...common, baseRev], await git(cwd, [...common, baseRev, ...pathspec], { trim: false }));
+  const revealed = await revealTextMarkedBinary(cwd, [...common, baseRev], await gitPaths(cwd, [...common, baseRev], opts.paths));
   let diff = revealed.diff;
   const unreviewed = [...revealed.unreviewed];
   // Files flagged assume-unchanged or skip-worktree: git diff takes their index entry for the
@@ -364,7 +401,7 @@ async function getDiffUnwrapped(cwd: string, target: DiffTarget, opts: DiffOptio
  */
 export async function indexFlagged(cwd: string, paths?: string[], honourSparse = true): Promise<string[]> {
   const root = await repoRoot(cwd);
-  const out = await git(root, ['ls-files', '-v', '-z', ...(paths?.length ? ['--', ...paths] : [])], { trim: false });
+  const out = await gitPaths(root, ['ls-files', '-v', '-z'], paths);
   const sparse = honourSparse && (await git(root, ['config', '--bool', 'core.sparseCheckout']).catch(() => '')) === 'true';
   const flagged: string[] = [];
   for (const entry of out.split('\0')) {
@@ -390,9 +427,10 @@ async function diffWithoutIndexFlags(cwd: string, args: string[], files: string[
     const env = { GIT_INDEX_FILE: copy };
     const literal = files.map((f) => `:(literal)${f}`);
     // One flag per call: git applies only the first of the two to the paths when both are given.
-    await git(root, ['update-index', '--no-skip-worktree', '--', ...files], { env });
-    await git(root, ['update-index', '--no-assume-unchanged', '--', ...files], { env });
-    const raw = await git(root, [...args, '--', ...literal], { trim: false, env });
+    const list = files.map((f) => `${f}\0`).join('');
+    await git(root, ['update-index', '--no-skip-worktree', '-z', '--stdin'], { env, input: list });
+    await git(root, ['update-index', '--no-assume-unchanged', '-z', '--stdin'], { env, input: list });
+    const raw = await gitPaths(root, args, literal, { env });
     return await revealTextMarkedBinary(root, args, raw);
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -428,7 +466,7 @@ async function revealTextMarkedBinary(cwd: string, args: string[], diff: string)
   const byFile = new Map<string, string>();
   const unreviewed = new Set<string>();
   const rediff = (names: string[]): Promise<string> =>
-    git(cwd, [...args, '--text', '--', ...names.map((f) => `:(literal)${f}`)], { trim: false, maxBuffer });
+    gitPaths(cwd, [...args, '--text'], names.map((f) => `:(literal)${f}`), { maxBuffer });
   const take = (out: string): void => {
     for (const section of splitSections(out)) {
       const h = parseUnifiedDiff(section)[0];
@@ -467,7 +505,7 @@ const REDIFF_MAX_BYTES = 64 * 1024 * 1024;
  * git's own rule, ignoring attributes: a NUL byte in the first 8000 bytes of the old or the new side.
  */
 async function binaryByContent(cwd: string, args: string[], files: string[]): Promise<Set<string>> {
-  const raw = (await git(cwd, [...args.filter((a) => !a.startsWith('--unified')), '--raw', '-z', '--no-abbrev', '--', ...files.map((f) => `:(literal)${f}`)], { trim: false })).split('\0');
+  const raw = (await gitPaths(cwd, [...args.filter((a) => !a.startsWith('--unified')), '--raw', '-z', '--no-abbrev'], files.map((f) => `:(literal)${f}`))).split('\0');
   const root = await repoRoot(cwd);
   const entries: Array<{ shas: string[]; paths: string[] }> = [];
   for (let i = 0; i < raw.length; ) {
@@ -574,7 +612,7 @@ export async function mergeBase(cwd: string, a: string, b: string): Promise<stri
 /** Untracked, non-ignored files relative to the repo root. */
 export async function listUntracked(cwd: string, paths?: string[]): Promise<string[]> {
   const root = await repoRoot(cwd);
-  const out = await git(root, ['ls-files', '--others', '--exclude-standard', '-z', ...(paths?.length ? ['--', ...paths] : [])], { trim: false });
+  const out = await gitPaths(root, ['ls-files', '--others', '--exclude-standard', '-z'], paths);
   return out.split('\0').filter((p) => p.length > 0 && !p.startsWith('.why-diff/'));
 }
 
