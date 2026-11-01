@@ -77,7 +77,8 @@ function copyTreeReplacing(src: string, dst: string, from: string, to: string): 
 // ---------------------------------------------------------------------------
 
 export interface SyntheticCall {
-  tool: 'Edit' | 'Write' | 'Bash';
+  /** Any tool name: Edit, Write and Bash get realistic results, others an empty object. */
+  tool: string;
   input: Record<string, unknown>;
   /** ISO timestamp of the tool call; the result is stamped one second later (or at `resultAt`). */
   at: string;
@@ -88,6 +89,8 @@ export interface SyntheticCall {
   isError?: boolean;
   /** Explicit `toolUseResult` for the result line (default: a minimal one shaped like the real tool's). */
   result?: Record<string, unknown> | string;
+  /** Write no tool_result line at all (a call still running, or cut off). */
+  noResult?: boolean;
 }
 
 export interface SyntheticTurn {
@@ -124,6 +127,7 @@ export function writeSyntheticTranscript(home: string, cwd: string, sessionId: s
       if (call.text) content.push({ type: 'text', text: call.text });
       content.push({ type: 'tool_use', id: toolUseId, name: call.tool, input: call.input });
       lines.push({ ...base('assistant', call.at), promptId, message: { model: 'claude-sonnet-4-5', id: `msg_${toolUseId}`, type: 'message', role: 'assistant', content, stop_reason: 'tool_use', usage: { input_tokens: 10, output_tokens: 10 } } });
+      if (call.noResult) return;
       const resultAt = call.resultAt ?? new Date(Date.parse(call.at) + 1000).toISOString();
       lines.push({
         ...base('user', resultAt),
@@ -146,6 +150,8 @@ function toolUseResultFor(call: SyntheticCall): Record<string, unknown> {
       return { type: 'create', filePath: call.input.file_path, content: call.input.content, structuredPatch: [], originalFile: null, userModified: false };
     case 'Bash':
       return { stdout: '', stderr: '', interrupted: false, isImage: false, noOutputExpected: false };
+    default:
+      return {};
   }
 }
 

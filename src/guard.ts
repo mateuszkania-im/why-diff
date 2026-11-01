@@ -33,7 +33,7 @@ export interface GuardOptions {
   home?: string;
   /** Where guard-state.json lives; default `<repo>/.why-diff` */
   stateDir?: string;
-  /** Change time of a path in ms (tests); default: lstat ctime on POSIX, mtime on Windows */
+  /** Change time of a path in ms (tests); default: lstat ctime */
   statTime?: (absPath: string) => Promise<number>;
 }
 
@@ -83,9 +83,9 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
   }
 
   // Files a shell command changed without naming them (a script computing the path, `rsync --delete`,
-  // a path from the environment): credited when the file (or, once deleted, the nearest directory above it) last changed
-  // while one of this session's shell calls ran (ctime on POSIX, mtime on Windows).
-  const byWindow = await shellWindowFiles(root, headed ? baseRev : undefined, session, opts.statTime ?? changeTime);
+  // a path from the environment, a background process): credited when the file (or, once deleted,
+  // the nearest path above it) last changed (ctime) while one of this session's tool calls ran.
+  const byWindow = await toolWindowFiles(root, headed ? baseRev : undefined, session, opts.statTime ?? changeTime);
   for (const f of [...byWindow.written, ...byWindow.removed]) paths.push(`:(literal)${f}`);
   if (!paths.length) return NO_BLOCK;
 
@@ -141,7 +141,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
       const removed = h.match === 'file-only' && shellOnly(h.hunk) && targeted(removedByShell, source, true);
       const rewritten = h.match === 'file-only' && h.hunk.status !== 'renamed' && targeted(rewrittenByShell, h.hunk.file, false);
       // Not named by any command: the file's own change time (or, once deleted, its directory's) inside a
-      // shell call window. A rewrite counts for every hunk of the file; a deletion or rename only
+      // tool call window. A rewrite counts for every hunk of the file; a deletion or rename only
       // when the hunk is nothing but that operation.
       if (!removed && !rewritten) {
         timed = h.hunk.status === 'renamed'
@@ -190,32 +190,35 @@ async function guard(payload: GuardPayload, opts: GuardOptions): Promise<GuardRe
 }
 
 const SHELL_GLOB = /[*?[]/;
-/** Clock slack on each side of a shell call window (transcript stamps vs file system times). */
+/** Clock slack on each side of a tool call window (transcript stamps vs file system times). */
 const WINDOW_SLACK_MS = 2000;
 const LSTAT_BATCH = 64;
+/** lstat errors meaning "this path is not there any more" (as opposed to unreadable). */
+const GONE: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR', 'ELOOP']);
 
 /**
- * When a path last changed. POSIX ctime: a command can backdate mtime (`touch -d`) but not ctime,
- * and any later write (a human edit) moves ctime past the window. Windows has no such ctime
- * (`ctimeMs` there is the metadata change time Node fakes from mtime), so it uses mtime.
+ * When a path last changed: its ctime. A command can backdate mtime (`touch -d`, `utimes`) but not
+ * ctime, and any later write (a human edit) moves ctime past the window. On Windows libuv fills
+ * `ctimeMs` from the NTFS ChangeTime, which `utimes` cannot set either.
  */
 async function changeTime(p: string): Promise<number> {
-  const st = await lstat(p);
-  return process.platform === 'win32' ? st.mtimeMs : st.ctimeMs;
+  return (await lstat(p)).ctimeMs;
 }
 
 /**
  * Changed files (against `rev`, working tree and untracked) whose change time lies inside one of the
- * session's shell call windows (`written`), and deleted ones whose nearest existing ancestor
- * directory's time does (`removed`). A human edit after the call moves the time out of every window,
- * so it is never credited; a human edit to the same file while an agent command is running is (the
- * one edge; long-running commands widen it).
+ * session's tool call windows (`written`), and deleted ones whose nearest existing ancestor's time
+ * does (`removed`). A human edit after the call moves the time out of every window, so it is never
+ * credited; a human edit while an agent tool call is running is (the one edge; long calls, subagents
+ * and background processes widen it).
  */
-async function shellWindowFiles(root: string, rev: string | undefined, session: Session, timeOf: (p: string) => Promise<number>): Promise<{ written: Set<string>; removed: Set<string> }> {
+async function toolWindowFiles(root: string, rev: string | undefined, session: Session, timeOf: (p: string) => Promise<number>): Promise<{ written: Set<string>; removed: Set<string> }> {
   const written = new Set<string>();
   const removed = new Set<string>();
-  const windows = (session.shellWindows ?? [])
-    .map((w) => ({ start: Date.parse(w.start), end: Date.parse(w.end) }))
+  const now = Date.now();
+  const windows = (session.toolWindows ?? [])
+    // An open window (background or detached process, no result yet) lasts until this guard runs.
+    .map((w) => ({ start: Date.parse(w.start), end: w.open ? Math.max(now, Date.parse(w.end)) : Date.parse(w.end) }))
     // Long calls are kept: dropping them would let `sleep 700; node fix.js` slip through.
     .filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end >= w.start)
     .map((w) => ({ start: w.start - WINDOW_SLACK_MS, end: w.end + WINDOW_SLACK_MS }));
@@ -234,15 +237,16 @@ async function shellWindowFiles(root: string, rev: string | undefined, session: 
         if (inWindow(await timeOf(abs))) written.add(f);
         return;
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return;
+        if (!GONE.has((err as NodeJS.ErrnoException).code ?? '')) return;
       }
-      // Deleted: date it by the nearest directory above it that still exists (up to the repo root).
+      // Deleted: date it by the nearest path above it that still exists (up to the repo root). A
+      // parent replaced by a file (ENOTDIR) or a symlink loop (ELOOP) is gone as a directory too.
       for (let dir = path.dirname(abs); ; dir = path.dirname(dir)) {
         try {
           if (inWindow(await timeOf(dir))) removed.add(f);
           return;
         } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return;
+          if (!GONE.has((err as NodeJS.ErrnoException).code ?? '')) return;
         }
         if (dir === top || path.dirname(dir) === dir || !dir.startsWith(top)) return;
       }

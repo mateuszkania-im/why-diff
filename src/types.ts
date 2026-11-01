@@ -74,16 +74,25 @@ export interface ReportEdit extends FileEdit {
 export const EDIT_TEXT_CAP = 2048;
 
 /**
- * When one shell tool call ran: from the assistant line that issued it to the line carrying its
- * result. The guard credits a changed file to the session when the file's mtime lies inside one.
+ * When one tool call of the session ran: from the assistant line that issued it to the line
+ * carrying its result. Every tool counts (Bash, Edit, Write, MCP tools, subagents...): the guard
+ * credits a changed file to the session when the file's change time lies inside one.
  */
-export interface ShellWindow {
+export interface ToolWindow {
   /** Tool call id from the transcript */
   callId: string;
+  /** Tool name */
+  tool: string;
   /** ISO timestamp of the tool call */
   start: string;
-  /** ISO timestamp of its result */
+  /** ISO timestamp of its result (equal to `start` for an open window without one) */
   end: string;
+  /**
+   * The call may still be changing files after its result: it ran in the background
+   * (`run_in_background`, a `backgroundTaskId`), its command detaches a process (`&`, `nohup`,
+   * `setsid`, `at`, `tmux`...), or it never got a result. The window lasts until the guard runs.
+   */
+  open?: boolean;
 }
 
 /** A parsed agent session. */
@@ -99,8 +108,8 @@ export interface Session {
   title?: string;
   prompts: Prompt[];
   edits: FileEdit[];
-  /** Shell tool calls that ran to a result, with their time span (Claude Code only) */
-  shellWindows?: ShellWindow[];
+  /** Tool calls that ran, with their time span (Claude Code only) */
+  toolWindows?: ToolWindow[];
 }
 
 /** One line inside a diff hunk. */

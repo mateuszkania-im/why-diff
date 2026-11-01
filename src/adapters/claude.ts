@@ -25,7 +25,7 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 
-import type { DiscoverOptions, EditKind, FileEdit, Harness, Prompt, Session, SessionAdapter, ShellWindow } from '../types.js';
+import type { DiscoverOptions, EditKind, FileEdit, Harness, Prompt, Session, SessionAdapter, ToolWindow } from '../types.js';
 import { DRIVE_PATH, driveKey, fileMentions, filePathNeedles, pathWithin } from './scan.js';
 import { detectBashMutations } from './bash-mutations.js';
 
@@ -132,6 +132,20 @@ const NEVER_RAN = [
   /^(?:Error: )?Permission to use [\w-]+ (?:with command [\s\S]* )?has been denied\b/,
 ];
 const TOOL_USE_ID = Buffer.from('"tool_use_id":"');
+const BACKGROUND_TASK = Buffer.from('"backgroundTaskId"');
+const RAW_TIMESTAMP = /"timestamp":"(\d{4}-\d\d-\d\dT[\d:.]+Z)"/g;
+
+/**
+ * Commands that leave a process running after the call returns: a bare `&` (not `&&`, `2>&1`,
+ * `&>`, `|&`), or a detaching launcher in command position (`nohup`, `setsid`, `disown`, `at`,
+ * `batch`, `crontab`, `systemd-run`, `launchctl`, `tmux`, `screen`, PowerShell `Start-Process` /
+ * `Start-Job`, cmd `start`). Erring towards "detaches" only widens the call's window.
+ */
+const BARE_AMPERSAND = /(?<![&|<>])&(?=\s|$|[;)}'"`!])/;
+const DETACH_LAUNCHER = /(?:^|[;&|({\n`'"]|\$\()\s*(?:(?:sudo|exec|env|command|nice|time|xargs)\s+(?:-\S+\s+)*)*(?:\w+=\S*\s+)*(?:nohup|setsid|disown|at|batch|crontab|systemd-run|launchctl|tmux|screen|daemonize|start-stop-daemon|start|Start-Process|Start-Job)(?=$|[\s;&|)}'"`])/i;
+export function detachesProcess(command: string): boolean {
+  return BARE_AMPERSAND.test(command) || DETACH_LAUNCHER.test(command);
+}
 
 /** Tools whose result can turn into FileEdits (see emitEdits). */
 function mayEdit(name: string): boolean {
@@ -287,7 +301,9 @@ class SessionBuilder {
   private summaryTitle: string | undefined;
   private readonly prompts: Prompt[] = [];
   private readonly edits: FileEdit[] = [];
-  private readonly shellWindows: ShellWindow[] = [];
+  private readonly toolWindows: ToolWindow[] = [];
+  /** Every tool call still waiting for its result line, for its time window. */
+  private readonly windowCalls = new Map<string, { name: string; at: string; open: boolean }>();
   private readonly pending = new Map<string, PendingCall>();
   private readonly pendingOrder: string[] = [];
   /** Transcript `promptId` (turn id) -> our Prompt.id */
@@ -354,15 +370,23 @@ class SessionBuilder {
    */
   canSkip(raw: Buffer): boolean {
     if (raw.length < SKIP_MIN_LINE || !raw.includes('"tool_result"') || !raw.includes('"type":"user"')) return false;
-    let any = false;
+    const ids: string[] = [];
     for (let at = raw.indexOf(TOOL_USE_ID); at !== -1; at = raw.indexOf(TOOL_USE_ID, at + 1)) {
       const from = at + TOOL_USE_ID.length;
       const to = raw.indexOf(0x22 /* " */, from);
       if (to === -1) return false;
-      any = true;
-      if (this.pending.has(raw.toString('latin1', from, to))) return false;
+      const id = raw.toString('latin1', from, to);
+      if (this.pending.has(id)) return false;
+      ids.push(id);
     }
-    return any;
+    if (!ids.length) return false;
+    // Skipped unparsed, but the calls it answers still need their windows closed. The latest
+    // timestamp on the line is used: a nested one can only widen the window, never shrink it.
+    let end: string | undefined;
+    for (const m of raw.toString('latin1').matchAll(RAW_TIMESTAMP)) if (!end || m[1]! > end) end = m[1];
+    const background = raw.includes(BACKGROUND_TASK);
+    for (const id of ids) this.closeWindow(id, end, { background });
+    return true;
   }
 
   build(transcriptPath: string, fallbackTime: Date): Session {
@@ -374,6 +398,9 @@ class SessionBuilder {
     }
     this.pending.clear();
     this.pendingOrder.length = 0;
+    // ...but they may still be running (or ran and were cut off): their windows stay open.
+    for (const [id, call] of this.windowCalls) this.toolWindows.push({ callId: id, tool: call.name, start: call.at, end: call.at, open: true });
+    this.windowCalls.clear();
     const fallbackIso = fallbackTime.toISOString();
     return {
       id: this.sessionId,
@@ -385,7 +412,7 @@ class SessionBuilder {
       ...(this.title ?? this.summaryTitle ? { title: this.title ?? this.summaryTitle } : {}),
       prompts: this.prompts,
       edits: this.edits,
-      ...(this.shellWindows.length ? { shellWindows: this.shellWindows } : {}),
+      ...(this.toolWindows.length ? { toolWindows: this.toolWindows } : {}),
     };
   }
 
@@ -411,13 +438,17 @@ class SessionBuilder {
     if (results.length > 0) {
       for (const r of results) {
         if (!r.tool_use_id) continue;
-        this.resolveCall(r.tool_use_id, line.timestamp, {
+        const outcome: ToolOutcome = {
           isError: r.is_error === true,
           text: blockText(r.content),
           // toolUseResult is per line; only trust it when the line holds one result.
           result: results.length === 1 && isRecord(line.toolUseResult) ? (line.toolUseResult as EditToolResult) : undefined,
           raw: results.length === 1 ? line.toolUseResult : undefined,
-        });
+        };
+        // A call that never ran (refused, denied) changed nothing; any other one may have.
+        if (neverRan(outcome)) this.windowCalls.delete(r.tool_use_id);
+        else this.closeWindow(r.tool_use_id, line.timestamp, { background: isRecord(outcome.raw) && outcome.raw.backgroundTaskId !== undefined });
+        this.resolveCall(r.tool_use_id, outcome);
       }
       return;
     }
@@ -464,6 +495,12 @@ class SessionBuilder {
         this.currentPromptId ??
         this.unknownPromptId();
       if (AGENT_TOOLS.has(tool.name)) this.agentCallPrompt.set(tool.id, promptId);
+      const input = isRecord(tool.input) ? tool.input : {};
+      this.windowCalls.set(tool.id, {
+        name: tool.name,
+        at: line.timestamp ?? this.lastTs ?? new Date(0).toISOString(),
+        open: input.run_in_background === true || (typeof input.command === 'string' && detachesProcess(input.command)),
+      });
       if (!mayEdit(tool.name)) continue; // only file-changing calls wait for their result
       const rationaleSource = textParts.length ? textParts.join('\n') : this.lastAssistantText;
       const call: PendingCall = {
@@ -482,20 +519,29 @@ class SessionBuilder {
     else if (!sawToolUse) this.lastAssistantText = '';
   }
 
-  private resolveCall(toolUseId: string, resultAt: string | undefined, outcome: ToolOutcome): void {
+  private resolveCall(toolUseId: string, outcome: ToolOutcome): void {
     const call = this.pending.get(toolUseId);
     if (!call) return; // result for a call we never saw (compaction, truncated file)
     this.pending.delete(toolUseId);
     const idx = this.pendingOrder.indexOf(toolUseId);
     if (idx !== -1) this.pendingOrder.splice(idx, 1);
-    // A command that failed (non-zero exit) may still have changed files: only one that never ran
-    // gets no window, and that is decided on structure, never on what a command printed.
-    if (call.name === 'Bash' && resultAt && !neverRan(outcome)) {
-      const start = Date.parse(call.at);
-      const end = Date.parse(resultAt);
-      if (Number.isFinite(start) && Number.isFinite(end) && end >= start) this.shellWindows.push({ callId: toolUseId, start: call.at, end: resultAt });
-    }
     this.emitEdits(call, outcome);
+  }
+
+  /**
+   * Record the time span of a call that got its result. A command that failed (non-zero exit) may
+   * still have changed files: only one that never ran gets no window, and that is decided on
+   * structure, never on what a command printed. A background call stays open.
+   */
+  private closeWindow(toolUseId: string, resultAt: string | undefined, opts: { background: boolean }): void {
+    const call = this.windowCalls.get(toolUseId);
+    if (!call) return;
+    this.windowCalls.delete(toolUseId);
+    const start = Date.parse(call.at);
+    const end = resultAt ? Date.parse(resultAt) : NaN;
+    if (!Number.isFinite(start)) return;
+    const open = call.open || opts.background || !Number.isFinite(end);
+    this.toolWindows.push({ callId: toolUseId, tool: call.name, start: call.at, end: Number.isFinite(end) && end >= start ? resultAt! : call.at, ...(open ? { open: true } : {}) });
   }
 
   // -- edit extraction -------------------------------------------------------

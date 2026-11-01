@@ -2,7 +2,7 @@ import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { ClaudeCodeAdapter, cleanPromptText, encodeProjectDir, humanPromptText } from '../src/adapters/claude.js';
+import { ClaudeCodeAdapter, cleanPromptText, detachesProcess, encodeProjectDir, humanPromptText } from '../src/adapters/claude.js';
 import type { FileEdit } from '../src/types.js';
 import { FIXTURE_CWD, FIXTURE_HOME, FIXTURE_SESSION, FIXTURE_SUBDIR_SESSION, materialiseFixtureHome, nat, shellPath, tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
 
@@ -435,8 +435,8 @@ describe('prompt cleaning on pasted blobs', () => {
   });
 });
 
-describe('ClaudeCodeAdapter.parse: shell windows', () => {
-  it('records one window per Bash call, from the tool_use line to its tool_result line', async () => {
+describe('ClaudeCodeAdapter.parse: tool windows', () => {
+  it('records one window per tool call, from the tool_use line to its tool_result line', async () => {
     const home = tempDir('why-diff-home-');
     const file = writeSyntheticTranscript(home, '/work/shop', 'win-1', [{
       prompt: 'fix the tests',
@@ -448,10 +448,11 @@ describe('ClaudeCodeAdapter.parse: shell windows', () => {
       ],
     }]);
     const s = await adapter.parse(file);
-    expect(s.shellWindows).toEqual([
-      { callId: 'toolu_0101xxxxxxxxxxxxxxxx', start: '2026-10-20T10:00:05.000Z', end: '2026-10-20T10:00:09.000Z' },
+    expect(s.toolWindows).toEqual([
+      { callId: 'toolu_0101xxxxxxxxxxxxxxxx', tool: 'Bash', start: '2026-10-20T10:00:05.000Z', end: '2026-10-20T10:00:09.000Z' },
+      { callId: 'toolu_0102xxxxxxxxxxxxxxxx', tool: 'Edit', start: '2026-10-20T10:00:10.000Z', end: '2026-10-20T10:00:11.000Z' },
       // a failing command (non-zero exit) may still have changed files
-      { callId: 'toolu_0103xxxxxxxxxxxxxxxx', start: '2026-10-20T10:00:20.000Z', end: '2026-10-20T10:00:21.000Z' },
+      { callId: 'toolu_0103xxxxxxxxxxxxxxxx', tool: 'Bash', start: '2026-10-20T10:00:20.000Z', end: '2026-10-20T10:00:21.000Z' },
     ]);
   });
 
@@ -471,11 +472,11 @@ describe('ClaudeCodeAdapter.parse: shell windows', () => {
       const last = lines[lines.length - 1] as { message: { content: Array<{ content: string }> } };
       last.message.content[0]!.content = out; // the command's own output as the result text
       writeFileSync(file, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
-      expect((await adapter.parse(file)).shellWindows ?? [], out).toHaveLength(1);
+      expect((await adapter.parse(file)).toolWindows ?? [], out).toHaveLength(1);
     }
   });
 
-  it('records no window for a Bash call that never got a result or was denied', async () => {
+  it('records no window for a denied call, and an open one for a call that never got a result', async () => {
     const home = tempDir('why-diff-home-');
     const file = writeSyntheticTranscript(home, '/work/shop', 'win-2', [{
       prompt: 'clean up',
@@ -487,11 +488,48 @@ describe('ClaudeCodeAdapter.parse: shell windows', () => {
     const last = lines[lines.length - 1] as { message: { content: Array<{ content: string }> } };
     last.message.content[0]!.content = 'The user doesn\'t want to proceed with this tool use. The tool use was rejected.';
     writeFileSync(file, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
-    expect((await adapter.parse(file)).shellWindows ?? []).toEqual([]);
+    expect((await adapter.parse(file)).toolWindows ?? []).toEqual([]);
 
     const unfinished = writeSyntheticTranscript(home, '/work/shop', 'win-3', [{ prompt: 'x', at: '2026-10-20T10:00:00.000Z', calls: [{ tool: 'Bash', at: '2026-10-20T10:00:05.000Z', input: { command: 'node a.js' } }] }]);
     const kept = readFileSync(unfinished, 'utf8').split('\n').filter(Boolean).slice(0, -1);
     writeFileSync(unfinished, `${kept.join('\n')}\n`);
-    expect((await adapter.parse(unfinished)).shellWindows ?? []).toEqual([]);
+    expect((await adapter.parse(unfinished)).toolWindows ?? []).toEqual([
+      { callId: 'toolu_0101xxxxxxxxxxxxxxxx', tool: 'Bash', start: '2026-10-20T10:00:05.000Z', end: '2026-10-20T10:00:05.000Z', open: true },
+    ]);
   });
+
+  it('opens the window of a background call and of a command that detaches', async () => {
+    const home = tempDir('why-diff-home-');
+    const file = writeSyntheticTranscript(home, '/work/shop', 'win-bg', [{
+      prompt: 'x', at: '2026-10-20T10:00:00.000Z',
+      calls: [
+        { tool: 'Bash', at: '2026-10-20T10:00:05.000Z', input: { command: 'npm run dev', run_in_background: true } },
+        { tool: 'Bash', at: '2026-10-20T10:00:10.000Z', input: { command: 'node a.js' }, result: { stdout: '', stderr: '', interrupted: false, isImage: false, backgroundTaskId: 'b1' } },
+        { tool: 'Bash', at: '2026-10-20T10:00:15.000Z', input: { command: 'nohup node a.js >/dev/null 2>&1 &' } },
+        { tool: 'Bash', at: '2026-10-20T10:00:20.000Z', input: { command: 'npm test 2>&1 && echo ok' } },
+        { tool: 'Agent', at: '2026-10-20T10:00:25.000Z', input: { prompt: 'x', run_in_background: true } },
+      ],
+    }]);
+    const open = ((await adapter.parse(file)).toolWindows ?? []).map((w) => [w.tool, w.open === true]);
+    expect(open).toEqual([['Bash', true], ['Bash', true], ['Bash', true], ['Bash', false], ['Agent', true]]);
+  });
+
+  it('closes the window of a big skipped tool result (a large Read) at its line timestamp', async () => {
+    const home = tempDir('why-diff-home-');
+    const file = writeSyntheticTranscript(home, '/work/shop', 'win-big', [{
+      prompt: 'x', at: '2026-10-20T10:00:00.000Z',
+      calls: [{ tool: 'Read', at: '2026-10-20T10:00:05.000Z', resultAt: '2026-10-20T10:00:30.000Z', input: { file_path: '/work/shop/a.js' }, result: { type: 'text', file: { content: 'x'.repeat(200_000) } } }],
+    }]);
+    expect((await adapter.parse(file)).toolWindows).toEqual([
+      { callId: 'toolu_0101xxxxxxxxxxxxxxxx', tool: 'Read', start: '2026-10-20T10:00:05.000Z', end: '2026-10-20T10:00:30.000Z' },
+    ]);
+  });
+});
+
+describe('detachesProcess', () => {
+  const yes = ['node a.js &', 'node a.js & echo started', '(sleep 9; x) &', "sh -c 'x &'", 'nohup x', 'setsid x', 'x & disown', 'echo x | at now', 'sudo -n at now', 'crontab f', 'systemd-run x',
+    'launchctl load f', "tmux new -d 'x'", 'screen -dm x', 'FOO=1 nohup x', 'Start-Process node', 'start /b node a.js', 'x &!'];
+  const no = ['a && b', 'a 2>&1', 'a &> log', 'a |& tee log', 'a >&2', 'curl "https://x/?a=1&b=2"', 'git log --format=%an at', 'npm start', 'echo screen', 'cat <&3'];
+  for (const c of yes) it(`detaches: ${c}`, () => expect(detachesProcess(c)).toBe(true));
+  for (const c of no) it(`stays in the foreground: ${c}`, () => expect(detachesProcess(c)).toBe(false));
 });

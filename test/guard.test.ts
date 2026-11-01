@@ -409,7 +409,7 @@ describe('runGuard', () => {
   }, 60_000);
 });
 
-describe('runGuard: shell changes whose path the command does not name (mtime windows)', () => {
+describe('runGuard: shell changes whose path the command does not name (tool call windows)', () => {
   const BL = new Set<LabelKind>(['test-skip-added', 'tests-disabled', 'assertion-removed', 'secret-like', 'ci-changed', 'protected-path']);
   const T = Date.now() - 30 * 60_000; // the Bash call starts here
   const iso = (ms: number): string => new Date(ms).toISOString();
@@ -510,8 +510,8 @@ describe('runGuard: shell changes whose path the command does not name (mtime wi
     expect(r.block).toBe(false);
   });
 
-  // POSIX only: Windows has no ctime that utimes leaves alone, so the guard falls back to mtime there.
-  it.skipIf(process.platform === 'win32')('uses ctime by default: a script that backdates the mtime is still credited', async () => {
+  // On every platform: utimes cannot set ctime (POSIX inode change time, NTFS ChangeTime on Windows).
+  it('uses ctime by default: a script that backdates the mtime is still credited', async () => {
     const now = Date.now();
     const r = await run((repo) => {
       applyEdit(repo, SKIP_OLD, SKIP_NEW);
