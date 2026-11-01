@@ -114,7 +114,8 @@ describe('alias spellings of a Windows path (sec030 #6)', () => {
     ['C:\\r\\test\\f.test.js . .', 'C:\\r\\test\\f.test.js'],
     ['C:\\r\\test. \\f.test.js', 'C:\\r\\test\\f.test.js'],
     ['C:\\r\\..\\r\\f.js', 'C:\\r\\..\\r\\f.js'],
-    ['/home/u/f.js.', '/home/u/f.js.'],
+    // a POSIX path keeps its trailing dot, except on Windows where the file system drops it
+    ['/home/u/f.js.', process.platform === 'win32' ? '/home/u/f.js' : '/home/u/f.js.'],
   ];
   for (const [input, want] of cases) it(`win32Spelling(${JSON.stringify(input)})`, () => expect(win32Spelling(input)).toBe(want));
 
