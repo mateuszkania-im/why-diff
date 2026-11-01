@@ -10,7 +10,10 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSyn
 import { lstat } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// Guard runs over real repositories (submodules, CLI children) take seconds on Windows runners.
+vi.setConfig({ testTimeout: 30_000 });
 import { runGuard, type GuardOptions } from '../src/guard.js';
 import * as gitModule from '../src/git.js';
 import { recordSessionStart } from '../src/session-start.js';
@@ -24,7 +27,8 @@ const savedEnv = { ...process.env };
 afterEach(() => {
   for (const k of Object.keys(process.env)) if (!(k in savedEnv)) delete process.env[k];
   Object.assign(process.env, savedEnv);
-  while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+  // A guard child still exiting (Windows) can hold a directory for a moment: EBUSY is retried.
+  while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 function temp(prefix: string): string {
   const d = realpathSync(tempDir(prefix));
@@ -501,5 +505,250 @@ describe('sec035 #6: change times on a file system mounted inside the repository
       },
     } as Partial<GuardOptions>);
     expect(res.block).toBe(false);
+  });
+});
+
+describe('sec035 fix round 1 (F1): the repository and the record must stay on the file systems they started on', () => {
+  const rootDev = (root: string, bump: string[]) => async (p: string) => {
+    const st = await lstat(p);
+    const hit = bump.some((b) => path.resolve(p) === b || path.resolve(p).startsWith(`${b}${path.sep}`));
+    return { dev: hit ? Number(st.dev) + 1000 : Number(st.dev), ctimeMs: st.ctimeMs, symlink: st.isSymbolicLink() };
+  };
+  /** A record from session start that reads as written before the first call. */
+  async function recorded(): Promise<{ repo: string; home: string; tp: string; data: string; times: (callAt: () => number) => (p: string) => Promise<number> }> {
+    const data = temp('wd-s35-data-');
+    process.env.CLAUDE_PLUGIN_DATA = data;
+    const x = repo();
+    await recordSessionStart({ session_id: SID, cwd: x.repo });
+    const times = (callAt: () => number) => async (p: string): Promise<number> => {
+      const st = await lstat(p);
+      return path.resolve(p).startsWith(path.join(data, 'sessions')) ? callAt() - 5000 : st.ctimeMs;
+    };
+    return { ...x, data, times };
+  }
+  const srcEdit = (r: string) => (t: number): SyntheticCall[] => [edit(t, path.join(r, 'src', 'f.js'), 'x;', 'x + 0;')];
+
+  it('the record keeps the devices of the root, the git dir and the record directory', async () => {
+    const x = await recorded();
+    const rec = JSON.parse(readFileSync(path.join(x.data, 'sessions', `${hash(SID)}.json`), 'utf8')) as Record<string, unknown>;
+    expect(typeof rec.rootDev).toBe('number');
+    expect(typeof rec.gitDev).toBe('number');
+    expect(typeof rec.dataDirDev).toBe('number');
+  });
+
+  it('a repository root on another device than at session start (a mount over it) fails closed', async () => {
+    const x = await recorded();
+    replaceIn(path.join(x.repo, 'src', 'f.js'), 'x;', 'x + 0;');
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => { callAt = t; return srcEdit(x.repo)(t); }, { statTime: x.times(() => callAt), pathStat: rootDev(x.repo, [x.repo]) });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('file system');
+  });
+
+  it('a git dir on another device than at session start fails closed', async () => {
+    const x = await recorded();
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => { callAt = t; return srcEdit(x.repo)(t); }, { statTime: x.times(() => callAt), pathStat: rootDev(x.repo, [path.join(x.repo, '.git')]) });
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('file system');
+  });
+
+  it('a record directory on another device than at session start fails closed', async () => {
+    const x = await recorded();
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => { callAt = t; return srcEdit(x.repo)(t); }, { statTime: x.times(() => callAt), pathStat: rootDev(x.repo, [path.join(x.data, 'sessions')]) });
+    expect(res.block).toBe(true);
+  });
+
+  it('a record on an untrusted file system type fails closed', async () => {
+    const x = await recorded();
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => { callAt = t; return srcEdit(x.repo)(t); }, { statTime: x.times(() => callAt), fsType: async (p: string) => (p.startsWith(x.data) ? 'msdos' : 'apfs') } as Partial<GuardOptions>);
+    expect(res.block).toBe(true);
+    expect(res.message).toContain('msdos');
+  });
+
+  it('without a record, a repository on an untrusted file system type blocks; on a trusted one it does not', async () => {
+    const x = repo();
+    replaceIn(path.join(x.repo, 'src', 'f.js'), 'x;', 'x + 0;');
+    const bad = await guardRun(x.repo, x.home, srcEdit(x.repo), { fsType: async () => 'msdos' } as Partial<GuardOptions>);
+    expect(bad.block).toBe(true);
+    expect(bad.message).toContain('msdos');
+    const unknown = await guardRun(x.repo, x.home, srcEdit(x.repo), { fsType: async () => { throw new Error('statfs failed'); } } as Partial<GuardOptions>);
+    expect(unknown.block).toBe(true);
+    const good = await guardRun(x.repo, x.home, srcEdit(x.repo), { fsType: async () => 'apfs' } as Partial<GuardOptions>);
+    expect(good.block).toBe(false);
+  });
+});
+
+describe('sec035 fix round 1 (F2): non-executable global settings reach git, programs do not', () => {
+  function globalConfig(text: string): string {
+    const f = path.join(temp('wd-s35-gcfg-'), 'gitconfig');
+    writeFileSync(f, text);
+    process.env.GIT_CONFIG_GLOBAL = f;
+    return f;
+  }
+  const forwarded = (): Promise<string> => (gitModule as unknown as { forwardedGlobalConfig: () => Promise<string> }).forwardedGlobalConfig();
+
+  it('safe.directory, autocrlf and the excludes file are forwarded; aliases, programs and includes are not', async () => {
+    const inc = path.join(temp('wd-s35-inc-'), 'inc');
+    writeFileSync(inc, '[core]\n\tfsmonitor = /bin/evil-inc\n');
+    globalConfig(`[safe]\n\tdirectory = /srv/repo\n\tdirectory = /srv/other \\"quoted\\"\n[core]\n\tautocrlf = true\n\texcludesFile = /home/u/.gitignore_global\n\tfsmonitor = /bin/evil\n\tpager = /bin/evil\n[alias]\n\tx = !/bin/evil\n[include]\n\tpath = ${inc}\n[filter "x"]\n\tclean = /bin/evil\n`);
+    const text = await forwarded();
+    expect(text).toContain('directory = "/srv/repo"');
+    expect(text).toContain('directory = "/srv/other \\"quoted\\""');
+    expect(text).toContain('autocrlf = "true"');
+    expect(text.toLowerCase()).toContain('excludesfile = "/home/u/.gitignore_global"');
+    expect(text).not.toContain('evil');
+    expect(text).not.toContain('include');
+  });
+
+  it('with a global core.autocrlf=true: a source-only edit and an added test pass, a skip still blocks', async () => {
+    globalConfig('[core]\n\tautocrlf = true\n');
+    // test/helpers/setup.ts pins core.autocrlf=false for every test git process: lift that here.
+    for (const k of Object.keys(process.env)) if (/^GIT_CONFIG_(COUNT|KEY_|VALUE_)/.test(k)) delete process.env[k];
+    const x = repo();
+    // Check the test file out again so it has CRLF line endings, as on Windows.
+    rmSync(x.tp);
+    git(x.repo, ['checkout', '--', TEST]);
+    expect(readFileSync(x.tp, 'utf8')).toContain('\r\n');
+    const src = path.join(x.repo, 'src', 'f.js');
+    replaceIn(src, 'x;', 'x + 0;');
+    expect((await guardRun(x.repo, x.home, (t) => [edit(t, src, 'x;', 'x + 0;')])).block).toBe(false);
+    const added = 'it("t11",()=>{\r\n  expect(f(11)).toBe(11);\r\n});\r\nit("t10"';
+    replaceIn(x.tp, 'it("t10"', added);
+    const add = await guardRun(x.repo, x.home, (t) => [edit(t, src, 'x;', 'x + 0;'), edit(t + 5000, x.tp, 'it("t10"', added)]);
+    expect(add.message ?? '').toBe('');
+    expect(add.block).toBe(false);
+    replaceIn(x.tp, 'it("t5"', 'it.skip("t5"');
+    const skipped = await guardRun(x.repo, x.home, (t) => [edit(t, x.tp, 'it("t5"', 'it.skip("t5"')]);
+    expect(skipped.block).toBe(true);
+    expect(skipped.message).toContain('test-skip-added');
+  });
+
+  it('with a global excludes file, build output it ignores is not read as the agent\'s untracked work', async () => {
+    const ignore = path.join(temp('wd-s35-ign-'), 'ignore');
+    writeFileSync(ignore, 'build/\n');
+    globalConfig(`[core]\n\texcludesFile = ${ignore}\n`);
+    process.env.WHY_DIFF_MAX_TIMED_BYTES = '10';
+    const x = repo();
+    mkdirSync(path.join(x.repo, 'build'));
+    for (let i = 0; i < 5; i++) writeFileSync(path.join(x.repo, 'build', `m${i}.js`), 'export const x = 1;\n'.repeat(5));
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => { callAt = t; return [bash(t, 'npm run build')]; }, {
+      statTime: async (p) => (path.resolve(p).startsWith(path.join(x.repo, 'build')) ? callAt + 1000 : (await lstat(p)).ctimeMs),
+    });
+    expect(res.block).toBe(false);
+  });
+});
+
+describe('sec035 fix round 1 (F3, F5): submodules are based on their own session-start commit, and clean ones cost little', () => {
+  function staleSubmodule(fetched: boolean): { repo: string; home: string; lib: string } {
+    const upstream = temp('wd-s35-up-');
+    mkdirSync(path.join(upstream, 'test'));
+    writeFileSync(path.join(upstream, 'test', 'a.test.js'), testFile());
+    git(upstream, ['init', '-q', '-b', 'main']);
+    git(upstream, ['add', '-A']);
+    git(upstream, ['commit', '-qm', 'C1'], PAST);
+    const x = repo('wd-s35-stale-');
+    git(x.repo, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', upstream, 'lib']);
+    git(x.repo, ['commit', '-qm', 'lib at C1'], PAST);
+    writeFileSync(path.join(upstream, 'test', 'b.test.js'), testFile());
+    git(upstream, ['add', '-A']);
+    git(upstream, ['commit', '-qm', 'C2'], PAST);
+    const c2 = git(upstream, ['rev-parse', 'HEAD']).trim();
+    const lib = path.join(x.repo, 'lib');
+    if (fetched) git(lib, ['-c', 'protocol.file.allow=always', 'fetch', '-q', 'origin'], PAST);
+    git(x.repo, ['update-index', '--cacheinfo', `160000,${c2},lib`]);
+    git(x.repo, ['commit', '-qm', 'bump lib'], PAST);
+    return { ...x, lib };
+  }
+
+  it('a submodule behind its gitlink whose new commit was never fetched does not block a source-only edit', async () => {
+    const x = staleSubmodule(false);
+    const src = path.join(x.repo, 'src', 'f.js');
+    replaceIn(src, 'x;', 'x + 0;');
+    const res = await guardRun(x.repo, x.home, (t) => [edit(t, src, 'x;', 'x + 0;')]);
+    expect(res.message ?? '').toBe('');
+    expect(res.block).toBe(false);
+  });
+
+  it('a fetched but not checked-out gitlink commit is not credited when the agent refreshes the submodule index', async () => {
+    const x = staleSubmodule(true);
+    const src = path.join(x.repo, 'src', 'f.js');
+    replaceIn(src, 'x;', 'x + 0;');
+    const subGit = path.join(x.repo, '.git', 'modules', 'lib');
+    let callAt = 0;
+    const res = await guardRun(x.repo, x.home, (t) => { callAt = t; return [edit(t, src, 'x;', 'x + 0;'), bash(t + 5000, 'git status')]; }, {
+      statTime: async (p) => (path.resolve(p).startsWith(subGit) ? callAt + 6000 : (await lstat(p)).ctimeMs),
+    });
+    expect(res.message ?? '').toBe('');
+    expect(res.block).toBe(false);
+  });
+
+  it('session-start records each checked-out submodule head', async () => {
+    const data = temp('wd-s35-data-');
+    process.env.CLAUDE_PLUGIN_DATA = data;
+    const x = staleSubmodule(true);
+    await recordSessionStart({ session_id: SID, cwd: x.repo });
+    const rec = JSON.parse(readFileSync(path.join(data, 'sessions', `${hash(SID)}.json`), 'utf8')) as { submodules?: Record<string, string> };
+    expect(rec.submodules?.lib).toBe(git(x.lib, ['rev-parse', 'HEAD']).trim());
+  });
+
+  it('a clean submodule of 5000 files adds little to a source-only session', async () => {
+    const lib = temp('wd-s35-big-');
+    for (let d = 0; d < 50; d++) {
+      mkdirSync(path.join(lib, `d${d}`));
+      for (let i = 0; i < 100; i++) writeFileSync(path.join(lib, `d${d}`, `f${i}.test.js`), `it("x${i}",()=>{});\n`);
+    }
+    git(lib, ['init', '-q', '-b', 'main']);
+    git(lib, ['add', '-A']);
+    git(lib, ['commit', '-qm', 'big'], PAST);
+    const x = repo('wd-s35-bigsup-');
+    git(x.repo, ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'lib']);
+    git(x.repo, ['commit', '-qm', 'big lib'], PAST);
+    const src = path.join(x.repo, 'src', 'f.js');
+    replaceIn(src, 'x;', 'x + 0;');
+    let walked = 0;
+    const t0 = Date.now();
+    const res = await guardRun(x.repo, x.home, (t) => [edit(t, src, 'x;', 'x + 0;')], {
+      // Its index and refs were written before the session (as they would be): not after the last call.
+      statTime: async (p) => (path.resolve(p).startsWith(path.join(x.repo, '.git')) ? Date.now() - 3600_000 : (await lstat(p)).ctimeMs),
+      pathStat: async (p) => {
+        if (p.includes(`${path.sep}lib${path.sep}d`)) walked++;
+        const st = await lstat(p);
+        return { dev: Number(st.dev), ctimeMs: st.ctimeMs, symlink: st.isSymbolicLink() };
+      },
+    });
+    expect(res.block).toBe(false);
+    expect(walked).toBe(0);
+    expect(Date.now() - t0).toBeLessThan(10_000);
+  }, 60_000);
+});
+
+describe('sec035 fix round 1 (F4): a linked worktree on another device than its repository', () => {
+  it('times of the common git dir are compared with the common dir, not with the worktree root', async () => {
+    const x = repo();
+    const wt = path.join(temp('wd-s35-wt-'), 'wt');
+    git(x.repo, ['worktree', 'add', '-q', '-b', 'feature', wt]);
+    const src = path.join(wt, 'src', 'f.js');
+    replaceIn(src, 'x;', 'x + 0;');
+    const res = await guardRun(wt, x.home, (t) => [edit(t, src, 'x;', 'x + 0;')], {
+      // The main repository (and its common git dir: objects, refs) sits on another device than the worktree.
+      pathStat: async (p) => {
+        const st = await lstat(p);
+        const onMain = path.resolve(p) === x.repo || path.resolve(p).startsWith(`${x.repo}${path.sep}`);
+        return { dev: onMain ? Number(st.dev) + 1000 : Number(st.dev), ctimeMs: st.ctimeMs, symlink: st.isSymbolicLink() };
+      },
+    });
+    expect(res.message ?? '').toBe('');
+    expect(res.block).toBe(false);
+  });
+});
+
+describe('sec035 fix round 1 (F6): git status never recurses into submodules', () => {
+  it('status gets --ignore-submodules=dirty', () => {
+    const args = gitModule.hardenedInvocation(['status', '--porcelain']).args;
+    expect(args).toContain('--ignore-submodules=dirty');
   });
 });

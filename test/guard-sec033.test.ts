@@ -9,7 +9,10 @@ import { mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, w
 import { createHash } from 'node:crypto';
 import { lstat } from 'node:fs/promises';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// Guard runs over real repositories (submodules, CLI children) take seconds on Windows runners.
+vi.setConfig({ testTimeout: 30_000 });
 import { runGuard, type GuardOptions } from '../src/guard.js';
 import { recordSessionStart } from '../src/session-start.js';
 import type { LabelKind } from '../src/types.js';
@@ -22,7 +25,8 @@ const savedEnv = { ...process.env };
 afterEach(() => {
   for (const k of Object.keys(process.env)) if (!(k in savedEnv)) delete process.env[k];
   Object.assign(process.env, savedEnv);
-  while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+  // A guard child still exiting (Windows) can hold a directory for a moment: EBUSY is retried.
+  while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 function temp(prefix: string): string {
   const d = realpathSync(tempDir(prefix));
