@@ -48,6 +48,8 @@ export interface GuardOptions {
   pathStat?: (absPath: string) => Promise<PathStat>;
   /** Type of the file system holding a path (`apfs`, `ext4`, `msdos`...) (tests); default: statfs / mount */
   fsType?: (absPath: string) => Promise<string>;
+  /** Why the file system holding a path was mounted by a user, or undefined (tests); default: the mount table */
+  userMount?: (absPath: string) => Promise<string | undefined>;
 }
 
 export interface GuardResult {
@@ -155,7 +157,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // when the index and refs last changed, and the session's base record.
   const statTime = opts.statTime ?? changeTime;
   const pathStat = opts.pathStat ?? lstatOf;
-  const metaTimes = await gitMetaTimes(gitEntry, statTime, pathStat);
+  const metaTimes = await gitMetaTimes(path.dirname(gitEntry), gitEntry, statTime, pathStat);
   const sessionId = payload.session_id;
   const record = sessionId ? await readBaseRecord(sessionId, statTime, pathStat) : undefined;
   const session = await claudeCodeAdapter.parse(payload.transcript_path);
@@ -180,6 +182,8 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   let recordedHead: string | undefined;
   let indexBase: string | undefined;
   let recordedSubmodules: Record<string, RecordedSubmodule> | undefined;
+  // Whether the SessionStart record kept (and matched) the devices of the root and the git dir.
+  let devicesRecorded = false;
   const fsType = opts.fsType ?? fileSystemType;
   const markers = sessionId ? await transcriptMarkers(payload.transcript_path, sessionId).catch(() => ({ ok: true, failed: true })) : { ok: false, failed: false };
   if (markers.failed) throw new FailClosedError(`base record could not be written at session start (the SessionStart hook said so); the session's base cannot be trusted`);
@@ -203,6 +207,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
           const now = await deviceOf(p, pathStat);
           if (now !== was) throw new FailClosedError(`the ${what} (${p}) is on another file system than at session start (device ${was} then, ${now ?? 'unreadable'} now): a file system mounted over it can report any change time`);
         }
+        devicesRecorded = true;
       }
       if (typeof devs.dataDirDev === 'number') {
         const now = await deviceOf(path.dirname(record.file), pathStat);
@@ -242,11 +247,26 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   }
 
   // A record (once trusted by its time) only proves anything if its own file system cannot forge times.
-  if (record) await trustedFileSystem(record.file, 'the base record', fsType);
+  const userMount = opts.userMount ?? userMountOf;
+  const gitDir = await absoluteGitDir(root);
+  if (process.platform === 'win32' && !opts.fsType) await prefetchWindowsTypes([root, commonDir, gitDir, ...(record ? [record.file] : [])]);
+  if (record) {
+    await trustedFileSystem(record.file, 'the base record', fsType, userMount);
+    await trustedFileSystem(path.dirname(record.file), 'the base record directory', fsType, userMount);
+  }
   // The repository's file systems must be ones whose change times cannot be forged without root,
   // whether or not the devices match the recorded ones (a remount can reuse the same device).
-  await trustedFileSystem(root, 'the repository', fsType);
-  await trustedFileSystem(commonDir, 'the git dir', fsType);
+  await trustedFileSystem(root, 'the repository', fsType, userMount);
+  await trustedFileSystem(commonDir, 'the git dir', fsType, userMount);
+  if (gitDir !== commonDir) await trustedFileSystem(gitDir, 'the worktree git dir', fsType, userMount);
+  // Without devices recorded at session start, a root or git dir on its own volume (its device
+  // differs from its parent directory's) could be a volume mounted over it during the session.
+  if (!devicesRecorded) {
+    for (const [what, dir] of [['repository root', await real(root)], ['git dir', await real(commonDir)]] as const) {
+      const [here, up] = await Promise.all([deviceOf(dir, pathStat), deviceOf(path.dirname(dir), pathStat)]);
+      if (here === undefined || here !== up) throw new FailClosedError(`unreviewed: the ${what} (${dir}) is the root of its own volume, and no SessionStart record kept its device, so a volume mounted over it during the session cannot be ruled out`);
+    }
+  }
 
   let baseRev = 'HEAD';
   const headed = await hasHead(root);
@@ -257,7 +277,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   const config: WhyDiffConfig = await loadConfig(root, baseRev).catch(() => ({}));
   const blocking = opts.blocking ?? new Set<LabelKind>([...DEFAULT_BLOCK_ON, ...(config.blockOn ?? [])]);
   const protectedGlob = compileGlobs(config.protected);
-  const ctx: SessionCheck = { payload, opts, session, windows, statTime, pathStat, rawObjectTime: opts.objectTime ?? changeTime, config, blocking, protectedGlob, recordedSubmodules, fsType, gitDev: await deviceOf(commonDir, pathStat) };
+  const ctx: SessionCheck = { payload, opts, session, windows, statTime, pathStat, rawObjectTime: opts.objectTime ?? changeTime, config, blocking, protectedGlob, recordedSubmodules, fsType, userMount, gitDev: await deviceOf(commonDir, pathStat) };
   const hits = await checkRepository(ctx, { root, baseRev, headed, indexBase, metaTimes, prefix: '', depth: 0 });
   return hits.length ? blocked(payload.transcript_path, hits) : NO_BLOCK;
 }
@@ -282,6 +302,7 @@ interface SessionCheck {
   /** Submodule heads from the SessionStart record, by path from the session's repository */
   recordedSubmodules?: Record<string, RecordedSubmodule>;
   fsType: (p: string) => Promise<string>;
+  userMount: (p: string) => Promise<string | undefined>;
   /** Device of the session repository's git common dir */
   gitDev?: number;
   config: WhyDiffConfig;
@@ -584,8 +605,8 @@ async function checkSubmodules(ctx: SessionCheck, repo: RepoUnderCheck, layeredA
     // Its times prove something only on a trusted file system, on the devices it had at session start.
     const subCommon = await gitCommonDir(subRoot);
     try {
-      await trustedFileSystem(subRoot, `submodule ${key}`, ctx.fsType);
-      await trustedFileSystem(subCommon, `the git dir of submodule ${key}`, ctx.fsType);
+      await trustedFileSystem(subRoot, `submodule ${key}`, ctx.fsType, ctx.userMount);
+      await trustedFileSystem(subCommon, `the git dir of submodule ${key}`, ctx.fsType, ctx.userMount);
     } catch (err) {
       unreviewed(p, `is on an untrusted file system (${(err as Error).message.replace(/^unreviewed: /, '')})`);
       continue;
@@ -622,7 +643,7 @@ async function checkSubmodules(ctx: SessionCheck, repo: RepoUnderCheck, layeredA
       for (const hit of await checkSubmodules(ctx, unchanged, false)) if (!hits.includes(hit)) hits.push(hit);
       continue;
     }
-    const metaTimes = await gitMetaTimes(gitEntry, ctx.statTime, ctx.pathStat);
+    const metaTimes = await gitMetaTimes(subRoot, gitEntry, ctx.statTime, ctx.pathStat);
     // Its index and refs unchanged during the session: HEAD is where it was at session start, and the
     // index's stat data can be trusted (change times compared, which a command cannot set on a
     // trusted file system), so `git status` lists every changed file and only those are dated. None,
@@ -794,19 +815,22 @@ async function findGitEntry(dir: string): Promise<string | null> {
  * process can touch them first. A missing index is dated by the directory that held it. Nothing
  * that cannot be read fails: the times only add credit.
  */
-async function gitMetaTimes(gitEntry: string, statTime: (p: string) => Promise<number>, pathStat: (p: string) => Promise<PathStat>): Promise<number[]> {
-  let gitDir = gitEntry;
+async function gitMetaTimes(workTree: string, gitEntry: string, statTime: (p: string) => Promise<number>, pathStat: (p: string) => Promise<PathStat>): Promise<number[]> {
+  // Fail closed: times that cannot be read count as changed now (after every call), never as quiet.
+  const UNKNOWN = [Infinity];
+  const linkTimes: number[] = [];
+  // A `.git` that is a symlink: credited by the link's own change time (it cannot be backdated).
+  const entry = await lstat(gitEntry).catch(() => undefined);
+  if (entry?.isSymbolicLink()) linkTimes.push(await statTime(gitEntry).catch(() => Infinity));
+  let gitDir: string;
+  let common: string;
   try {
-    const st = await lstat(gitEntry);
-    if (!st.isDirectory()) {
-      const m = /^gitdir:\s*(.+?)\s*$/m.exec(await readFile(gitEntry, 'utf8'));
-      if (!m) return [];
-      gitDir = path.resolve(path.dirname(gitEntry), m[1]!);
-    }
+    const [g = '', c = ''] = (await git(workTree, ['rev-parse', '--absolute-git-dir', '--git-common-dir'])).split('\n');
+    gitDir = await realpath(path.resolve(workTree, g));
+    common = await realpath(path.resolve(workTree, c));
   } catch {
-    return [];
+    return UNKNOWN;
   }
-  const common = await readFile(path.join(gitDir, 'commondir'), 'utf8').then((c) => path.resolve(gitDir, c.trim()), () => gitDir);
   // A file on another device than the git dir it belongs to (the worktree's own git dir for the
   // index, HEAD and its reflog; the common dir for refs) sits on a mount: its time reads as changed
   // after every call (see onDevice). A mount over the git dir itself is caught by the devices the
@@ -832,7 +856,8 @@ async function gitMetaTimes(gitEntry: string, statTime: (p: string) => Promise<n
     files.push(t(dir));
     for (const f of await readdir(dir).catch(() => [] as string[])) files.push(t(path.join(dir, f)));
   }
-  return (await Promise.all(files)).filter((t): t is number => t !== undefined);
+  const times = (await Promise.all(files)).filter((t): t is number => t !== undefined);
+  return times.length ? [...linkTimes, ...times] : UNKNOWN;
 }
 
 /**
@@ -928,6 +953,11 @@ async function gitCommonDir(root: string): Promise<string> {
   return path.resolve(root, await git(root, ['rev-parse', '--git-common-dir']));
 }
 
+/** The git dir of the work tree at `root` (a linked worktree's own one), absolute. */
+async function absoluteGitDir(root: string): Promise<string> {
+  return path.resolve(root, await git(root, ['rev-parse', '--absolute-git-dir']));
+}
+
 /**
  * File system types whose change times a user without root cannot set: local disk file systems and
  * the kernel's own. Not: FAT and exFAT (ctime is the stored mtime, `touch` sets it), FUSE, network
@@ -939,22 +969,85 @@ const LINUX_FS: ReadonlyMap<number, string> = new Map([
   [0xef53, 'ext4'], [0x58465342, 'xfs'], [0x9123683e, 'btrfs'], [0x2fc12fc1, 'zfs'], [0x5346544e, 'ntfs'], [0x01021994, 'tmpfs'], [0x794c7630, 'overlay'],
   [0x4244, 'hfs'], [0x482b, 'hfs'], [0x4d44, 'msdos'], [0x2011bab0, 'exfat'], [0x65735546, 'fuse'], [0x6969, 'nfs'], [0x517b, 'smbfs'], [0xff534d42, 'cifs'], [0xfe534d42, 'smb2'],
 ]);
+/** One mounted file system: its source, mount point, type and options. */
+interface MountEntry {
+  source: string;
+  mountPoint: string;
+  type: string;
+  options: string[];
+}
+let mountTable: Promise<MountEntry[]> | undefined;
+/**
+ * The mounted file systems, read once per run: macOS `/sbin/mount` (by absolute path, in the
+ * temporary directory), Linux `/proc/self/mountinfo`. Empty elsewhere.
+ */
+function mounts(): Promise<MountEntry[]> {
+  mountTable ??= (async (): Promise<MountEntry[]> => {
+    if (process.platform === 'darwin') {
+      const out = await new Promise<string>((resolve, reject) => execFile('/sbin/mount', [], { encoding: 'utf8', cwd: os.tmpdir(), shell: false }, (err, o) => (err ? reject(err) : resolve(o))));
+      return out.split('\n').map((line) => /^(.+?) on (.+) \(([^)]*)\)\s*$/.exec(line)).filter((m): m is RegExpExecArray => m !== null).map((m) => {
+        const options = m[3]!.split(',').map((o) => o.trim());
+        return { source: m[1]!, mountPoint: m[2]!, type: options[0] ?? '', options: options.slice(1) };
+      });
+    }
+    if (process.platform === 'linux') {
+      const unescape = (v: string): string => v.replace(/\\([0-7]{3})/g, (_, o: string) => String.fromCharCode(parseInt(o, 8)));
+      return (await readFile('/proc/self/mountinfo', 'utf8')).split('\n').filter(Boolean).map((line) => {
+        const [left = '', right = ''] = line.split(' - ');
+        const f = left.split(' ');
+        const [type = '', source = '', superOptions = ''] = right.split(' ');
+        return { source: unescape(source), mountPoint: unescape(f[4] ?? ''), type, options: [...(f[5] ?? '').split(','), ...superOptions.split(',')] };
+      });
+    }
+    return [];
+  })();
+  const table = mountTable;
+  setTimeout(() => { if (mountTable === table) mountTable = undefined; }, 2000).unref();
+  return table;
+}
+/**
+ * Why the file system holding `p` was mounted by a user (who can then write any time into it: an
+ * HFS+ or ext4 image with crafted dates), or undefined: the mount entry whose mount point is the
+ * longest prefix of `p`'s real path says `mounted by <user>`, is `nobrowse`, or is a disk image
+ * (macOS); is FUSE, set up by udisks2, or under `/media` or `/run/media` (Linux).
+ */
+async function userMountOf(p: string): Promise<string | undefined> {
+  if (process.platform !== 'darwin' && process.platform !== 'linux') return undefined;
+  const real = await realpath(p);
+  let best: MountEntry | undefined;
+  for (const m of await mounts()) {
+    const mp = m.mountPoint;
+    const under = real === mp || real.startsWith(mp.endsWith('/') ? mp : `${mp}/`);
+    if (under && (!best || mp.length > best.mountPoint.length)) best = m;
+  }
+  if (!best) throw new Error(`no mount found for ${real}`);
+  const describe = `${best.source} on ${best.mountPoint} (${[best.type, ...best.options].join(', ')})`;
+  if (process.platform === 'darwin') {
+    if (best.options.some((o) => o.startsWith('mounted by'))) return describe;
+    // The system's own nobrowse volumes (VM, Preboot, Update, Data...) live under /System/Volumes.
+    if (best.options.includes('nobrowse') && !best.mountPoint.startsWith('/System/Volumes/')) return describe;
+    if (/disk image/i.test(best.options.join(','))) return describe;
+    return undefined;
+  }
+  if (best.type.startsWith('fuse') || best.options.includes('uhelper=udisks2') || /^\/(run\/)?media\//.test(`${best.mountPoint}/`)) return describe;
+  return undefined;
+}
+
 let darwinMounts: Promise<Map<number, string>> | undefined;
-/** macOS: file system type by device, from `mount` (each `/dev/...` source's `st_rdev` is the `st_dev` of files on it). */
+/** macOS: file system type by device, from the mount table (each `/dev/...` source's `st_rdev` is the `st_dev` of files on it). */
 function darwinMountTypes(): Promise<Map<number, string>> {
-  darwinMounts ??= new Promise<string>((resolve, reject) => execFile('/sbin/mount', [], { encoding: 'utf8' }, (err, out) => (err ? reject(err) : resolve(out))))
-    .then(async (out) => {
-      const types = new Map<number, string>();
-      for (const line of out.split('\n')) {
-        const m = /^(\/dev\/\S+) on .+ \(([^,)]+)/.exec(line);
-        if (!m) continue;
-        const rdev = await stat(m[1]!).then((st) => Number(st.rdev), () => undefined);
-        if (rdev !== undefined && !types.has(rdev)) types.set(rdev, m[2]!);
-      }
-      return types;
-    });
-  setTimeout(() => { darwinMounts = undefined; }, 2000).unref();
-  return darwinMounts;
+  darwinMounts ??= mounts().then(async (table) => {
+    const types = new Map<number, string>();
+    for (const m of table) {
+      if (!m.source.startsWith('/dev/')) continue;
+      const rdev = await stat(m.source).then((st) => Number(st.rdev), () => undefined);
+      if (rdev !== undefined && !types.has(rdev)) types.set(rdev, m.type);
+    }
+    return types;
+  });
+  const table = darwinMounts;
+  setTimeout(() => { if (darwinMounts === table) darwinMounts = undefined; }, 2000).unref();
+  return table;
 }
 const fsTypes = new Map<string, Promise<string>>();
 /** The type of the file system holding `p` (`apfs`, `ext4`, `msdos`...), once per path; throws when it cannot be told. */
@@ -980,52 +1073,68 @@ async function readFileSystemType(p: string): Promise<string> {
   return LINUX_FS.get(type) ?? `unknown (0x${type.toString(16)})`;
 }
 /**
- * The command that reads the Windows volume holding `realPath`: PowerShell's `Get-Volume -FilePath`,
- * by absolute path under `%SystemRoot%` (the hook's own environment, not the agent's), run in the
- * temporary directory without a shell. The path travels as data (`WD_PATH` in the environment),
- * never in the script text, so no character in it (a quote of any kind, `$`, a backtick) can
- * change the script (exported for tests).
+ * The command that reads the Windows volumes holding `realPaths`: PowerShell's `Get-Volume -FilePath`
+ * for each, by absolute path under `%SystemRoot%` (the hook's own environment, not the agent's), run
+ * in the temporary directory without a shell. The paths travel as data (`WD_PATHS` in the
+ * environment, one per line), never in the script text, so no character in them (a quote of any
+ * kind, `$`, a backtick) can change the script. It prints `<FileSystemType>|<DriveType>` per path,
+ * `ERROR|` for one it cannot read (exported for tests).
  */
-export function windowsVolumeCommand(realPath: string): { file: string; args: string[]; options: { cwd: string; windowsHide: true; shell: false; encoding: 'utf8'; timeout: number; env: NodeJS.ProcessEnv } } {
+export function windowsVolumeCommand(realPaths: string[]): { file: string; args: string[]; options: { cwd: string; windowsHide: true; shell: false; encoding: 'utf8'; timeout: number; env: NodeJS.ProcessEnv } } {
   const system32 = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32');
   return {
     file: path.join(system32, 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
     args: ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_VOLUME_SCRIPT],
-    options: { cwd: os.tmpdir(), windowsHide: true, shell: false, encoding: 'utf8', timeout: 20_000, env: { ...process.env, WD_PATH: realPath } },
+    options: { cwd: os.tmpdir(), windowsHide: true, shell: false, encoding: 'utf8', timeout: 30_000, env: { ...process.env, WD_PATHS: realPaths.join('\n') } },
   };
 }
-const WINDOWS_VOLUME_SCRIPT = '$v = Get-Volume -FilePath $env:WD_PATH -ErrorAction Stop; "$($v.FileSystemType)|$($v.DriveType)"';
-const windowsVolumes = new Map<number, Promise<string>>();
-/**
- * Windows: the file system of the volume that actually holds `p` (junctions and folder mount points
- * followed with `realpath`), from `Get-Volume -FilePath` ({@link windowsVolumeCommand}). Trusted only
- * as NTFS or ReFS on a Fixed or Removable drive: any other file system or drive type (Remote, Network,
- * Unknown...), a UNC path, or a failure is not. Cached by volume serial (`st_dev`) for the process:
- * one PowerShell start per volume per guard run.
- */
-async function windowsFileSystemType(p: string): Promise<string> {
+const WINDOWS_VOLUME_SCRIPT = '$env:WD_PATHS -split "`n" | ForEach-Object { try { $v = Get-Volume -FilePath $_ -ErrorAction Stop; "$($v.FileSystemType)|$($v.DriveType)" } catch { "ERROR|" } }';
+/** Windows volume type by the real path of what was asked (not by volume serial, which an image's maker chooses). */
+const windowsVolumes = new Map<string, Promise<string>>();
+async function windowsRealPath(p: string): Promise<string> {
   const real = await new Promise<string>((resolve, reject) => realpathNative(p, (err, out) => (err ? reject(err) : resolve(out))));
   if (/^\\\\/.test(real)) throw new Error(`${real} is a UNC or network path`);
   if (!/^[A-Za-z]:[\\/]/.test(real)) throw new Error(`${real} is not on a local drive`);
-  const dev = Number((await stat(real)).dev);
-  let t = windowsVolumes.get(dev);
-  if (!t) {
-    const c = windowsVolumeCommand(real);
-    t = new Promise<string>((resolve, reject) => execFile(c.file, c.args, c.options, (err, out) => (err ? reject(err) : resolve(String(out)))))
-      .then((out) => {
-        const m = /^(\w+)\|(\w*)\s*$/m.exec(out.trim());
-        if (!m) throw new Error('no file system in Get-Volume output');
-        if (!/^(fixed|removable)$/i.test(m[2]!)) throw new Error(`drive type ${m[2] || 'unknown'}`);
-        const fs = m[1]!.toLowerCase();
-        return fs === 'ntfs' || fs === 'refs' ? fs : `${fs} (Windows)`;
-      });
-    windowsVolumes.set(dev, t);
-    t.catch(() => windowsVolumes.delete(dev));
-  }
+  return real;
+}
+/** Read the volume types of the real paths of `paths` not read yet, in one PowerShell start. */
+async function prefetchWindowsTypes(paths: string[]): Promise<void> {
+  const reals = [...new Set(await Promise.all(paths.map((p) => windowsRealPath(p).catch(() => undefined))))].filter((r): r is string => r !== undefined && !windowsVolumes.has(r));
+  if (!reals.length) return;
+  const c = windowsVolumeCommand(reals);
+  const run = new Promise<string[]>((resolve, reject) => execFile(c.file, c.args, c.options, (err, out) => (err ? reject(err) : resolve(String(out).split(/\r?\n/).filter((l) => l.includes('|'))))));
+  reals.forEach((r, i) => {
+    const t = run.then((lines) => windowsTypeOf(lines[i]));
+    windowsVolumes.set(r, t);
+    t.catch(() => windowsVolumes.delete(r));
+    // One guard run is short; a long-lived process (the library) must see a later mount.
+    setTimeout(() => { if (windowsVolumes.get(r) === t) windowsVolumes.delete(r); }, 5000).unref();
+  });
+  await run.catch(() => undefined);
+}
+/** `<FileSystemType>|<DriveType>`: trusted only as NTFS or ReFS on a Fixed or Removable drive. */
+function windowsTypeOf(line: string | undefined): string {
+  const m = /^(\w+)\|(\w*)\s*$/.exec((line ?? '').trim());
+  if (!m || m[1] === 'ERROR') throw new Error('Get-Volume could not read the volume');
+  if (!/^(fixed|removable)$/i.test(m[2]!)) throw new Error(`drive type ${m[2] || 'unknown'}`);
+  const fs = m[1]!.toLowerCase();
+  return fs === 'ntfs' || fs === 'refs' ? fs : `${fs} (Windows)`;
+}
+/**
+ * Windows: the file system of the volume that actually holds `p` (junctions and folder mount points
+ * followed with `realpath`), from `Get-Volume -FilePath` ({@link windowsVolumeCommand}). A UNC path, a
+ * remote or unknown drive type, any file system but NTFS and ReFS, or a failure is not trusted.
+ */
+async function windowsFileSystemType(p: string): Promise<string> {
+  const real = await windowsRealPath(p);
+  if (!windowsVolumes.has(real)) await prefetchWindowsTypes([real]);
+  const t = windowsVolumes.get(real);
+  if (!t) throw new Error(`Get-Volume could not read the volume of ${real}`);
   return t;
 }
+
 /** Throw {@link FailClosedError} unless `p` sits on a file system type from {@link TRUSTED_FS}. */
-async function trustedFileSystem(p: string, what: string, fsType: (p: string) => Promise<string>): Promise<void> {
+async function trustedFileSystem(p: string, what: string, fsType: (p: string) => Promise<string>, userMount: (p: string) => Promise<string | undefined> = userMountOf): Promise<void> {
   let type: string;
   try {
     type = await fsType(p);
@@ -1033,6 +1142,13 @@ async function trustedFileSystem(p: string, what: string, fsType: (p: string) =>
     throw new FailClosedError(`unreviewed: cannot tell which file system ${what} is on (${p}: ${(err as Error).message}), so its change times cannot be trusted`);
   }
   if (!TRUSTED_FS.has(type.toLowerCase())) throw new FailClosedError(`unreviewed: ${what} (${p}) is on a ${type} file system, whose change times can be set without root, so its changes cannot be dated`);
+  let mounted: string | undefined;
+  try {
+    mounted = await userMount(p);
+  } catch (err) {
+    throw new FailClosedError(`unreviewed: cannot tell who mounted the file system ${what} is on (${p}: ${(err as Error).message}), so its change times cannot be trusted`);
+  }
+  if (mounted) throw new FailClosedError(`unreviewed: ${what} (${p}) is on a volume a user mounted (${mounted}), whose change times can be written by that user, so its changes cannot be dated`);
 }
 
 /** What the guard reads of a path (lstat: a symlink is never followed). */
