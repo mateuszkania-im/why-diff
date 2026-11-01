@@ -2624,7 +2624,7 @@ var program = new Command();
 
 // src/cli.ts
 var import_picocolors2 = __toESM(require_picocolors(), 1);
-import { mkdir as mkdir3, mkdtemp as mkdtemp2, rm as rm2, writeFile as writeFile2 } from "node:fs/promises";
+import { mkdir as mkdir3, mkdtemp as mkdtemp2, rm as rm2, writeFile as writeFile3 } from "node:fs/promises";
 import os9 from "node:os";
 import path13 from "node:path";
 import { spawn as spawn4 } from "node:child_process";
@@ -2650,8 +2650,8 @@ var BINARY_HUNK_HEADER = "Binary file changed", FILE_LEVEL_LABELS = /* @__PURE__
 
 // src/git.ts
 import { execFile, spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
-import { lstat, mkdtemp, open, readFile, readlink, realpath, rm, stat } from "node:fs/promises";
+import { mkdtempSync, rmSync } from "node:fs";
+import { lstat, mkdtemp, open, readFile, readlink, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path2 from "node:path";
@@ -2905,7 +2905,7 @@ function hardenedInvocation(args) {
   let out = [...args], i = 0;
   for (; out[i] === "-c" && i + 1 < out.length; ) i += 2;
   let sub = out[i];
-  return sub === "reflog" && out[i + 1] === "show" ? out.splice(i + 2, 0, "--no-ext-diff", "--no-textconv") : sub === "diff" ? out.splice(i + 1, 0, "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty") : sub && DIFF_COMMANDS.has(sub) ? out.splice(i + 1, 0, "--no-ext-diff", "--no-textconv") : sub === "hash-object" && out.splice(i + 1, 0, "--no-filters"), { args: [...safeConfig(), ...out], env: HARDENED_ENV };
+  return sub === "reflog" && out[i + 1] === "show" ? out.splice(i + 2, 0, "--no-ext-diff", "--no-textconv") : sub === "diff" ? out.splice(i + 1, 0, "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty") : sub === "status" ? out.splice(i + 1, 0, "--ignore-submodules=dirty") : sub && DIFF_COMMANDS.has(sub) ? out.splice(i + 1, 0, "--no-ext-diff", "--no-textconv") : sub === "hash-object" && out.splice(i + 1, 0, "--no-filters"), { args: [...safeConfig(), ...out], env: HARDENED_ENV };
 }
 var HARDENED_ENV = {
   GIT_CONFIG_NOSYSTEM: "1",
@@ -2945,18 +2945,46 @@ function filterPairs(cwd) {
 var USER_KEYS = /^(core\.(autocrlf|eol|safecrlf|excludesfile|ignorecase|precomposeunicode|longpaths|symlinks|filemode|protectntfs|protecthfs)|safe\.directory|user\.(name|email))$/;
 function userScopeEnv() {
   let env = baseEnv();
-  return delete env.GIT_CONFIG_NOSYSTEM, delete env.GIT_CONFIG_GLOBAL, env;
+  delete env.GIT_CONFIG_NOSYSTEM, delete env.GIT_CONFIG_GLOBAL;
+  for (let k of ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"]) process.env[k] !== void 0 && (env[k] = process.env[k]);
+  return env;
 }
-var userPairs;
-function userConfigPairs() {
-  return userPairs ??= execFileAsync("git", hardenedInvocation(["config", "-z", "--show-scope", "--get-regexp", USER_KEYS.source]).args, { cwd: os.tmpdir(), encoding: "utf8", env: userScopeEnv() }).then(({ stdout }) => {
-    let pairs = [];
-    for (let entry of stdout.split("\0")) {
-      let m = /^(\w+)\t([^\n]+)\n?([\s\S]*)$/.exec(entry);
-      !m || m[1] !== "system" && m[1] !== "global" || USER_KEYS.test(m[2].toLowerCase()) && pairs.push([m[2], m[3]]);
-    }
-    return pairs;
-  }, () => []), userPairs;
+var userConfig = /* @__PURE__ */ new Map();
+function forwardedGlobalConfig() {
+  let key = JSON.stringify(["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "HOME", "XDG_CONFIG_HOME", "USERPROFILE"].map((k) => process.env[k] ?? null)), text2 = userConfig.get(key);
+  return text2 || (text2 = execFileAsync("git", hardenedInvocation(["config", "-z", "--show-scope", "--get-regexp", USER_KEYS.source]).args, { cwd: os.tmpdir(), encoding: "utf8", env: userScopeEnv() }).then(({ stdout }) => configText(parseScoped(stdout).filter(([scope, k]) => (scope === "system" || scope === "global") && USER_KEYS.test(k.toLowerCase())).map(([, k, v]) => [k, v])), () => ""), userConfig.set(key, text2)), text2;
+}
+function parseScoped(out) {
+  let tokens = out.split("\0"), entries = [];
+  for (let i = 0; i + 1 < tokens.length; i += 2) {
+    let record = tokens[i + 1], nl = record.indexOf(`
+`);
+    entries.push([tokens[i], nl === -1 ? record : record.slice(0, nl), nl === -1 ? "true" : record.slice(nl + 1)]);
+  }
+  return entries;
+}
+function configText(pairs) {
+  let sections = /* @__PURE__ */ new Map();
+  for (let [key, value] of pairs) {
+    let dot = key.indexOf("."), section = key.slice(0, dot).toLowerCase(), name = key.slice(dot + 1);
+    if (!/^[a-z]+$/.test(section) || !/^[A-Za-z][A-Za-z0-9-]*$/.test(name)) continue;
+    let quoted = value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\t/g, "\\t");
+    sections.has(section) || sections.set(section, []), sections.get(section).push(`	${name} = "${quoted}"`);
+  }
+  return [...sections].map(([section, lines]) => `[${section}]
+${lines.join(`
+`)}
+`).join("");
+}
+var globalFiles = /* @__PURE__ */ new Map();
+async function globalConfigPath() {
+  let text2 = await forwardedGlobalConfig();
+  if (!text2) return HARDENED_ENV.GIT_CONFIG_GLOBAL;
+  let file = globalFiles.get(text2);
+  return file || (file = (async () => {
+    let dir = await mkdtemp(path2.join(os.tmpdir(), "why-diff-gitconfig-")), f = path2.join(dir, "config");
+    return await writeFile(f, text2, { mode: 384 }), process.once("exit", () => rmSync(dir, { recursive: !0, force: !0 })), f;
+  })(), globalFiles.set(text2, file)), file;
 }
 var NO_GRAFTS = path2.join(os.tmpdir(), `why-diff-no-grafts-${randomBytes(8).toString("hex")}`);
 function baseEnv() {
@@ -2965,7 +2993,7 @@ function baseEnv() {
   return { ...env, GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C", GIT_NO_REPLACE_OBJECTS: "1", GIT_GRAFT_FILE: NO_GRAFTS, ...HARDENED_ENV };
 }
 async function gitEnv(cwd) {
-  let pairs = [...await userConfigPairs(), ...await filterPairs(cwd)], env = baseEnv();
+  let pairs = await filterPairs(cwd), env = { ...baseEnv(), GIT_CONFIG_GLOBAL: await globalConfigPath() };
   return pairs.forEach(([k, v], n) => {
     env[`GIT_CONFIG_KEY_${n}`] = k, env[`GIT_CONFIG_VALUE_${n}`] = v;
   }), pairs.length && (env.GIT_CONFIG_COUNT = String(pairs.length)), env;
@@ -8320,7 +8348,7 @@ var DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5", ANTHROPIC_VERSION = "2023-06-0
 
 // src/classify/cache.ts
 import { createHash } from "node:crypto";
-import { mkdir, readFile as readFile5, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile as readFile5, rename, writeFile as writeFile2 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 var CACHE_VERSION = 1, MAX_ENTRIES = 5e3;
 function cachePath(repoRoot2) {
@@ -8366,7 +8394,7 @@ var VerdictCache = class _VerdictCache {
     let all = [...this.entries], kept = all.slice(Math.max(0, all.length - MAX_ENTRIES));
     await mkdir(dirname(this.path), { recursive: !0 });
     let tmp = `${this.path}.${process.pid}.tmp`;
-    await writeFile(tmp, JSON.stringify({ version: CACHE_VERSION, entries: Object.fromEntries(kept) }) + `
+    await writeFile2(tmp, JSON.stringify({ version: CACHE_VERSION, entries: Object.fromEntries(kept) }) + `
 `), await rename(tmp, this.path), this.dirty = !1;
   }
 };
@@ -10419,13 +10447,14 @@ function renderReport(report, format, opts = {}) {
 
 // src/guard.ts
 import { constants as fsConstants2, createReadStream as createReadStream4 } from "node:fs";
-import { access, lstat as lstat3, readdir as readdir4, readFile as readFile8, realpath as realpath7 } from "node:fs/promises";
+import { access, lstat as lstat4, readdir as readdir4, readFile as readFile8, realpath as realpath7, stat as stat5, statfs } from "node:fs/promises";
+import { execFile as execFile3 } from "node:child_process";
 import readline2 from "node:readline";
 import path12 from "node:path";
 
 // src/session-start.ts
 import { createHash as createHash2 } from "node:crypto";
-import { mkdir as mkdir2, open as open3, readFile as readFile7, realpath as realpath6 } from "node:fs/promises";
+import { lstat as lstat3, mkdir as mkdir2, open as open3, readFile as readFile7, realpath as realpath6 } from "node:fs/promises";
 import os8 from "node:os";
 import path11 from "node:path";
 function dataDir() {
@@ -10462,9 +10491,19 @@ function hookOutput(context) {
 }
 async function writeRecord(id, root) {
   try {
-    let head = await git(root, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]).catch(() => "") || null, indexTree = await git(root, ["write-tree"]).catch(() => "") || void 0, record = { session_id: id, root, head, at: (/* @__PURE__ */ new Date()).toISOString(), ...indexTree && /^[0-9a-f]{40,64}$/.test(indexTree) ? { indexTree } : {} }, file = recordPath(id);
+    let head = await git(root, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]).catch(() => "") || null, indexTree = await git(root, ["write-tree"]).catch(() => "") || void 0, file = recordPath(id);
     await mkdir2(path11.dirname(file), { recursive: !0, mode: 448 });
-    let fh = await open3(file, "wx", 384);
+    let dev = (p) => lstat3(p).then((st) => Number(st.dev), () => {
+    }), common = await git(root, ["rev-parse", "--git-common-dir"]).then((d) => path11.resolve(root, d), () => {
+    }), devs = { rootDev: await dev(root), gitDev: common ? await dev(common) : void 0, dataDirDev: await dev(path11.dirname(file)) }, submodules = await submoduleHeads(root, "", 1).catch(() => ({})), record = {
+      session_id: id,
+      root,
+      head,
+      at: (/* @__PURE__ */ new Date()).toISOString(),
+      ...indexTree && /^[0-9a-f]{40,64}$/.test(indexTree) ? { indexTree } : {},
+      ...Object.fromEntries(Object.entries(devs).filter(([, v]) => v !== void 0)),
+      ...Object.keys(submodules).length ? { submodules } : {}
+    }, fh = await open3(file, "wx", 384);
     try {
       await fh.writeFile(`${JSON.stringify(record)}
 `);
@@ -10473,6 +10512,19 @@ async function writeRecord(id, root) {
     }
   } catch {
   }
+}
+async function submoduleHeads(root, prefix, depth) {
+  let out = {};
+  if (depth > 3) return out;
+  for (let e of await indexEntries(root)) {
+    if (e.mode !== "160000") continue;
+    let abs = path11.join(root, ...e.path.split("/")), sub = await repoRoot(abs).then((r) => realpath6(r), () => {
+    });
+    if (!sub || sub !== await realpath6(abs).catch(() => abs)) continue;
+    let head = await git(sub, ["rev-parse", "--verify", "-q", "HEAD^{commit}"]).catch(() => "");
+    /^[0-9a-f]{40,64}$/.test(head) && (out[`${prefix}${e.path}`] = head), Object.assign(out, await submoduleHeads(sub, `${prefix}${e.path}/`, depth + 1).catch(() => ({})));
+  }
+  return out;
 }
 
 // src/guard.ts
@@ -10539,10 +10591,10 @@ async function guard(payload, opts, state, notes) {
   state.relevant = !0;
   let statTime = opts.statTime ?? changeTime, pathStat = opts.pathStat ?? lstatOf, metaTimes = await gitMetaTimes(gitEntry, statTime, pathStat), sessionId = payload.session_id, record = sessionId ? await readBaseRecord(sessionId, statTime, pathStat) : void 0, session = await claudeCodeAdapter.parse(payload.transcript_path);
   if (state.relevant = session.edits.some((e) => !e.failed) || (session.toolWindows?.length ?? 0) > 0, !state.relevant) return NO_BLOCK;
-  let root = await repoRoot(cwd), real = (p) => realpath7(p).catch(() => path12.resolve(p)), objectTime = onDevice(opts.objectTime ?? changeTime, pathStat, await deviceOf(root, pathStat));
+  let root = await repoRoot(cwd), real = (p) => realpath7(p).catch(() => path12.resolve(p)), commonDir = await gitCommonDir(root), objectTime = onDevice(opts.objectTime ?? changeTime, pathStat, await deviceOf(commonDir, pathStat));
   if (await real(root) !== await real(path12.dirname(gitEntry)))
     throw new FailClosedError(`git reports the work tree at ${root}, not at ${path12.dirname(gitEntry)} where the .git entry is (core.worktree or a .git file points elsewhere)`);
-  let windows = windowCheck(session), recordedHead, indexBase, markers = sessionId ? await transcriptMarkers(payload.transcript_path, sessionId).catch(() => ({ ok: !0, failed: !0 })) : { ok: !1, failed: !1 };
+  let windows = windowCheck(session), recordedHead, indexBase, recordedSubmodules, devicesChecked = !1, fsType = opts.fsType ?? fileSystemType, markers = sessionId ? await transcriptMarkers(payload.transcript_path, sessionId).catch(() => ({ ok: !0, failed: !0 })) : { ok: !1, failed: !1 };
   if (markers.failed) throw new FailClosedError("base record could not be written at session start (the SessionStart hook said so); the session's base cannot be trusted");
   if (record) {
     if (!windows) throw new FailClosedError(`the session's base record cannot be dated: no tool call of this session has a readable time (${record.file})`);
@@ -10555,7 +10607,19 @@ async function guard(payload, opts, state, notes) {
         throw new FailClosedError(`the base record is for ${record.data.root}, and this session's directory is inside it, but git now finds the repository ${root}`);
       notes.push(`base record is for another repository (${record.data.root}); this session now works in ${root}, so the base comes from the reflogs`);
     } else {
-      record.data.head ? (recordedHead = record.data.head, notes.push(`base from the SessionStart record: ${record.data.head}`)) : notes.push("base record names no commit (unborn branch at session start); the base comes from the reflogs");
+      let devs = record.data;
+      if (typeof devs.rootDev == "number" && typeof devs.gitDev == "number") {
+        for (let [what, p, was] of [["repository root", await real(root), devs.rootDev], ["git dir", commonDir, devs.gitDev]]) {
+          let now = await deviceOf(p, pathStat);
+          if (now !== was) throw new FailClosedError(`the ${what} (${p}) is on another file system than at session start (device ${was} then, ${now ?? "unreadable"} now): a file system mounted over it can report any change time`);
+        }
+        devicesChecked = !0;
+      }
+      if (typeof devs.dataDirDev == "number") {
+        let now = await deviceOf(path12.dirname(record.file), pathStat);
+        if (now !== devs.dataDirDev) throw new FailClosedError(`the base record directory (${path12.dirname(record.file)}) is on another file system than at session start (device ${devs.dataDirDev} then, ${now ?? "unreadable"} now)`);
+      }
+      devs.submodules && typeof devs.submodules == "object" && (recordedSubmodules = Object.fromEntries(Object.entries(devs.submodules).filter(([, h]) => typeof h == "string" && /^[0-9a-f]{40,64}$/.test(h)))), record.data.head ? (recordedHead = record.data.head, notes.push(`base from the SessionStart record: ${record.data.head}`)) : notes.push("base record names no commit (unborn branch at session start); the base comes from the reflogs");
       let tree = record.data.indexTree;
       tree && await git(root, ["cat-file", "-e", `${tree}^{tree}`]).then(() => !0, () => !1) && await writtenBefore(root, tree, windows.firstStart, objectTime) && (indexBase = tree, notes.push(`index compared against the index tree recorded at session start: ${tree}`));
     }
@@ -10568,9 +10632,10 @@ async function guard(payload, opts, state, notes) {
       notes.push("no SessionStart base record; the base comes from the reflogs");
     }
   }
+  record && await trustedFileSystem(record.file, "the base record", fsType), devicesChecked || (await trustedFileSystem(root, "the repository", fsType), await trustedFileSystem(commonDir, "the git dir", fsType));
   let baseRev = "HEAD", headed = await hasHead(root);
   headed && (baseRev = await sessionBase(root, Date.parse(session.startedAt), objectTime, recordedHead));
-  let config = await loadConfig(root, baseRev).catch(() => ({})), blocking = opts.blocking ?? /* @__PURE__ */ new Set([...DEFAULT_BLOCK_ON, ...config.blockOn ?? []]), protectedGlob = compileGlobs(config.protected), hits = await checkRepository({ payload, opts, session, windows, statTime, pathStat, objectTime, config, blocking, protectedGlob }, { root, baseRev, headed, indexBase, metaTimes, prefix: "", depth: 0 });
+  let config = await loadConfig(root, baseRev).catch(() => ({})), blocking = opts.blocking ?? /* @__PURE__ */ new Set([...DEFAULT_BLOCK_ON, ...config.blockOn ?? []]), protectedGlob = compileGlobs(config.protected), ctx = { payload, opts, session, windows, statTime, pathStat, rawObjectTime: opts.objectTime ?? changeTime, config, blocking, protectedGlob, recordedSubmodules }, hits = await checkRepository(ctx, { root, baseRev, headed, indexBase, metaTimes, prefix: "", depth: 0 });
   return hits.length ? blocked(payload.transcript_path, hits) : NO_BLOCK;
 }
 var MAX_SUBMODULE_DEPTH = 3;
@@ -10585,7 +10650,7 @@ async function checkRepository(ctx, repo) {
     if (!rel) return null;
     let p = rel.split(path12.sep).join("/"), magic = `:(${e.kind === "bash" && SHELL_GLOB.test(p) ? "glob" : "literal"}${icase ? ",icase" : ""})`;
     return [.../* @__PURE__ */ new Set([p, p.normalize("NFD")])].map((v) => `${magic}${v}`);
-  }).flatMap((p) => p ?? []))], sparseTrust = { before: Date.parse(session.startedAt) - WINDOW_SLACK_MS, timeOf: ctx.objectTime }, shellTargets = (ops) => new Set(session.edits.filter((e) => !e.failed && e.kind === "bash" && ops.has(e.bashOp ?? "")).map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants)).filter((p) => !!p).map((p) => p.split(path12.sep).join("/").replace(/^(\.\/)+/, "").replace(/\/+$/, ""))), removedByShell = shellTargets(REMOVE_OPS), rewrittenByShell = shellTargets(REWRITE_OPS), targeted = (targets, file, dirs) => {
+  }).flatMap((p) => p ?? []))], sparseTrust = { before: Date.parse(session.startedAt) - WINDOW_SLACK_MS, timeOf: onDevice(ctx.rawObjectTime, pathStat, await deviceOf(await gitCommonDir(root), pathStat)) }, shellTargets = (ops) => new Set(session.edits.filter((e) => !e.failed && e.kind === "bash" && ops.has(e.bashOp ?? "")).map((e) => repoRelativePath(e.filePath, roots, session.cwd, cwdVariants)).filter((p) => !!p).map((p) => p.split(path12.sep).join("/").replace(/^(\.\/)+/, "").replace(/\/+$/, ""))), removedByShell = shellTargets(REMOVE_OPS), rewrittenByShell = shellTargets(REWRITE_OPS), targeted = (targets, file, dirs) => {
     let f = file.normalize("NFC").replace(/^(\.\/)+/, "");
     icase && (f = f.toLowerCase());
     for (let r of targets)
@@ -10640,12 +10705,12 @@ async function checkRepository(ctx, repo) {
     let first = await check(paths, NO_CREDIT);
     if (first.length) return first;
   }
-  let excluded = await sparseExcluded(root, sparseTrust), byWindow = await toolWindowFiles(root, headed ? baseRev : void 0, windows, opts.statTime ? statTime : void 0, pathStat, excluded), hits = [];
+  let excluded = await sparseExcluded(root, sparseTrust), byWindow = await toolWindowFiles(root, headed ? baseRev : void 0, windows, opts.statTime ? statTime : void 0, pathStat, excluded, repo.onlyFiles), hits = [];
   for (let [f, mount] of [...byWindow.foreign].sort(([a], [b]) => a < b ? -1 : 1))
     (byWindow.differs.has(f) || isTestFile(f) || isConfigFile(f)) && hits.push(`- ${prefix}${f} unreviewed: on another file system mounted inside the repository (at ${prefix}${mount}), whose change times cannot be trusted`);
   let timedNew = [...byWindow.written].filter((f) => byWindow.untracked.has(f)).sort(), byteCap = Number(process.env.WHY_DIFF_MAX_TIMED_BYTES) > 0 ? Number(process.env.WHY_DIFF_MAX_TIMED_BYTES) : MAX_TIMED_BYTES, kept = timedNew.slice(0, MAX_TIMED_UNTRACKED), over = timedNew.slice(MAX_TIMED_UNTRACKED), bytes = 0;
   for (let i = 0; i < kept.length; i += LSTAT_BATCH) {
-    let sizes = await Promise.all(kept.slice(i, i + LSTAT_BATCH).map((f) => lstat3(path12.join(root, ...f.split("/"))).then((st) => st.size, () => 0)));
+    let sizes = await Promise.all(kept.slice(i, i + LSTAT_BATCH).map((f) => lstat4(path12.join(root, ...f.split("/"))).then((st) => st.size, () => 0)));
     for (let [j, size] of sizes.entries())
       if (bytes += size, bytes > byteCap) {
         over.unshift(...kept.slice(i + j)), kept.length = i + j;
@@ -10664,7 +10729,7 @@ async function checkRepository(ctx, repo) {
     for (let [args, deletedOnly] of [[[baseRev, "HEAD"], !1], [["--cached", indexBase ?? baseRev], !1], [["--diff-filter=D", baseRev, "HEAD"], !0], [["--diff-filter=D", "--cached", indexBase ?? baseRev], !0]]) {
       let out = await git(root, ["diff", "--name-only", "--no-renames", "-z", ...args, "--"], { trim: !1 });
       for (let f of out.split("\0"))
-        !f || f.startsWith(".why-diff/") || (deletedOnly ? await lstat3(path12.join(root, ...f.split("/"))).then(() => !0, () => !1) && credit.detached.add(f) : (credit.layered.has(f) || all.push(`:(literal)${f}`), credit.layered.add(f)));
+        !f || f.startsWith(".why-diff/") || (deletedOnly ? await lstat4(path12.join(root, ...f.split("/"))).then(() => !0, () => !1) && credit.detached.add(f) : (credit.layered.has(f) || all.push(`:(literal)${f}`), credit.layered.add(f)));
     }
   if (all.length) for (let hit of await check(all, credit)) hits.includes(hit) || hits.push(hit);
   for (let hit of await checkSubmodules(ctx, repo, layeredActive)) hits.includes(hit) || hits.push(hit);
@@ -10693,7 +10758,7 @@ async function checkSubmodules(ctx, repo, layeredActive) {
   };
   for (let [p, l] of [...links].sort(([a], [b]) => a < b ? -1 : 1)) {
     headed && (l.base = await treeLink(baseRev, p), l.head = await treeLink("HEAD", p));
-    let changed = headed && new Set([l.base, l.head, l.index].map((x) => x ?? "-")).size > 1, abs = path12.join(root, ...p.split("/")), st = await lstat3(abs).catch(() => {
+    let changed = headed && new Set([l.base, l.head, l.index].map((x) => x ?? "-")).size > 1, abs = path12.join(root, ...p.split("/")), st = await lstat4(abs).catch(() => {
     });
     if (!st) {
       changed && layeredActive && unreviewed(p, "is not checked out, and its recorded commit changed during the session");
@@ -10703,7 +10768,7 @@ async function checkSubmodules(ctx, repo, layeredActive) {
       unreviewed(p, "is a symlink, a file or a mount point in the place of the submodule directory");
       continue;
     }
-    let gitEntry = path12.join(abs, ".git"), hasGit = await lstat3(gitEntry).then(() => !0, () => !1), subRoot = hasGit ? await repoRoot(abs).catch(() => {
+    let gitEntry = path12.join(abs, ".git"), hasGit = await lstat4(gitEntry).then(() => !0, () => !1), subRoot = hasGit ? await repoRoot(abs).catch(() => {
     }) : void 0;
     if (!subRoot || await real(subRoot) !== await real(abs)) {
       hasGit || (await readdir4(abs).catch(() => [])).length ? unreviewed(p, "holds files but no repository of its own (its .git is missing or points elsewhere)") : changed && layeredActive && unreviewed(p, "is not checked out, and its recorded commit changed during the session");
@@ -10713,16 +10778,48 @@ async function checkSubmodules(ctx, repo, layeredActive) {
       unreviewed(p, `is nested more than ${MAX_SUBMODULE_DEPTH} levels deep`);
       continue;
     }
-    if (l.base && !await git(subRoot, ["cat-file", "-e", `${l.base}^{commit}`]).then(() => !0, () => !1)) {
-      unreviewed(p, `lacks the commit the base records for it (${l.base.slice(0, 12)})`);
-      continue;
+    let subHeaded = await hasHead(subRoot), metaTimes = await gitMetaTimes(gitEntry, ctx.statTime, ctx.pathStat), prefixed = `${prefix}${p}/`, w = ctx.windows, quiet = !(w && metaTimes.some((t) => w.inWindow(t) || t > w.lastEnd)), candidates;
+    if (quiet) {
+      candidates = statusPaths(await git(subRoot, ["status", "--porcelain=v2", "-z", "--untracked-files=all"], { trim: !1 }));
+      let subRoots = rootVariants(subRoot), named = ctx.session.edits.some((e) => !e.failed && repoRelativePath(e.filePath, subRoots, ctx.session.cwd) !== null);
+      if (!candidates.size && !named) {
+        let unchanged = { root: subRoot, baseRev: subHeaded ? "HEAD" : await emptyTree(subRoot), headed: subHeaded, metaTimes, prefix: prefixed, depth: depth + 1 };
+        for (let hit of await checkSubmodules(ctx, unchanged, !1)) hits.includes(hit) || hits.push(hit);
+        continue;
+      }
     }
-    let metaTimes = await gitMetaTimes(gitEntry, ctx.statTime, ctx.pathStat), sub = { root: subRoot, baseRev: l.base ?? await emptyTree(subRoot), headed: await hasHead(subRoot), metaTimes, prefix: `${prefix}${p}/`, depth: depth + 1 };
+    let objectTime = onDevice(ctx.rawObjectTime, ctx.pathStat, await deviceOf(await gitCommonDir(subRoot), ctx.pathStat)), subBase;
+    try {
+      subBase = subHeaded ? await sessionBase(subRoot, Date.parse(ctx.session.startedAt), objectTime, ctx.recordedSubmodules?.[`${prefix}${p}`]) : await emptyTree(subRoot);
+    } catch (err) {
+      if (!(err instanceof FailClosedError)) throw err;
+      if (l.base || l.index !== l.head) {
+        unreviewed(p, `has no commit from before the session to compare against (${err.message})`);
+        continue;
+      }
+      subBase = await emptyTree(subRoot);
+    }
+    let sub = { root: subRoot, baseRev: subBase, headed: subHeaded, metaTimes, prefix: prefixed, depth: depth + 1 };
+    candidates && (!subHeaded || await git(subRoot, ["rev-parse", "HEAD"]) === subBase) && (sub.onlyFiles = candidates);
     for (let hit of await checkRepository(ctx, sub)) hits.includes(hit) || hits.push(hit);
   }
   return hits;
 }
-var GITLINK = "160000", NO_CREDIT = { written: /* @__PURE__ */ new Set(), removed: /* @__PURE__ */ new Set(), detached: /* @__PURE__ */ new Set(), layered: /* @__PURE__ */ new Set() }, MAX_TIMED_UNTRACKED = 2e3, MAX_TIMED_BYTES = 32 * 1024 * 1024;
+var GITLINK = "160000";
+function statusPaths(out) {
+  let paths = /* @__PURE__ */ new Set(), tokens = out.split("\0");
+  for (let i = 0; i < tokens.length; i++) {
+    let t = tokens[i], fields = (n) => {
+      let at = 0;
+      for (let k = 0; k < n; k++)
+        if (at = t.indexOf(" ", at) + 1, at === 0) return;
+      return t.slice(at);
+    }, p;
+    t.startsWith("1 ") ? p = fields(8) : t.startsWith("2 ") ? (p = fields(9), tokens[i + 1] && paths.add(tokens[++i])) : t.startsWith("u ") ? p = fields(10) : t.startsWith("? ") && (p = t.slice(2)), p && paths.add(p);
+  }
+  return paths;
+}
+var NO_CREDIT = { written: /* @__PURE__ */ new Set(), removed: /* @__PURE__ */ new Set(), detached: /* @__PURE__ */ new Set(), layered: /* @__PURE__ */ new Set() }, MAX_TIMED_UNTRACKED = 2e3, MAX_TIMED_BYTES = 32 * 1024 * 1024;
 async function blocked(transcript, hits) {
   return transcript && await shownBefore(transcript, hits).catch(() => !1) ? {
     block: !0,
@@ -10769,7 +10866,7 @@ async function findGitEntry(dir) {
   for (let d = path12.resolve(dir); ; d = path12.dirname(d)) {
     let entry = path12.join(d, ".git");
     try {
-      return await lstat3(entry), entry;
+      return await lstat4(entry), entry;
     } catch (err) {
       if (!GONE2.has(err.code ?? "")) return entry;
     }
@@ -10779,7 +10876,7 @@ async function findGitEntry(dir) {
 async function gitMetaTimes(gitEntry, statTime, pathStat) {
   let gitDir = gitEntry;
   try {
-    if (!(await lstat3(gitEntry)).isDirectory()) {
+    if (!(await lstat4(gitEntry)).isDirectory()) {
       let m = /^gitdir:\s*(.+?)\s*$/m.exec(await readFile8(gitEntry, "utf8"));
       if (!m) return [];
       gitDir = path12.resolve(path12.dirname(gitEntry), m[1]);
@@ -10787,16 +10884,19 @@ async function gitMetaTimes(gitEntry, statTime, pathStat) {
   } catch {
     return [];
   }
-  let common = await readFile8(path12.join(gitDir, "commondir"), "utf8").then((c) => path12.resolve(gitDir, c.trim()), () => gitDir), workTree = path12.dirname(gitEntry), anchor = await deviceOf(((d) => !path12.relative(workTree, d).startsWith("..") && !path12.isAbsolute(path12.relative(workTree, d)))(common) ? workTree : common, pathStat), timeOf = onDevice(statTime, pathStat, anchor), time = (p) => timeOf(p).then((t) => t, () => {
-  }), files = [
+  let common = await readFile8(path12.join(gitDir, "commondir"), "utf8").then((c) => path12.resolve(gitDir, c.trim()), () => gitDir), anchored = async (dir) => {
+    let timeOf = onDevice(statTime, pathStat, await deviceOf(dir, pathStat));
+    return (p) => timeOf(p).then((t) => t, () => {
+    });
+  }, time = await anchored(gitDir), commonTime = await anchored(common), files = [
     time(path12.join(gitDir, "index")).then((t) => t ?? time(gitDir)),
     time(path12.join(gitDir, "logs", "HEAD")),
-    time(path12.join(common, "packed-refs"))
+    commonTime(path12.join(common, "packed-refs"))
   ], head = await readFile8(path12.join(gitDir, "HEAD"), "utf8").catch(() => ""), ref = /^ref:\s*(refs\/\S+)\s*$/.exec(head)?.[1];
-  ref && !ref.split("/").includes("..") ? files.push(time(path12.join(common, ...ref.split("/")))) : files.push(time(path12.join(gitDir, "HEAD")));
-  for (let dir of /* @__PURE__ */ new Set([path12.join(common, "reftable"), path12.join(gitDir, "reftable")])) {
-    files.push(time(dir));
-    for (let f of await readdir4(dir).catch(() => [])) files.push(time(path12.join(dir, f)));
+  ref && !ref.split("/").includes("..") ? files.push(commonTime(path12.join(common, ...ref.split("/")))) : files.push(time(path12.join(gitDir, "HEAD")));
+  for (let [dir, t] of [[path12.join(common, "reftable"), commonTime], ...gitDir === common ? [] : [[path12.join(gitDir, "reftable"), time]]]) {
+    files.push(t(dir));
+    for (let f of await readdir4(dir).catch(() => [])) files.push(t(path12.join(dir, f)));
   }
   return (await Promise.all(files)).filter((t) => t !== void 0);
 }
@@ -10853,10 +10953,64 @@ async function readBaseRecord(sessionId, statTime, pathStat = lstatOf) {
 }
 var SHELL_GLOB = /[*?[]/, WINDOW_SLACK_MS = 2e3, LSTAT_BATCH = 256, GONE2 = /* @__PURE__ */ new Set(["ENOENT", "ENOTDIR", "ELOOP"]);
 async function changeTime(p) {
-  return (await lstat3(p)).ctimeMs;
+  return (await lstat4(p)).ctimeMs;
+}
+async function gitCommonDir(root) {
+  return path12.resolve(root, await git(root, ["rev-parse", "--git-common-dir"]));
+}
+var TRUSTED_FS = /* @__PURE__ */ new Set(["apfs", "hfs", "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "ntfs", "tmpfs", "overlay"]), LINUX_FS = /* @__PURE__ */ new Map([
+  [61267, "ext4"],
+  [1481003842, "xfs"],
+  [2435016766, "btrfs"],
+  [801189825, "zfs"],
+  [1397118030, "ntfs"],
+  [16914836, "tmpfs"],
+  [2035054128, "overlay"],
+  [16964, "hfs"],
+  [18475, "hfs"],
+  [19780, "msdos"],
+  [538032816, "exfat"],
+  [1702057286, "fuse"],
+  [26985, "nfs"],
+  [20859, "smbfs"],
+  [4283649346, "cifs"],
+  [4266872130, "smb2"]
+]), darwinMounts;
+function darwinMountTypes() {
+  return darwinMounts ??= new Promise((resolve, reject) => execFile3("/sbin/mount", [], { encoding: "utf8" }, (err, out) => err ? reject(err) : resolve(out))).then(async (out) => {
+    let types = /* @__PURE__ */ new Map();
+    for (let line of out.split(`
+`)) {
+      let m = /^(\/dev\/\S+) on .+ \(([^,)]+)/.exec(line);
+      if (!m) continue;
+      let rdev = await stat5(m[1]).then((st) => Number(st.rdev), () => {
+      });
+      rdev !== void 0 && !types.has(rdev) && types.set(rdev, m[2]);
+    }
+    return types;
+  }), darwinMounts;
+}
+async function fileSystemType(p) {
+  if (process.platform === "win32") return "ntfs";
+  if (process.platform === "darwin") {
+    let dev = Number((await lstat4(p)).dev), type2 = (await darwinMountTypes()).get(dev);
+    if (!type2) throw new Error(`no mounted device ${dev} found for ${p}`);
+    return type2;
+  }
+  let { type } = await statfs(p);
+  return LINUX_FS.get(type) ?? `unknown (0x${type.toString(16)})`;
+}
+async function trustedFileSystem(p, what, fsType) {
+  let type;
+  try {
+    type = await fsType(p);
+  } catch (err) {
+    throw new FailClosedError(`unreviewed: cannot tell which file system ${what} is on (${p}: ${err.message}), so its change times cannot be trusted`);
+  }
+  if (!TRUSTED_FS.has(type.toLowerCase())) throw new FailClosedError(`unreviewed: ${what} (${p}) is on a ${type} file system, whose change times can be set without root, so its changes cannot be dated`);
 }
 async function lstatOf(p) {
-  let st = await lstat3(p);
+  let st = await lstat4(p);
   return { dev: Number(st.dev), ctimeMs: st.ctimeMs, symlink: st.isSymbolicLink() };
 }
 async function deviceOf(p, pathStat) {
@@ -10869,14 +11023,14 @@ function onDevice(timeOf, pathStat, dev) {
     return d !== void 0 && d !== dev ? 1 / 0 : t;
   };
 }
-async function toolWindowFiles(root, rev, windows, statTime, pathStat, excluded) {
+async function toolWindowFiles(root, rev, windows, statTime, pathStat, excluded, onlyFiles) {
   let written = /* @__PURE__ */ new Set(), removed = /* @__PURE__ */ new Set(), untracked = /* @__PURE__ */ new Set(), foreign = /* @__PURE__ */ new Map(), differs = /* @__PURE__ */ new Set();
   if (!windows) return { written, removed, untracked, foreign, differs };
   let { inWindow, lastEnd } = windows, timeOf = statTime ?? changeTime, changed = await git(root, ["diff", "--name-only", "--no-renames", "-z", rev ?? await emptyTree(root), "--"], { trim: !1 }), entries = await indexEntries(root), sparse = await sparseMissing(root, entries, excluded);
   for (let f of await listUntracked(root)) untracked.add(f);
   for (let f of changed.split("\0")) f && differs.add(f);
   for (let f of untracked) differs.add(f);
-  let gitlinks = new Set(entries.filter((e) => e.mode === GITLINK).map((e) => e.path)), files = [.../* @__PURE__ */ new Set([...differs, ...entries.map((e) => e.path)])].filter((f) => !f.startsWith(".why-diff/") && !sparse.has(f) && !gitlinks.has(f)), top = path12.resolve(root), rootDev = await deviceOf(top, pathStat), gone = (err) => {
+  let gitlinks = new Set(entries.filter((e) => e.mode === GITLINK).map((e) => e.path)), files = [.../* @__PURE__ */ new Set([...differs, ...entries.map((e) => e.path)])].filter((f) => !f.startsWith(".why-diff/") && !sparse.has(f) && !gitlinks.has(f) && (!onlyFiles || onlyFiles.has(f))), top = path12.resolve(root), rootDev = await deviceOf(top, pathStat), gone = (err) => {
     if (GONE2.has(err.code ?? "")) return !0;
     throw err;
   }, dirStates = /* @__PURE__ */ new Map(), dirState = (rel) => {
@@ -11145,9 +11299,9 @@ program2.name("why-diff").enablePositionalOptions().version(VERSION, "-V, --vers
     onProgress: progress
   }), report = o.redactPrompts ? redactReport(built, "prompts") : built, out = renderReport(report, format, { verbose: !!o.verbose }), outFile = o.out;
   if (format === "html" && !outFile && (outFile = path13.join(await repoRoot(process.cwd()), ".why-diff", "report.html")), outFile) {
-    await mkdir3(path13.dirname(path13.resolve(outFile)), { recursive: !0 }), await writeFile2(outFile, out);
+    await mkdir3(path13.dirname(path13.resolve(outFile)), { recursive: !0 }), await writeFile3(outFile, out);
     let outDir = path13.dirname(path13.resolve(outFile));
-    path13.basename(outDir) === ".why-diff" && await writeFile2(path13.join(outDir, ".gitignore"), `*
+    path13.basename(outDir) === ".why-diff" && await writeFile3(path13.join(outDir, ".gitignore"), `*
 `, { flag: "wx" }).catch((err) => {
       if (err.code !== "EEXIST") throw err;
     }), progress(`wrote ${path13.relative(process.cwd(), path13.resolve(outFile)) || outFile}`), format === "html" && o.open !== !1 && process.stdout.isTTY && openFile(path13.resolve(outFile)), format === "html" && process.stdout.write(renderReport(report, "terminal", {}) + `
