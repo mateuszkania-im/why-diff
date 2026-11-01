@@ -203,7 +203,13 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
       // the session started reports any change time it likes: the devices must be the recorded ones.
       const devs = record.data;
       if (typeof devs.rootDev === 'number' && typeof devs.gitDev === 'number') {
-        for (const [what, p, was] of [['repository root', await real(root), devs.rootDev], ['git dir', commonDir, devs.gitDev]] as const) {
+        const checks: Array<readonly [string, string, number]> = [['repository root', await real(root), devs.rootDev], ['git dir', commonDir, devs.gitDev]];
+        const wtGitDir = await absoluteGitDir(root);
+        if (wtGitDir !== commonDir) {
+          // A linked worktree's own git dir: its device kept at session start, else that of the common dir.
+          checks.push(['worktree git dir', wtGitDir, typeof devs.worktreeGitDev === 'number' ? devs.worktreeGitDev : devs.gitDev]);
+        }
+        for (const [what, p, was] of checks) {
           const now = await deviceOf(p, pathStat);
           if (now !== was) throw new FailClosedError(`the ${what} (${p}) is on another file system than at session start (device ${was} then, ${now ?? 'unreadable'} now): a file system mounted over it can report any change time`);
         }
@@ -218,7 +224,7 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
         for (const [k, v] of Object.entries(devs.submodules as Record<string, unknown>)) {
           const e = (typeof v === 'string' ? { head: v } : v) as Partial<RecordedSubmodule> | null;
           if (!e || typeof e.head !== 'string' || !/^[0-9a-f]{40,64}$/.test(e.head)) continue;
-          recordedSubmodules[k] = { head: e.head, ...(typeof e.rootDev === 'number' ? { rootDev: e.rootDev } : {}), ...(typeof e.gitDev === 'number' ? { gitDev: e.gitDev } : {}) };
+          recordedSubmodules[k] = { head: e.head, ...(typeof e.rootDev === 'number' ? { rootDev: e.rootDev } : {}), ...(typeof e.gitDev === 'number' ? { gitDev: e.gitDev } : {}), ...(typeof e.worktreeGitDev === 'number' ? { worktreeGitDev: e.worktreeGitDev } : {}) };
         }
       }
       if (record.data.head) {
@@ -262,7 +268,9 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
   // Without devices recorded at session start, a root or git dir on its own volume (its device
   // differs from its parent directory's) could be a volume mounted over it during the session.
   if (!devicesRecorded) {
-    for (const [what, dir] of [['repository root', await real(root)], ['git dir', await real(commonDir)]] as const) {
+    const dirs: Array<readonly [string, string]> = [['repository root', await real(root)], ['git dir', await real(commonDir)]];
+    if (gitDir !== commonDir) dirs.push(['worktree git dir', await real(gitDir)]);
+    for (const [what, dir] of dirs) {
       const [here, up] = await Promise.all([deviceOf(dir, pathStat), deviceOf(path.dirname(dir), pathStat)]);
       if (here === undefined || here !== up) throw new FailClosedError(`unreviewed: the ${what} (${dir}) is the root of its own volume, and no SessionStart record kept its device, so a volume mounted over it during the session cannot be ruled out`);
     }
@@ -287,6 +295,7 @@ interface RecordedSubmodule {
   head: string;
   rootDev?: number;
   gitDev?: number;
+  worktreeGitDev?: number;
 }
 
 /** What one guard run knows about the session, shared by the repository and its submodules. */
@@ -604,9 +613,11 @@ async function checkSubmodules(ctx: SessionCheck, repo: RepoUnderCheck, layeredA
     const key = `${prefix}${p}`;
     // Its times prove something only on a trusted file system, on the devices it had at session start.
     const subCommon = await gitCommonDir(subRoot);
+    const subGitDir = await absoluteGitDir(subRoot);
     try {
       await trustedFileSystem(subRoot, `submodule ${key}`, ctx.fsType, ctx.userMount);
       await trustedFileSystem(subCommon, `the git dir of submodule ${key}`, ctx.fsType, ctx.userMount);
+      if (subGitDir !== subCommon) await trustedFileSystem(subGitDir, `the worktree git dir of submodule ${key}`, ctx.fsType, ctx.userMount);
     } catch (err) {
       unreviewed(p, `is on an untrusted file system (${(err as Error).message.replace(/^unreviewed: /, '')})`);
       continue;
@@ -615,7 +626,9 @@ async function checkSubmodules(ctx: SessionCheck, repo: RepoUnderCheck, layeredA
     const subGitDev = await deviceOf(subCommon, ctx.pathStat);
     if (rec?.rootDev !== undefined || rec?.gitDev !== undefined) {
       const rootNow = await deviceOf(await real(subRoot), ctx.pathStat);
-      if ((rec.rootDev !== undefined && rec.rootDev !== rootNow) || (rec.gitDev !== undefined && rec.gitDev !== subGitDev)) {
+      const wtNow = subGitDir !== subCommon ? await deviceOf(subGitDir, ctx.pathStat) : undefined;
+      const wtWas = rec.worktreeGitDev ?? rec.gitDev;
+      if ((rec.rootDev !== undefined && rec.rootDev !== rootNow) || (rec.gitDev !== undefined && rec.gitDev !== subGitDev) || (wtNow !== undefined && wtWas !== undefined && wtNow !== wtWas)) {
         unreviewed(p, 'or its git dir is on another file system than at session start');
         continue;
       }
@@ -969,58 +982,86 @@ const LINUX_FS: ReadonlyMap<number, string> = new Map([
   [0xef53, 'ext4'], [0x58465342, 'xfs'], [0x9123683e, 'btrfs'], [0x2fc12fc1, 'zfs'], [0x5346544e, 'ntfs'], [0x01021994, 'tmpfs'], [0x794c7630, 'overlay'],
   [0x4244, 'hfs'], [0x482b, 'hfs'], [0x4d44, 'msdos'], [0x2011bab0, 'exfat'], [0x65735546, 'fuse'], [0x6969, 'nfs'], [0x517b, 'smbfs'], [0xff534d42, 'cifs'], [0xfe534d42, 'smb2'],
 ]);
-/** One mounted file system: its source, mount point, type and options. */
-interface MountEntry {
+/** One mounted file system: its source, mount point, type, options and (Linux) device. */
+export interface MountEntry {
   source: string;
   mountPoint: string;
   type: string;
   options: string[];
+  /** Linux mountinfo `major:minor` */
+  majorMinor?: string;
+}
+// eslint-disable-next-line no-control-regex
+const CONTROL = /[\x00-\x1f\x7f]/;
+/** macOS `mount` output as entries; throws on any line it cannot read or a mount point with a control character. */
+export function parseDarwinMounts(out: string): MountEntry[] {
+  return out.split('\n').filter((line) => line.length).map((line) => {
+    const m = /^(.+?) on (\/.*) \(([^()]*)\)$/.exec(line);
+    if (!m) throw new Error(`unreadable mount table line ${JSON.stringify(line.slice(0, 120))}`);
+    if (CONTROL.test(m[2]!)) throw new Error(`mount point with a control character ${JSON.stringify(m[2])}`);
+    const options = m[3]!.split(',').map((o) => o.trim());
+    return { source: m[1]!, mountPoint: m[2]!, type: options[0] ?? '', options: options.slice(1) };
+  });
+}
+/** Linux `/proc/self/mountinfo` as entries; throws on any line it cannot read or a mount point with a control character. */
+export function parseLinuxMountinfo(text: string): MountEntry[] {
+  const unescape = (v: string): string => v.replace(/\\([0-7]{3})/g, (_, o: string) => String.fromCharCode(parseInt(o, 8)));
+  return text.split('\n').filter((line) => line.length).map((line) => {
+    const sep = line.indexOf(' - ');
+    const f = sep === -1 ? [] : line.slice(0, sep).split(' ');
+    const r = sep === -1 ? [] : line.slice(sep + 3).split(' ');
+    if (f.length < 6 || r.length < 3 || !/^\d+:\d+$/.test(f[2]!)) throw new Error(`unreadable mountinfo line ${JSON.stringify(line.slice(0, 120))}`);
+    const mountPoint = unescape(f[4]!);
+    if (CONTROL.test(mountPoint)) throw new Error(`mount point with a control character ${JSON.stringify(mountPoint)}`);
+    return { source: unescape(r[1]!), mountPoint, type: r[0]!, options: [...f[5]!.split(','), ...r[2]!.split(',')], majorMinor: f[2]! };
+  });
 }
 let mountTable: Promise<MountEntry[]> | undefined;
-/**
- * The mounted file systems, read once per run: macOS `/sbin/mount` (by absolute path, in the
- * temporary directory), Linux `/proc/self/mountinfo`. Empty elsewhere.
- */
+/** The mounted file systems, read once per run: macOS `/sbin/mount` (by absolute path, in the temporary directory), Linux `/proc/self/mountinfo`. */
 function mounts(): Promise<MountEntry[]> {
   mountTable ??= (async (): Promise<MountEntry[]> => {
     if (process.platform === 'darwin') {
-      const out = await new Promise<string>((resolve, reject) => execFile('/sbin/mount', [], { encoding: 'utf8', cwd: os.tmpdir(), shell: false }, (err, o) => (err ? reject(err) : resolve(o))));
-      return out.split('\n').map((line) => /^(.+?) on (.+) \(([^)]*)\)\s*$/.exec(line)).filter((m): m is RegExpExecArray => m !== null).map((m) => {
-        const options = m[3]!.split(',').map((o) => o.trim());
-        return { source: m[1]!, mountPoint: m[2]!, type: options[0] ?? '', options: options.slice(1) };
-      });
+      return parseDarwinMounts(await new Promise<string>((resolve, reject) => execFile('/sbin/mount', [], { encoding: 'utf8', cwd: os.tmpdir(), shell: false }, (err, o) => (err ? reject(err) : resolve(o)))));
     }
-    if (process.platform === 'linux') {
-      const unescape = (v: string): string => v.replace(/\\([0-7]{3})/g, (_, o: string) => String.fromCharCode(parseInt(o, 8)));
-      return (await readFile('/proc/self/mountinfo', 'utf8')).split('\n').filter(Boolean).map((line) => {
-        const [left = '', right = ''] = line.split(' - ');
-        const f = left.split(' ');
-        const [type = '', source = '', superOptions = ''] = right.split(' ');
-        return { source: unescape(source), mountPoint: unescape(f[4] ?? ''), type, options: [...(f[5] ?? '').split(','), ...superOptions.split(',')] };
-      });
-    }
+    if (process.platform === 'linux') return parseLinuxMountinfo(await readFile('/proc/self/mountinfo', 'utf8'));
     return [];
   })();
   const table = mountTable;
   setTimeout(() => { if (mountTable === table) mountTable = undefined; }, 2000).unref();
   return table;
 }
+/** Linux `major:minor` of a `st_dev` (glibc encoding). */
+function linuxMajorMinor(dev: bigint): string {
+  const major = ((dev >> 8n) & 0xfffn) | ((dev >> 32n) & ~0xfffn);
+  const minor = (dev & 0xffn) | ((dev >> 12n) & ~0xffn);
+  return `${major}:${minor}`;
+}
+/**
+ * The mount entry holding a path of device `dev` at `real`: the entries whose device is that device
+ * (Linux: mountinfo's major:minor; macOS: `stat` of each mount point), the longest mount point that
+ * is a prefix of `real` breaking a tie. Throws when no entry has that device (exported for tests).
+ */
+export async function pickMount(entries: MountEntry[], real: string, dev: bigint, deviceOfMountPoint: (mp: string) => Promise<bigint | undefined>): Promise<MountEntry> {
+  const same: MountEntry[] = [];
+  for (const m of entries) {
+    const match = m.majorMinor !== undefined ? m.majorMinor === linuxMajorMinor(dev) : (await deviceOfMountPoint(m.mountPoint)) === dev;
+    if (match) same.push(m);
+  }
+  if (!same.length) throw new Error(`no mount entry has the device of ${real}`);
+  const prefix = (mp: string): boolean => real === mp || real.startsWith(mp.endsWith('/') ? mp : `${mp}/`);
+  return same.sort((a, b) => Number(prefix(b.mountPoint)) - Number(prefix(a.mountPoint)) || b.mountPoint.length - a.mountPoint.length)[0]!;
+}
 /**
  * Why the file system holding `p` was mounted by a user (who can then write any time into it: an
- * HFS+ or ext4 image with crafted dates), or undefined: the mount entry whose mount point is the
- * longest prefix of `p`'s real path says `mounted by <user>`, is `nobrowse`, or is a disk image
- * (macOS); is FUSE, set up by udisks2, or under `/media` or `/run/media` (Linux).
+ * HFS+ or ext4 image with crafted dates), or undefined. The entry is found by device ({@link pickMount});
+ * untrusted: `mounted by <user>`, `nobrowse` outside `/System/Volumes`, or a disk image (macOS); FUSE,
+ * udisks2, or under `/media` or `/run/media` (Linux). A mount table that cannot be read throws.
  */
 async function userMountOf(p: string): Promise<string | undefined> {
   if (process.platform !== 'darwin' && process.platform !== 'linux') return undefined;
   const real = await realpath(p);
-  let best: MountEntry | undefined;
-  for (const m of await mounts()) {
-    const mp = m.mountPoint;
-    const under = real === mp || real.startsWith(mp.endsWith('/') ? mp : `${mp}/`);
-    if (under && (!best || mp.length > best.mountPoint.length)) best = m;
-  }
-  if (!best) throw new Error(`no mount found for ${real}`);
+  const dev = (await stat(real, { bigint: true })).dev;
+  const best = await pickMount(await mounts(), real, dev, (mp) => stat(mp, { bigint: true }).then((st) => st.dev, () => undefined));
   const describe = `${best.source} on ${best.mountPoint} (${[best.type, ...best.options].join(', ')})`;
   if (process.platform === 'darwin') {
     if (best.options.some((o) => o.startsWith('mounted by'))) return describe;
