@@ -4,7 +4,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { ClaudeCodeAdapter, cleanPromptText, encodeProjectDir, humanPromptText } from '../src/adapters/claude.js';
 import type { FileEdit } from '../src/types.js';
-import { FIXTURE_CWD, FIXTURE_HOME, FIXTURE_SESSION, FIXTURE_SUBDIR_SESSION, materialiseFixtureHome, tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
+import { FIXTURE_CWD, FIXTURE_HOME, FIXTURE_SESSION, FIXTURE_SUBDIR_SESSION, materialiseFixtureHome, nat, shellPath, tempDir, writeSyntheticTranscript } from './helpers/claude-fixture.js';
 
 const adapter = new ClaudeCodeAdapter();
 const MAIN = path.join(FIXTURE_HOME, '.claude', 'projects', encodeProjectDir(FIXTURE_CWD), `${FIXTURE_SESSION}.jsonl`);
@@ -108,7 +108,7 @@ describe('ClaudeCodeAdapter.parse', () => {
       id: `${FIXTURE_SESSION}:toolu_01WriteFormat000000001:0`,
       tool: 'Write',
       kind: 'write',
-      filePath: `${FIXTURE_CWD}/src/format.ts`,
+      filePath: nat(`${FIXTURE_CWD}/src/format.ts`),
       promptId: firstPrompt,
       oldText: null,
       at: '2026-10-31T10:00:10.000Z',
@@ -147,7 +147,7 @@ describe('ClaudeCodeAdapter.parse', () => {
   it('turns file-mutating Bash commands into bash edits attributed to their prompt', async () => {
     const { edits, prompts } = await adapter.parse(MAIN);
     const sed = byTool(edits, 'toolu_06BashSed000000000000006');
-    expect(sed.map((e) => [e.kind, path.relative(FIXTURE_CWD, e.filePath)])).toEqual([
+    expect(sed.map((e) => [e.kind, path.relative(FIXTURE_CWD, e.filePath).split(path.sep).join('/')])).toEqual([
       ['bash', 'package.json'],
       ['bash', 'src/legacy.ts'],
     ]);
@@ -155,14 +155,14 @@ describe('ClaudeCodeAdapter.parse', () => {
     expect(sed[0]?.command).toContain("sed -i ''");
 
     const [heredoc] = byTool(edits, 'toolu_07BashHeredoc0000000007');
-    expect(heredoc).toMatchObject({ kind: 'bash', filePath: `${FIXTURE_CWD}/CHANGELOG.md`, promptId: prompts[2]!.id });
+    expect(heredoc).toMatchObject({ kind: 'bash', filePath: nat(`${FIXTURE_CWD}/CHANGELOG.md`), promptId: prompts[2]!.id });
     expect(heredoc?.newText).toBe('# Changelog\n\n## 1.1.0\n\n- Add formatPrice helper\n');
   });
 
   it('includes subagent edits, attributed to the prompt that launched the Agent call', async () => {
     const { edits, prompts } = await adapter.parse(MAIN);
     const [sub] = byTool(edits, 'toolu_S1WriteTest0000000000001');
-    expect(sub).toMatchObject({ tool: 'Write', kind: 'write', filePath: `${FIXTURE_CWD}/test/format.test.ts`, sessionId: FIXTURE_SESSION });
+    expect(sub).toMatchObject({ tool: 'Write', kind: 'write', filePath: nat(`${FIXTURE_CWD}/test/format.test.ts`), sessionId: FIXTURE_SESSION });
     // The subagent ran after the second human prompt, yet belongs to the first one.
     expect(sub?.promptId).toBe(prompts[0]!.id);
     expect(sub?.rationale).toBe('Writing the test file.');
@@ -412,7 +412,7 @@ describe('fixture materialisation', () => {
     const found = await adapter.discover(repo, { home });
     expect(found).toHaveLength(2);
     const session = await adapter.parse(found[0]!);
-    expect(session.cwd).toBe(repo);
+    expect(session.cwd).toBe(shellPath(repo));
     expect(session.edits[0]?.filePath).toBe(path.join(repo, 'src/format.ts'));
   });
 });

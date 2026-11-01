@@ -1,3 +1,4 @@
+import { nat } from './helpers/claude-fixture.js';
 import { cp, mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -25,15 +26,15 @@ describe('opencode helpers', () => {
 
   it('maps tool inputs to edit bodies', () => {
     expect(opencodeToolEdits('edit', { filePath: 'a.ts', oldString: 'x', newString: 'y' }, '/r')).toEqual([
-      { kind: 'edit', filePath: '/r/a.ts', oldText: 'x', newText: 'y' },
+      { kind: 'edit', filePath: nat('/r/a.ts'), oldText: 'x', newText: 'y' },
     ]);
     expect(opencodeToolEdits('patch', { patchText: '*** Begin Patch\n*** Add File: n.ts\n+n\n*** End Patch' }, '/r')).toEqual([
-      { kind: 'write', filePath: '/r/n.ts', oldText: null, newText: 'n\n' },
+      { kind: 'write', filePath: nat('/r/n.ts'), oldText: null, newText: 'n\n' },
     ]);
     expect(opencodeToolEdits('bash', { command: 'echo x > out.txt', workdir: 'pkg' }, '/r')).toEqual([
-      { kind: 'bash', filePath: '/r/pkg/out.txt', oldText: null, newText: null },
+      { kind: 'bash', filePath: nat('/r/pkg/out.txt'), oldText: null, newText: null },
     ]);
-    expect(opencodeToolEdits('read', { filePath: '/r/a.ts' }, '/r')).toEqual([]);
+    expect(opencodeToolEdits('read', { filePath: nat('/r/a.ts') }, '/r')).toEqual([]);
   });
 });
 
@@ -78,7 +79,7 @@ describe('opencodeAdapter (JSON storage)', () => {
   it('turns edit/write/multiedit/apply_patch/bash tool parts into edits', async () => {
     const s = await opencodeAdapter.parse(SESSION_FILE);
     expect(
-      s.edits.map((e) => [e.id, e.tool, e.kind, path.relative(REPO, e.filePath), e.promptId, e.failed ?? false]),
+      s.edits.map((e) => [e.id, e.tool, e.kind, path.relative(REPO, e.filePath).split(path.sep).join('/'), e.promptId, e.failed ?? false]),
     ).toEqual([
       ['ses_01demoA:call_write_1:0', 'write', 'write', 'src/greet.ts', 'ses_01demoA:0', false],
       ['ses_01demoA:call_edit_1:0', 'edit', 'edit', 'src/index.ts', 'ses_01demoA:0', false],
@@ -182,7 +183,7 @@ describe.skipIf(!sqlite)('opencodeAdapter (opencode.db, v1.2+)', () => {
         toolUseId: 'call_db_1',
         tool: 'edit',
         kind: 'edit',
-        filePath: `${REPO}/packages/api/src/routes.ts`,
+        filePath: nat(`${REPO}/packages/api/src/routes.ts`),
         at: '2026-10-25T12:00:02.000Z',
         promptId: 'ses_02db:0',
         oldText: '// routes',

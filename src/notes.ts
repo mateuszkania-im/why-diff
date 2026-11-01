@@ -95,7 +95,15 @@ export async function writeNote(root: string, note: ProvenanceNote, rev = 'HEAD'
     throw new Error(`the provenance note would be ${Buffer.byteLength(body)} bytes, over the ${NOTE_MAX_BYTES}-byte limit readers accept; narrow it with --since or --session`);
   }
   const sha = await git(root, ['rev-parse', '--verify', `${rev}^{commit}`]);
-  await gitWithInput(root, ['notes', `--ref=${NOTES_REF}`, 'add', '-f', '-F', '-', sha], body);
+  try {
+    await gitWithInput(root, ['notes', `--ref=${NOTES_REF}`, 'add', '-f', '-F', '-', sha], body);
+  } catch (err) {
+    // A note is a commit on the notes ref, so git needs an author identity.
+    if (/Please tell me who you are|Author identity unknown|auto-detection is disabled|empty ident/i.test((err as Error).message)) {
+      throw new Error('git has no author identity for the notes commit; set one with git config user.name "Your Name" and git config user.email you@example.com, then run why-diff notes again');
+    }
+    throw err;
+  }
   return sha;
 }
 

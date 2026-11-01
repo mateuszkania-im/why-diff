@@ -17,6 +17,7 @@ import { opencodeAdapter } from './adapters/opencode.js';
 import { redactReport } from './redact.js';
 import { compileGlobs, configChanged, loadConfig, samePath, CONFIG_FILE, type WhyDiffConfig } from './config.js';
 import { createClassifier, classifyHunks, summarizeIntent, type ClassifierKind } from './classify/index.js';
+import { DRIVE_PATH, driveKey } from './adapters/scan.js';
 import { applyNotes, readNotes, NOTE_MODEL, NOTES_REF } from './notes.js';
 
 export const ADAPTERS: Record<Harness, SessionAdapter> = {
@@ -313,6 +314,13 @@ async function checkSessionFile(file: string): Promise<void> {
 export function tildify(p: string, home: string): string {
   if (!home) return p;
   const h = home.replace(/[\\/]+$/, '');
+  if (DRIVE_PATH.test(p) && DRIVE_PATH.test(h)) {
+    // Windows: git prints `C:/Users/x`, the home is `C:\\Users\\x`; compare without case or slash style.
+    const pk = driveKey(p);
+    const hk = driveKey(h);
+    if (pk === hk) return '~';
+    return pk.startsWith(`${hk}/`) ? `~${p.replace(/\\/g, '/').replace(/\/+$/, '').slice(hk.length)}` : p;
+  }
   return p === h ? '~' : p.startsWith(h + '/') || p.startsWith(h + '\\') ? '~' + p.slice(h.length) : p;
 }
 

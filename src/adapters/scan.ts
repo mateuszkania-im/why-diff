@@ -38,7 +38,8 @@ export function filePathNeedles(roots: string[], sep: string): string[] {
       ? [root.replace(/\//g, '\\'), root.replace(/\\/g, '/')].flatMap((r) => [r.charAt(0).toUpperCase() + r.slice(1), r.charAt(0).toLowerCase() + r.slice(1)])
       : [root];
     for (const r of forms) {
-      const s = DRIVE_PATH.test(r) ? (r.includes('\\') ? '\\' : '/') : sep;
+      // A drive root keeps its own slash style; a `/x` root is POSIX-spelled whatever the OS.
+      const s = DRIVE_PATH.test(r) ? (r.includes('\\') ? '\\' : '/') : r.startsWith('/') ? '/' : sep;
       out.add(`"file_path":${JSON.stringify(r.endsWith(s) ? r : r + s).slice(0, -1)}`);
     }
   }

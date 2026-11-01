@@ -103,6 +103,29 @@ export async function readCodexMeta(file: string): Promise<CodexSessionMeta | nu
   return null;
 }
 
+/**
+ * Byte needles for "a path under one of these roots": the root as given and resolved, and for a
+ * Windows drive root both slash styles, with backslashes also as JSON writes them (`\\\\`).
+ */
+function rootNeedles(roots: string[]): string[] {
+  const out = new Set<string>();
+  for (const r of roots) {
+    if (!r) continue;
+    if (!DRIVE_PATH.test(r)) {
+      out.add(`${r.replace(/\/+$/, '')}/`);
+      continue;
+    }
+    const fwd = r.replace(/\\/g, '/').replace(/\/+$/, '');
+    const back = fwd.replace(/\//g, '\\');
+    for (const f of [fwd, fwd.charAt(0).toLowerCase() + fwd.slice(1), fwd.charAt(0).toUpperCase() + fwd.slice(1)]) out.add(`${f}/`);
+    for (const b of [back, back.charAt(0).toLowerCase() + back.slice(1), back.charAt(0).toUpperCase() + back.slice(1)]) {
+      out.add(`${b}\\`);
+      out.add(`${b.replace(/\\/g, '\\\\')}\\\\`);
+    }
+  }
+  return [...out];
+}
+
 async function realpathSafe(p: string): Promise<string> {
   try {
     return await realpath(p);
@@ -145,7 +168,7 @@ async function discover(
   const root = path.join(codexHome(opts.home), 'sessions');
   const repo = await realpathSafe(repoRoot);
   const repos = [repo, ...(await Promise.all((opts.extraRoots ?? []).map(realpathSafe)))];
-  const needles = [...new Set([...repos, path.resolve(repoRoot), ...(opts.extraRoots ?? []).map((r) => path.resolve(r))])].map((r) => `${r}/`);
+  const needles = rootNeedles([...repos, repoRoot, path.resolve(repoRoot), ...(opts.extraRoots ?? []).flatMap((r) => [r, path.resolve(r)])]);
   const found: string[] = [];
 
   for (const y of (await listDir(root)).filter((d) => /^\d{4}$/.test(d))) {

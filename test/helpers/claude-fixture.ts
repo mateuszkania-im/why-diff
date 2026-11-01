@@ -22,6 +22,14 @@ export const FIXTURE_CWD = '/home/dev/acme-shop';
 export const FIXTURE_SESSION = '6f1d2c3b-9a8e-4f70-b1c2-d3e4f5a6b7c8';
 export const FIXTURE_SUBDIR_SESSION = '0c3d4e5f-aaaa-4bbb-8ccc-ddddeeeeffff';
 
+/**
+ * A synthetic POSIX absolute path (`/work/repo/a.ts`) as the code under test spells it on this OS:
+ * unchanged on POSIX, resolved onto the current drive on Windows (`D:\\work\\repo\\a.ts`).
+ */
+export function nat(p: string): string {
+  return process.platform === 'win32' ? path.resolve(p) : p;
+}
+
 /** A path as a shell command on this OS would spell it: forward slashes (Git Bash on Windows takes `C:/x`, and `\\` is an escape). */
 export function shellPath(p: string): string {
   return p.split(path.sep).join('/');
@@ -43,7 +51,8 @@ export function materialiseFixtureHome(repoRoot: string): string {
 
   for (const dirName of readdirSync(srcProjects)) {
     const renamed = dirName.startsWith(oldPrefix) ? newPrefix + dirName.slice(oldPrefix.length) : dirName;
-    copyTreeReplacing(path.join(srcProjects, dirName), path.join(dstProjects, renamed), FIXTURE_CWD, repoRoot);
+    // Forward slashes: JSON-safe as is, and what a shell command on Windows (Git Bash) would carry.
+    copyTreeReplacing(path.join(srcProjects, dirName), path.join(dstProjects, renamed), FIXTURE_CWD, shellPath(repoRoot));
   }
   return home;
 }

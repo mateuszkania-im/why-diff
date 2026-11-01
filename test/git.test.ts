@@ -54,7 +54,9 @@ describe('git helpers', () => {
 
     put(repo, 'no-newline.txt', 'last line without newline');
     put(repo, 'docs/my notes.md', '# notes\n');
-    put(repo, 'weird "name".txt', 'quoted\n');
+    // `"` is not allowed in Windows file names: that one case runs on POSIX only.
+    const quoted = process.platform !== 'win32';
+    if (quoted) put(repo, 'weird "name".txt', 'quoted\n');
     put(repo, 'empty.txt', '');
     put(repo, 'image.bin', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02]));
     put(repo, 'ignored.log', 'nope\n');
@@ -67,7 +69,7 @@ describe('git helpers', () => {
     expect(diff).toContain('\\ No newline at end of file');
     const hunks = parseUnifiedDiff(diff);
     const files = hunks.map((h) => h.file).sort();
-    expect(files).toEqual(['.gitignore', 'docs/my notes.md', 'image.bin', 'no-newline.txt', 'weird "name".txt'].sort());
+    expect(files).toEqual(['.gitignore', 'docs/my notes.md', 'image.bin', 'no-newline.txt', ...(quoted ? ['weird "name".txt'] : [])].sort());
     expect(hunks.find((h) => h.file === 'no-newline.txt')?.lines).toEqual([{ type: 'add', text: 'last line without newline', newNo: 1 }]);
     expect(hunks.find((h) => h.file === 'image.bin')).toMatchObject({ header: 'Binary file changed', lines: [] });
     // The index was never touched.

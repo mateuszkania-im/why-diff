@@ -856,10 +856,15 @@ async function readMeta(file: string): Promise<SubagentMeta | null> {
   }
 }
 
-/** The root as given plus its realpath (macOS `/var` -> `/private/var`). */
+/**
+ * The root as given (Windows resolves a drive-less `/x` onto the current drive; the project folder
+ * and transcript keep the spelling the caller used), resolved, and its realpath (macOS `/var` ->
+ * `/private/var`).
+ */
 async function rootVariants(root: string): Promise<string[]> {
   const normalised = path.resolve(root);
   const variants = new Set<string>([normalised]);
+  if (path.isAbsolute(root)) variants.add(root.length > 1 ? root.replace(/[\\/]+$/, '') : root);
   try {
     variants.add(await realpath(normalised));
   } catch {

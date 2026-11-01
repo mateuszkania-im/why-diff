@@ -423,15 +423,17 @@ export function repoRelativePath(
   cwd = '',
   cwdVariants: string[] = rootVariants(cwd),
 ): string | null {
-  if (DRIVE_PATH.test(filePath) || (!path.isAbsolute(filePath) && DRIVE_PATH.test(cwd))) return driveRelativePath(filePath, roots, cwd);
+  if (DRIVE_PATH.test(filePath) || (!path.isAbsolute(filePath) && DRIVE_PATH.test(cwd))) return driveRelativePath(filePath, roots, cwd, cwdVariants);
   // Compared in Unicode NFC: macOS file APIs and agents may hand over NFD names (`cafe\u0301.js`)
   // where git reports NFC (`caf\u00e9.js`).
   const candidates = new Set<string>();
   const nfcCwd = cwd.normalize('NFC');
-  const abs = path.isAbsolute(filePath) ? path.normalize(filePath.normalize('NFC')) : nfcCwd ? path.resolve(nfcCwd, filePath.normalize('NFC')) : null;
+  // resolve, not only normalize: on Windows a rooted path without a drive (`/work/a.ts`) lies on the
+  // current drive, which is how the roots were resolved too.
+  const abs = path.isAbsolute(filePath) ? path.resolve(filePath.normalize('NFC')) : nfcCwd ? path.resolve(nfcCwd, filePath.normalize('NFC')) : null;
   if (!abs) return null;
-  cwdVariants = cwdVariants.map((v) => v.normalize('NFC'));
-  roots = roots.map((r) => r.normalize('NFC'));
+  cwdVariants = cwdVariants.map((v) => path.resolve(v.normalize('NFC')));
+  roots = roots.map((r) => path.resolve(r.normalize('NFC')));
   candidates.add(abs);
   for (const v of cwdVariants) {
     for (const w of cwdVariants) {
@@ -448,18 +450,30 @@ export function repoRelativePath(
 }
 
 /** {@link repoRelativePath} for Windows drive paths: case-insensitive, either slash style. */
-function driveRelativePath(filePath: string, roots: string[], cwd: string): string | null {
+function driveRelativePath(filePath: string, roots: string[], cwd: string, cwdVariants: string[] = []): string | null {
   // win32 resolution handles both slash styles and resolves `.` / `..` before containment is checked.
   const resolved = DRIVE_PATH.test(filePath) ? path.win32.resolve(filePath) : DRIVE_PATH.test(cwd) ? path.win32.resolve(cwd, filePath) : null;
   if (!resolved) return null;
   const abs = resolved.normalize('NFC').replace(/\\/g, '/').replace(/\/$/, '');
   if (abs.split('/').includes('..')) return null;
-  const lower = abs.toLowerCase();
-  for (const root of roots) {
-    if (!DRIVE_PATH.test(root)) continue;
-    const r = driveKey(path.win32.resolve(root.normalize('NFC')));
-    if (lower === r) return '';
-    if (lower.startsWith(`${r}/`) && abs.length === lower.length) return abs.slice(r.length + 1);
+  // The same file under another spelling of the session cwd (an 8.3 short name such as
+  // `C:\\Users\\RUNNER~1`, a junction): remap it onto each other spelling.
+  const candidates = [abs];
+  const lowerAbs = abs.toLowerCase();
+  const keys = cwdVariants.filter((v) => DRIVE_PATH.test(v)).map((v) => path.win32.resolve(v.normalize('NFC')).replace(/\\/g, '/').replace(/\/$/, ''));
+  for (const v of keys) {
+    const vk = v.toLowerCase();
+    if (lowerAbs !== vk && !lowerAbs.startsWith(`${vk}/`)) continue;
+    for (const w of keys) if (w !== v) candidates.push(w + abs.slice(v.length));
+  }
+  for (const c of candidates) {
+    const lower = c.toLowerCase();
+    for (const root of roots) {
+      if (!DRIVE_PATH.test(root)) continue;
+      const r = driveKey(path.win32.resolve(root.normalize('NFC')));
+      if (lower === r) return '';
+      if (lower.startsWith(`${r}/`) && c.length === lower.length) return c.slice(r.length + 1);
+    }
   }
   return null;
 }

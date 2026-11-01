@@ -12,6 +12,7 @@
  *   records without `any`.
  */
 
+import os from 'node:os';
 import path from 'node:path';
 import type { EditKind } from '../types.js';
 
@@ -98,7 +99,9 @@ export type PatchFileOp =
 
 /** Resolve a possibly relative path against `base` (returns absolute, normalised). */
 export function resolvePath(base: string, p: string): string {
-  const expanded = p.startsWith('~/') && process.env.HOME ? path.join(process.env.HOME, p.slice(2)) : p;
+  // Windows has no HOME unless Git Bash set one: fall back to the user profile.
+  const home = process.env.HOME || os.homedir();
+  const expanded = p.startsWith('~/') && home ? path.join(home, p.slice(2)) : p;
   return path.resolve(base, expanded);
 }
 
@@ -413,7 +416,7 @@ export function shellWriteTargets(command: string): ShellWrites {
   const add = (...ps: string[]): void => {
     for (const raw of ps) {
       if (!raw) continue;
-      const p = cdDir !== null && !path.isAbsolute(raw) && !raw.startsWith('~') ? path.join(cdDir, raw) : raw;
+      const p = cdDir !== null && !path.isAbsolute(raw) && !raw.startsWith('~') ? path.posix.join(cdDir, raw) : raw; // shell paths: `/`, on every OS
       if (!targets.includes(p)) targets.push(p);
     }
   };
@@ -421,7 +424,7 @@ export function shellWriteTargets(command: string): ShellWrites {
   for (const seg of tokenizeSegments(stripHeredocs(command))) {
     if (seg[0] === 'cd' || seg[0] === 'pushd') {
       const dir = seg[1];
-      if (dir && dir !== '-') cdDir = cdDir !== null && !path.isAbsolute(dir) && !dir.startsWith('~') ? path.join(cdDir, dir) : dir;
+      if (dir && dir !== '-') cdDir = cdDir !== null && !path.isAbsolute(dir) && !dir.startsWith('~') ? path.posix.join(cdDir, dir) : dir;
       continue;
     }
     // Redirections: `> f`, `>> f`, `1> f`, `&> f` (not `2>`, not `>&2`).

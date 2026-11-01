@@ -1,3 +1,4 @@
+import { nat } from './helpers/claude-fixture.js';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { utimes } from 'node:fs/promises';
 import os from 'node:os';
@@ -61,7 +62,7 @@ describe('apply_patch parser', () => {
       "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: old.ts\n*** Move to: new.ts\n@@\n-a\n+b\n*** End of File\n*** End Patch\nEOF",
     );
     expect(ops).toEqual([{ kind: 'update', path: 'old.ts', movePath: 'new.ts', hunks: [{ oldText: 'a', newText: 'b' }] }]);
-    expect(patchOpsToEdits(ops, '/r')).toEqual([{ kind: 'patch', filePath: '/r/new.ts', oldText: 'a', newText: 'b' }]);
+    expect(patchOpsToEdits(ops, '/r')).toEqual([{ kind: 'patch', filePath: nat('/r/new.ts'), oldText: 'a', newText: 'b' }]);
   });
 
   it('maps add/delete to write edits with absolute paths', () => {
@@ -73,8 +74,8 @@ describe('apply_patch parser', () => {
       '/repo',
     );
     expect(edits).toEqual([
-      { kind: 'write', filePath: '/repo/x/y.ts', oldText: null, newText: 'hi\n' },
-      { kind: 'write', filePath: '/abs/z.ts', oldText: null, newText: '' },
+      { kind: 'write', filePath: nat('/repo/x/y.ts'), oldText: null, newText: 'hi\n' },
+      { kind: 'write', filePath: nat('/abs/z.ts'), oldText: null, newText: '' },
     ]);
   });
 
@@ -231,7 +232,7 @@ describe('codexAdapter.parse (classic tools)', () => {
       id: e.id.replace(`${sid}:`, ''),
       tool: e.tool,
       kind: e.kind,
-      file: path.relative(REPO, e.filePath),
+      file: path.relative(REPO, e.filePath).split(path.sep).join('/'),
       prompt: e.promptId.replace(`${sid}:`, ''),
       failed: e.failed ?? false,
     }));
@@ -270,7 +271,7 @@ describe('codexAdapter.parse (code mode exec cells)', () => {
       toolUseId: 'call_cell_1',
       tool: 'apply_patch',
       kind: 'patch',
-      filePath: '/work/demo-repo/packages/app/src/Button.tsx',
+      filePath: nat('/work/demo-repo/packages/app/src/Button.tsx'),
       // The `@@ const styles = {` header is an anchor, not part of the hunk body.
       oldText: "  color: 'red',\n};",
       newText: "  color: 'blue',\n};",
@@ -278,7 +279,7 @@ describe('codexAdapter.parse (code mode exec cells)', () => {
       promptId: `${s.id}:0`,
     });
     expect(patch?.failed).toBeUndefined();
-    expect(pnpm).toMatchObject({ toolUseId: 'call_cell_1', kind: 'bash', filePath: '/work/demo-repo/packages/app/package.json', command: 'pnpm add clsx' });
+    expect(pnpm).toMatchObject({ toolUseId: 'call_cell_1', kind: 'bash', filePath: nat('/work/demo-repo/packages/app/package.json'), command: 'pnpm add clsx' });
   });
 
   it('synthesises edits from FileChange events it cannot tie to a parsed call', async () => {
@@ -288,7 +289,7 @@ describe('codexAdapter.parse (code mode exec cells)', () => {
     expect(added).toMatchObject({
       toolUseId: 'exec-dddd',
       kind: 'write',
-      filePath: '/work/demo-repo/packages/app/test/Button.test.tsx',
+      filePath: nat('/work/demo-repo/packages/app/test/Button.test.tsx'),
       newText: "import { it } from 'vitest';\nit('renders', () => {});\n",
       promptId: `${s.id}:1`,
       at: '2026-10-21T07:10:02.500Z',

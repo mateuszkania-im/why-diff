@@ -66,7 +66,17 @@ function makeRepo(): { repo: string; home: string; emptyHome: string } {
 const provenance = (repo: string, home: string) => buildReport({ cwd: repo, base: 'main', committedOnly: true, home, harnesses: ['claude-code'] });
 const scan = (repo: string, home: string) => buildReport({ cwd: repo, base: 'main', committedOnly: true, home, harnesses: ['claude-code'] });
 
+// `git notes add` makes a commit on the notes ref: it needs an identity (CI machines have none).
+const savedEnv = Object.fromEntries(Object.keys(GIT_ENV).map((k) => [k, process.env[k]]));
+beforeAll(() => {
+  Object.assign(process.env, GIT_ENV);
+});
+
 afterAll(() => {
+  for (const [k, v] of Object.entries(savedEnv)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
@@ -218,6 +228,17 @@ describe('why-diff notes CLI', () => {
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('git push origin refs/notes/why-diff');
     expect(parseNote(git(repo, 'notes', '--ref=why-diff', 'show', 'HEAD'))?.hunks.length).toBeGreaterThan(0);
+  });
+
+  it('says to set user.name / user.email when git has no identity for the notes commit', () => {
+    const { repo, home } = makeRepo();
+    const noIdentity: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home, WHY_DIFF_CLAUDE_BIN: '/nonexistent/why-diff-test-claude', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(home, 'no-such-gitconfig'), GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'user.useConfigOnly', GIT_CONFIG_VALUE_0: 'true' };
+    for (const k of Object.keys(GIT_ENV)) delete noIdentity[k];
+    for (const k of ['EMAIL', 'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1', 'GIT_CONFIG_KEY_2', 'GIT_CONFIG_VALUE_2']) delete noIdentity[k];
+    const r = spawnSync(process.execPath, ['--import', tsxLoader, path.join(root, 'src', 'cli.ts'), 'notes', '--base', 'main', '--harness', 'claude-code', '-q'], { cwd: repo, encoding: 'utf8', env: noIdentity });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('git config user.name');
+    expect(r.stderr).toContain('git config user.email');
   });
 
   it('refuses when no transcripts are found (nothing to record)', () => {

@@ -2629,7 +2629,7 @@ import path12 from "node:path";
 import { spawn as spawn3 } from "node:child_process";
 
 // src/pipeline.ts
-import os5 from "node:os";
+import os6 from "node:os";
 import path10 from "node:path";
 import { lstat as lstat2, readFile as readFile6, stat as stat4 } from "node:fs/promises";
 
@@ -3132,7 +3132,7 @@ function filePathNeedles(roots, sep) {
   for (let root of roots) {
     let forms = DRIVE_PATH.test(root) ? [root.replace(/\//g, "\\"), root.replace(/\\/g, "/")].flatMap((r) => [r.charAt(0).toUpperCase() + r.slice(1), r.charAt(0).toLowerCase() + r.slice(1)]) : [root];
     for (let r of forms) {
-      let s = DRIVE_PATH.test(r) ? r.includes("\\") ? "\\" : "/" : sep;
+      let s = DRIVE_PATH.test(r) ? r.includes("\\") ? "\\" : "/" : r.startsWith("/") ? "/" : sep;
       out.add(`"file_path":${JSON.stringify(r.endsWith(s) ? r : r + s).slice(0, -1)}`);
     }
   }
@@ -3289,10 +3289,10 @@ function difference(a, b) {
   return out;
 }
 function repoRelativePath(filePath, roots, cwd = "", cwdVariants = rootVariants(cwd)) {
-  if (DRIVE_PATH.test(filePath) || !path3.isAbsolute(filePath) && DRIVE_PATH.test(cwd)) return driveRelativePath(filePath, roots, cwd);
-  let candidates = /* @__PURE__ */ new Set(), nfcCwd = cwd.normalize("NFC"), abs = path3.isAbsolute(filePath) ? path3.normalize(filePath.normalize("NFC")) : nfcCwd ? path3.resolve(nfcCwd, filePath.normalize("NFC")) : null;
+  if (DRIVE_PATH.test(filePath) || !path3.isAbsolute(filePath) && DRIVE_PATH.test(cwd)) return driveRelativePath(filePath, roots, cwd, cwdVariants);
+  let candidates = /* @__PURE__ */ new Set(), nfcCwd = cwd.normalize("NFC"), abs = path3.isAbsolute(filePath) ? path3.resolve(filePath.normalize("NFC")) : nfcCwd ? path3.resolve(nfcCwd, filePath.normalize("NFC")) : null;
   if (!abs) return null;
-  cwdVariants = cwdVariants.map((v) => v.normalize("NFC")), roots = roots.map((r) => r.normalize("NFC")), candidates.add(abs);
+  cwdVariants = cwdVariants.map((v) => path3.resolve(v.normalize("NFC"))), roots = roots.map((r) => path3.resolve(r.normalize("NFC"))), candidates.add(abs);
   for (let v of cwdVariants)
     for (let w of cwdVariants)
       v !== w && (abs === v || abs.startsWith(v + path3.sep)) && candidates.add(w + abs.slice(v.length));
@@ -3303,17 +3303,25 @@ function repoRelativePath(filePath, roots, cwd = "", cwdVariants = rootVariants(
     }
   return null;
 }
-function driveRelativePath(filePath, roots, cwd) {
+function driveRelativePath(filePath, roots, cwd, cwdVariants = []) {
   let resolved = DRIVE_PATH.test(filePath) ? path3.win32.resolve(filePath) : DRIVE_PATH.test(cwd) ? path3.win32.resolve(cwd, filePath) : null;
   if (!resolved) return null;
   let abs = resolved.normalize("NFC").replace(/\\/g, "/").replace(/\/$/, "");
   if (abs.split("/").includes("..")) return null;
-  let lower = abs.toLowerCase();
-  for (let root of roots) {
-    if (!DRIVE_PATH.test(root)) continue;
-    let r = driveKey(path3.win32.resolve(root.normalize("NFC")));
-    if (lower === r) return "";
-    if (lower.startsWith(`${r}/`) && abs.length === lower.length) return abs.slice(r.length + 1);
+  let candidates = [abs], lowerAbs = abs.toLowerCase(), keys = cwdVariants.filter((v) => DRIVE_PATH.test(v)).map((v) => path3.win32.resolve(v.normalize("NFC")).replace(/\\/g, "/").replace(/\/$/, ""));
+  for (let v of keys) {
+    let vk = v.toLowerCase();
+    if (!(lowerAbs !== vk && !lowerAbs.startsWith(`${vk}/`)))
+      for (let w of keys) w !== v && candidates.push(w + abs.slice(v.length));
+  }
+  for (let c of candidates) {
+    let lower = c.toLowerCase();
+    for (let root of roots) {
+      if (!DRIVE_PATH.test(root)) continue;
+      let r = driveKey(path3.win32.resolve(root.normalize("NFC")));
+      if (lower === r) return "";
+      if (lower.startsWith(`${r}/`) && c.length === lower.length) return c.slice(r.length + 1);
+    }
   }
   return null;
 }
@@ -6075,6 +6083,7 @@ async function readMeta(file) {
 }
 async function rootVariants2(root) {
   let normalised = path5.resolve(root), variants = /* @__PURE__ */ new Set([normalised]);
+  path5.isAbsolute(root) && variants.add(root.length > 1 ? root.replace(/[\\/]+$/, "") : root);
   try {
     variants.add(await realpath2(normalised));
   } catch {
@@ -6122,11 +6131,12 @@ function str(v) {
 // src/adapters/codex.ts
 import { createReadStream as createReadStream3 } from "node:fs";
 import { readdir as readdir2, realpath as realpath3, stat as stat3 } from "node:fs/promises";
-import os3 from "node:os";
+import os4 from "node:os";
 import path7 from "node:path";
 import { createInterface } from "node:readline";
 
 // src/adapters/patch.ts
+import os3 from "node:os";
 import path6 from "node:path";
 function isRecord2(value) {
   return typeof value == "object" && value !== null && !Array.isArray(value);
@@ -6163,7 +6173,7 @@ function clip2(text2, max = 500) {
   return t.length <= max ? t : `${t.slice(0, max - 1)}\u2026`;
 }
 function resolvePath2(base, p) {
-  let expanded = p.startsWith("~/") && process.env.HOME ? path6.join(process.env.HOME, p.slice(2)) : p;
+  let home = process.env.HOME || os3.homedir(), expanded = p.startsWith("~/") && home ? path6.join(home, p.slice(2)) : p;
   return path6.resolve(base, expanded);
 }
 function patchOpsToEdits(ops, baseDir) {
@@ -6324,14 +6334,14 @@ function shellWriteTargets(command) {
   let targets = [], mutating = !1, cdDir = null, add = (...ps) => {
     for (let raw of ps) {
       if (!raw) continue;
-      let p = cdDir !== null && !path6.isAbsolute(raw) && !raw.startsWith("~") ? path6.join(cdDir, raw) : raw;
+      let p = cdDir !== null && !path6.isAbsolute(raw) && !raw.startsWith("~") ? path6.posix.join(cdDir, raw) : raw;
       targets.includes(p) || targets.push(p);
     }
   };
   for (let seg of tokenizeSegments(stripHeredocs(command))) {
     if (seg[0] === "cd" || seg[0] === "pushd") {
       let dir = seg[1];
-      dir && dir !== "-" && (cdDir = cdDir !== null && !path6.isAbsolute(dir) && !dir.startsWith("~") ? path6.join(cdDir, dir) : dir);
+      dir && dir !== "-" && (cdDir = cdDir !== null && !path6.isAbsolute(dir) && !dir.startsWith("~") ? path6.posix.join(cdDir, dir) : dir);
       continue;
     }
     let words = [];
@@ -6511,7 +6521,7 @@ function jsStringArg(argSrc, keys) {
 
 // src/adapters/codex.ts
 function codexHome(home) {
-  return home ? path7.join(home, ".codex") : process.env.CODEX_HOME ?? path7.join(os3.homedir(), ".codex");
+  return home ? path7.join(home, ".codex") : process.env.CODEX_HOME ?? path7.join(os4.homedir(), ".codex");
 }
 async function* readJsonl(file) {
   let rl = createInterface({ input: createReadStream3(file, { encoding: "utf8" }), crlfDelay: 1 / 0 });
@@ -6532,6 +6542,21 @@ async function readCodexMeta(file) {
     return !id || !cwd ? null : { id, cwd, timestamp: str2(p, "timestamp") ?? str2(line, "timestamp") ?? "" };
   }
   return null;
+}
+function rootNeedles(roots) {
+  let out = /* @__PURE__ */ new Set();
+  for (let r of roots) {
+    if (!r) continue;
+    if (!DRIVE_PATH.test(r)) {
+      out.add(`${r.replace(/\/+$/, "")}/`);
+      continue;
+    }
+    let fwd = r.replace(/\\/g, "/").replace(/\/+$/, ""), back = fwd.replace(/\//g, "\\");
+    for (let f of [fwd, fwd.charAt(0).toLowerCase() + fwd.slice(1), fwd.charAt(0).toUpperCase() + fwd.slice(1)]) out.add(`${f}/`);
+    for (let b of [back, back.charAt(0).toLowerCase() + back.slice(1), back.charAt(0).toUpperCase() + back.slice(1)])
+      out.add(`${b}\\`), out.add(`${b.replace(/\\/g, "\\\\")}\\\\`);
+  }
+  return [...out];
 }
 async function realpathSafe(p) {
   try {
@@ -6554,7 +6579,7 @@ async function listDir(dir) {
 }
 var DAY_MS = 864e5;
 async function discover(repoRoot2, opts = {}) {
-  let root = path7.join(codexHome(opts.home), "sessions"), repos = [await realpathSafe(repoRoot2), ...await Promise.all((opts.extraRoots ?? []).map(realpathSafe))], needles = [.../* @__PURE__ */ new Set([...repos, path7.resolve(repoRoot2), ...(opts.extraRoots ?? []).map((r) => path7.resolve(r))])].map((r) => `${r}/`), found = [];
+  let root = path7.join(codexHome(opts.home), "sessions"), repos = [await realpathSafe(repoRoot2), ...await Promise.all((opts.extraRoots ?? []).map(realpathSafe))], needles = rootNeedles([...repos, repoRoot2, path7.resolve(repoRoot2), ...(opts.extraRoots ?? []).flatMap((r) => [r, path7.resolve(r)])]), found = [];
   for (let y of (await listDir(root)).filter((d) => /^\d{4}$/.test(d)))
     for (let m of (await listDir(path7.join(root, y))).filter((d) => /^\d{2}$/.test(d)))
       for (let d of (await listDir(path7.join(root, y, m))).filter((x) => /^\d{2}$/.test(x))) {
@@ -6895,12 +6920,12 @@ var codexAdapter = {
 // src/adapters/opencode.ts
 import { existsSync } from "node:fs";
 import { readdir as readdir3, readFile as readFile3, realpath as realpath4 } from "node:fs/promises";
-import os4 from "node:os";
+import os5 from "node:os";
 import path8 from "node:path";
 function opencodeDataDir(home) {
   if (home) return path8.join(home, ".local", "share", "opencode");
   let xdg = process.env.XDG_DATA_HOME;
-  return xdg ? path8.join(xdg, "opencode") : path8.join(os4.homedir(), ".local", "share", "opencode");
+  return xdg ? path8.join(xdg, "opencode") : path8.join(os5.homedir(), ".local", "share", "opencode");
 }
 var DB_REF = /^(.*\.db)#([^#/\\]+)$/;
 async function readJson(file) {
@@ -8050,7 +8075,12 @@ async function writeNote(root, note, rev = "HEAD") {
   if (Buffer.byteLength(body) > NOTE_MAX_BYTES)
     throw new Error(`the provenance note would be ${Buffer.byteLength(body)} bytes, over the ${NOTE_MAX_BYTES}-byte limit readers accept; narrow it with --since or --session`);
   let sha = await git(root, ["rev-parse", "--verify", `${rev}^{commit}`]);
-  return await gitWithInput(root, ["notes", `--ref=${NOTES_REF}`, "add", "-f", "-F", "-", sha], body), sha;
+  try {
+    await gitWithInput(root, ["notes", `--ref=${NOTES_REF}`, "add", "-f", "-F", "-", sha], body);
+  } catch (err) {
+    throw /Please tell me who you are|Author identity unknown|auto-detection is disabled|empty ident/i.test(err.message) ? new Error('git has no author identity for the notes commit; set one with git config user.name "Your Name" and git config user.email you@example.com, then run why-diff notes again') : err;
+  }
+  return sha;
 }
 function parseNote(text2) {
   if (text2.length > NOTE_MAX_BYTES) return null;
@@ -8268,7 +8298,7 @@ async function buildReport(opts = {}) {
   }
   let summary = summarize(attributed, reportSessions);
   ignoredHunks > 0 && (summary.ignoredHunks = ignoredHunks), attributed.some((h) => h.intent && h.intent.model !== NOTE_MODEL) && (summary.intent = summarizeIntent(attributed));
-  let usedPromptIds = new Set(attributed.map((h) => h.prompt?.id).filter(Boolean)), contributing = contributingSessionIds(attributed), home = opts.home ?? os5.homedir(), pathRoots = [root, ...extraRoots].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdOf = new Map(sessions.map((s) => [s.id, s.cwd])), publicPath = (e) => {
+  let usedPromptIds = new Set(attributed.map((h) => h.prompt?.id).filter(Boolean)), contributing = contributingSessionIds(attributed), home = opts.home ?? os6.homedir(), pathRoots = [root, ...extraRoots].flatMap(rootVariants).sort((a, b) => b.length - a.length), cwdOf = new Map(sessions.map((s) => [s.id, s.cwd])), publicPath = (e) => {
     let rel = repoRelativePath(e.filePath, pathRoots, cwdOf.get(e.sessionId) ?? "");
     return rel ? rel.split(path10.sep).join("/") : tildify(e.filePath, home);
   }, edits = editTable(attributed, sessions);
@@ -8334,6 +8364,10 @@ async function checkSessionFile(file) {
 function tildify(p, home) {
   if (!home) return p;
   let h = home.replace(/[\\/]+$/, "");
+  if (DRIVE_PATH.test(p) && DRIVE_PATH.test(h)) {
+    let pk = driveKey(p), hk = driveKey(h);
+    return pk === hk ? "~" : pk.startsWith(`${hk}/`) ? `~${p.replace(/\\/g, "/").replace(/\/+$/, "").slice(hk.length)}` : p;
+  }
   return p === h ? "~" : p.startsWith(h + "/") || p.startsWith(h + "\\") ? "~" + p.slice(h.length) : p;
 }
 function guessAdapter(file) {

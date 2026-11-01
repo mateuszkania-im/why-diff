@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { lstat } from 'node:fs/promises';
 import { afterEach, describe, expect, it } from 'vitest';
 import { acquireLock, releaseLock, runGuard } from '../src/guard.js';
@@ -578,7 +579,7 @@ describe('why-diff guard CLI', () => {
     const { repo, home } = makeRepo();
     const transcript = writeSyntheticTranscript(home, repo, 's-cli', [{ prompt: 'fix t5', at: SESSION_AT, calls: [editCall(repo, SKIP_OLD, SKIP_NEW)] }]);
     applyEdit(repo, SKIP_OLD, SKIP_NEW);
-    const run = (payload: object) => spawnSync(path.resolve('node_modules/.bin/tsx'), [path.resolve('src/cli.ts'), 'guard'], { input: JSON.stringify(payload), encoding: 'utf8', cwd: repo });
+    const run = (payload: object) => spawnSync(process.execPath, ['--import', pathToFileURL(path.resolve('node_modules/tsx/dist/esm/index.mjs')).href, path.resolve('src/cli.ts'), 'guard'], { input: JSON.stringify(payload), encoding: 'utf8', cwd: repo });
     const first = run({ transcript_path: transcript, cwd: repo, session_id: 's-cli' });
     expect(first.status).toBe(2);
     expect(first.stderr).toContain('test-skip-added');

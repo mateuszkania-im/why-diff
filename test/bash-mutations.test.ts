@@ -73,7 +73,7 @@ describe('detectBashMutations', () => {
       `install:${abs('packages/web/package.json')}`,
       `install:${abs('packages/web/package-lock.json')}`,
     ]);
-    expect(paths(`sudo rm -f /etc/thing.conf`)).toEqual([`delete:/etc/thing.conf`]);
+    expect(paths(`sudo rm -f /etc/thing.conf`)).toEqual([`delete:${abs('/etc/thing.conf')}`]);
     expect(paths(`FOO=1 sed -i 's/a/b/' x.ts; npx prettier --write src/`)).toEqual([`edit:${abs('x.ts')}`, `format:${abs('src')}`]);
     expect(paths(`npx prettier --check src/`)).toEqual([]);
     expect(paths(`pnpm exec eslint --fix src/a.ts`)).toEqual([`format:${abs('src/a.ts')}`]);
@@ -81,11 +81,11 @@ describe('detectBashMutations', () => {
 
   it('detects files written by inline python and node scripts, not files they only read', () => {
     const py = "cd sub && python3 - <<'EOF'\np='docs/plan.md';s=open(p).read()\nopen(p,'w').write(s.replace('a','b'))\nprint(open('other.json').read())\nEOF";
-    expect(paths(py)).toEqual(['edit:/repo/sub/docs/plan.md']);
+    expect(paths(py)).toEqual([`edit:${abs('sub/docs/plan.md')}`]);
     const loop = "python3 - <<'EOF'\nfor f in ['a/one.md', 'b/two.md']:\n    open(f, 'w').write('x')\nopen(f'out/{n}.md', 'w')\nEOF";
-    expect(paths(loop)).toEqual(['edit:/repo/a/one.md', 'edit:/repo/b/two.md']);
-    expect(paths(`python3 -c "import pathlib; pathlib.Path('x/y.txt').write_text('hi')"`)).toEqual(['edit:/repo/x/y.txt']);
-    expect(paths(`node -e "const fs=require('fs'); const f='pkg/a.json'; fs.writeFileSync(f, '{}')"`)).toEqual(['edit:/repo/pkg/a.json']);
+    expect(paths(loop)).toEqual([`edit:${abs('a/one.md')}`, `edit:${abs('b/two.md')}`]);
+    expect(paths(`python3 -c "import pathlib; pathlib.Path('x/y.txt').write_text('hi')"`)).toEqual([`edit:${abs('x/y.txt')}`]);
+    expect(paths(`node -e "const fs=require('fs'); const f='pkg/a.json'; fs.writeFileSync(f, '{}')"`)).toEqual([`edit:${abs('pkg/a.json')}`]);
     expect(paths(`python3 -c "print(open('README.md').read())"`)).toEqual([]);
   });
 
