@@ -347,14 +347,22 @@ const MESSAGE_HEAD = 'why-diff guard: your changes in this session include risky
 /**
  * Did Claude Code already deliver a block with exactly these hits? Only harness-written transcript
  * lines count: a `hook_blocking_error` attachment of the Stop event, or a `stop_hook_summary` system
- * line. Tool results, assistant text and anything in the working tree do not.
+ * line, carrying exactly this list. It must also come after the last tool call and tool result in
+ * the transcript: a line the agent appends to its own transcript during a tool call lands before
+ * the harness writes that call's result, so it never qualifies. Tool output, assistant text and
+ * anything in the working tree never count.
  */
 async function alreadyDelivered(transcript: string, hits: string[]): Promise<boolean> {
   const needle = `${MESSAGE_HEAD}${hits.join('\n')}\n\n`;
   const stream = createReadStream(transcript, { encoding: 'utf8' });
   const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  let deliveredAfterLastTool = false;
   try {
     for await (const raw of lines) {
+      if (raw.includes('"tool_use"') || raw.includes('"tool_result"')) {
+        deliveredAfterLastTool = false;
+        continue;
+      }
       if (!raw.includes('why-diff guard') || !(raw.includes('hook_blocking_error') || raw.includes('stop_hook_summary'))) continue;
       let line: { type?: unknown; subtype?: unknown; attachment?: { type?: unknown; hookEvent?: unknown } } & Record<string, unknown>;
       try {
@@ -367,13 +375,13 @@ async function alreadyDelivered(transcript: string, hits: string[]): Promise<boo
         (line.type === 'system' && line.subtype === 'stop_hook_summary');
       if (!harnessLine) continue;
       const source = line.type === 'attachment' ? line.attachment : line;
-      if (strings(source).some((t) => t.includes(needle))) return true;
+      if (strings(source).some((t) => t.includes(needle))) deliveredAfterLastTool = true;
     }
   } finally {
     lines.close();
     stream.destroy();
   }
-  return false;
+  return deliveredAfterLastTool;
 }
 
 function strings(v: unknown, depth = 0): string[] {

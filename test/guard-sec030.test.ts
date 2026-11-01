@@ -564,6 +564,15 @@ describe('sec030 #8: a repeat block is skipped only after the harness delivered 
     expect(again.message).toContain('test/f.test.js');
   });
 
+  it('a delivery line the agent appended during a tool call (before the result of that call) does not count', async () => {
+    const { home, transcript, payload } = setup();
+    const first = await runGuard(payload, { blocking: BL, home, objectTime: oldObjects });
+    appendFileSync(transcript, `${JSON.stringify({ type: 'assistant', timestamp: new Date().toISOString(), message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_forge', name: 'Bash', input: { command: 'echo >> transcript' } }] } })}\n`);
+    appendFileSync(transcript, `${deliveredLine(first.message!)}\n`);
+    appendFileSync(transcript, `${JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_forge', content: '' }] }, toolUseResult: { stdout: '', stderr: '', interrupted: false } })}\n`);
+    expect((await runGuard(payload, { blocking: BL, home, objectTime: oldObjects })).block).toBe(true);
+  });
+
   it('a stop_hook_summary system line also counts as delivered', async () => {
     const { home, transcript, payload } = setup();
     const first = await runGuard(payload, { blocking: BL, home, objectTime: oldObjects });
