@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.3
+
+### Security
+
+Guard bypasses found in a security review of 0.3.2 (the agent is treated as the adversary):
+
+- Session base: reflog entries with forged past dates could point the base at an older commit, so the guard diffed from it and missed later changes. Candidates now come from HEAD's reflog (entries dated before the session) and its first-parent history, and the base is the trusted one whose object was written last (an agent cannot write an object that predates the session); on a tie (one pack), the commit the others lead to.
+- A base that is no longer an ancestor of HEAD (a `git reset` dropped a pre-session commit) is diffed as is. The guard used to fall back to the merge base, which let a reset re-skip a test.
+- A test file untracked by a command that does not name it (a script running `git rm --cached`, the file kept on disk and excluded) was never credited. A file in the base that is gone from the index or HEAD but still on disk now counts as deleted when the index, the branch ref (or `packed-refs`) or HEAD's reflog last changed during one of the session's tool calls.
+- A weakening kept only in a commit or only in the index (the working tree put back, or never touched: `update-index --cacheinfo`) passed, because only the working tree was diffed. The guard also diffs the base against HEAD and against the index (blob ids only, no stat data), merges those hunks with the working tree's (identical hunks once), and credits them by the same index and ref change times.
+- Run time: 100,000 untracked files written during a call took 37 s, past the 30 s hook timeout. Paths the session named are now checked first; at most 2000 untracked files credited by change time alone are read, the rest block as `unreviewed` unread; and a run past 20 s (`WHY_DIFF_GUARD_DEADLINE_MS`) blocks with a clear message and exits.
+- Labels: `it.skipIf(` / `test.skipIf(` / `describe.skipIf(` and `.runIf(`, bracket access (`it["skip"]`, `it['skip']`, ``it[`skip`]``) and a bare `return;` added as the first statement of a test body count as skips; an `expect(...)` subject changed into a literal, or into the value the assertion used to expect, counts as a weakened assertion.
+
+### Documentation
+
+- README Limitations: label heuristics can be evaded by restructuring code (`if (false)`, try/catch, a shadowed `it`, an arrow never called); the guard catches common weakenings, not every semantic one.
+
 ## 0.3.2
 
 ### Security
