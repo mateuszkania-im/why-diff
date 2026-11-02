@@ -1,6 +1,6 @@
 {
-  "name": "why-diff",
-  "version": "0.3.5",
+  "name": "@mateuszkania-im/why-diff",
+  "version": "0.3.6",
   "description": "Trace every hunk of an AI agent's diff back to the prompt and tool call that wrote it. Flags unrequested changes and test tampering.",
   "type": "module",
   "bin": {
@@ -14,6 +14,9 @@
     "README.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=20"
   },
@@ -42,7 +45,7 @@
   "author": "Mateusz Kania",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mateuszkania-im/why-diff"
+    "url": "git+https://github.com/mateuszkania-im/why-diff.git"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

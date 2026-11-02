@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.6
+
+### Distribution
+
+- Published to npm under the scope: `@mateuszkania-im/why-diff` (`npx @mateuszkania-im/why-diff`, `npm i -g @mateuszkania-im/why-diff`). The plain name `why-diff` was refused by npm as too similar to an existing package; the installed command is still `why-diff`. `publishConfig.access` is `public`, and `repository.url` is in the normalized `git+https://...git` form (`npm pkg fix`). The GitHub and release-tarball install routes still work and the README keeps them as alternatives.
+
+### Fixes
+
+- Guard deadline: when the deadline killed the check, the child's close event could be handled before the timeout handler and the guard reported "the check exited without a result (signal SIGKILL)" instead of "did not finish within N s". Both blocked (exit 2), only the reason differed; the deadline now wins every time.
+
+### Tests
+
+- `sec033 #11` (synchronous labelling past the hard deadline) was flaky when the whole suite ran under load: the "near the deadline" bound counted node and tsx start-up time, which can take seconds on a busy machine, and the race above changed the message. The bound is now the deadline plus 3 s plus the start-up time measured in the same test, under the same load, and the message is asserted unchanged. It still proves that synchronous work is cut off with exit 2 and that the temporary files are removed.
+
 ## 0.3.5
 
 ### Security

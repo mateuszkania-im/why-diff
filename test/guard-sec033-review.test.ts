@@ -103,10 +103,15 @@ describe('sec033 #11: the hard deadline is enforced from outside the check', () 
     // One call still open (no result yet): its window lasts until the guard runs, so every file above is credited by time.
     const transcript = writeSyntheticTranscript(x.home, x.repo, 's33r', [{ prompt: 'go', at: iso(start), calls: [{ tool: 'Bash', at: iso(start + 50), input: { command: 'node gen.js', description: 'x' }, noResult: true }] }]);
     const tmp = temp('wd-s33r-tmp-');
+    // Process start (node + tsx loader) is not part of what the deadline governs, but under a loaded
+    // machine it can take seconds. Measure it here, under the same load, and allow exactly that much extra.
+    const t0 = Date.now();
+    spawnSync(process.execPath, ['--import', tsxLoader, path.join(root, 'src', 'cli.ts'), '--version'], { cwd: x.repo, encoding: 'utf8', timeout: 120_000 });
+    const startup = Date.now() - t0;
     const r = cli(x.repo, JSON.stringify({ transcript_path: transcript, cwd: x.repo, session_id: 's33r' }), { HOME: x.home, TMPDIR: tmp, WHY_DIFF_GUARD_DEADLINE_MS: '1500' });
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('did not finish within 1.5 s');
-    expect(r.ms).toBeLessThan(1500 + 3000);
+    expect(r.ms).toBeLessThan(1500 + 3000 + startup);
     expect(readdirSync(tmp).filter((f) => f.startsWith('why-diff'))).toEqual([]);
   }, 120_000);
 
