@@ -2,9 +2,9 @@
 /**
  * why-diff CLI.
  *
- *   npx why-diff                      # branch + working tree, terminal report
- *   npx why-diff main...HEAD --html   # interactive review page
- *   npx why-diff --classify           # + LLM intent check (uses your local Claude Code)
+ *   npx @mateuszkania-im/why-diff                      # branch + working tree, terminal report
+ *   npx @mateuszkania-im/why-diff main...HEAD --html   # interactive review page
+ *   npx @mateuszkania-im/why-diff --classify           # + LLM intent check (uses your local Claude Code)
  */
 import { Command, Option } from 'commander';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -338,10 +338,15 @@ async function guardInChild(raw: string, on: string | undefined): Promise<GuardR
   child.stdin!.end(raw);
   const cleanup = (): Promise<void> => rm(tmp, { recursive: true, force: true }).catch(() => {});
   return new Promise<GuardResult>((resolve) => {
+    let timedOut = false;
     const timer = setTimeout(() => {
+      timedOut = true;
       void killTree(child.pid, posix, () => child.kill('SIGKILL')).then(cleanup).then(() => resolve(timeoutResult(ms)));
     }, ms);
     const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
+      // The deadline already fired: its own handler reports the timeout once the kill and cleanup are done.
+      // Without this, the child's close event (caused by that kill) could win and report "exited without a result".
+      if (timedOut) return;
       clearTimeout(timer);
       void cleanup().then(() => {
         try {

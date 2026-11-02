@@ -5,9 +5,9 @@
 Every hunk of an agent's diff, traced back to the prompt you typed and the tool call that wrote it. Hunks nobody asked for, tests that were skipped, weakened or turned off, new dependencies and CI edits are flagged before you commit.
 
 ```bash
-npx -y github:mateuszkania-im/why-diff            # branch + working tree, in your terminal
-npx -y github:mateuszkania-im/why-diff --html     # interactive review page
-npx -y github:mateuszkania-im/why-diff --classify # + "did I actually ask for this?" check per hunk
+npx -y @mateuszkania-im/why-diff            # branch + working tree, in your terminal
+npx -y @mateuszkania-im/why-diff --html     # interactive review page
+npx -y @mateuszkania-im/why-diff --classify # + "did I actually ask for this?" check per hunk
 ```
 
 Node 20+. Works with **Claude Code**, **Codex** and **OpenCode** transcripts. Runs locally. No account, no server, no telemetry. The examples below use `why-diff` for short (see [Install](#install)).
@@ -153,7 +153,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # required: a shallow clone has no merge base
-      - uses: mateuszkania-im/why-diff@v0.3.5
+      - uses: mateuszkania-im/why-diff@v0.3.6
         with:
           fail-on: risk    # optional
 ```
@@ -179,16 +179,21 @@ With the [Claude Code plugin](#claude-code-plugin) installed, the Stop hook guar
 ## Install
 
 ```bash
-npx -y github:mateuszkania-im/why-diff --version
+npx @mateuszkania-im/why-diff --version          # run without installing
+npm i -g @mateuszkania-im/why-diff               # installs the `why-diff` command
+why-diff --version
 ```
 
-That runs the committed standalone file `plugin/bin/why-diff.mjs` (one file, zero dependencies, nothing to build). From v0.2.0 each release also has a tarball, which skips the git clone and is faster:
+The package is `@mateuszkania-im/why-diff` (the unscoped name was taken by npm's similarity check); the command it installs is still `why-diff`. It ships the standalone file `plugin/bin/why-diff.mjs` (one file, zero dependencies, nothing to build).
+
+Alternatives, same file: straight from GitHub, or the tarball attached to each release (from v0.2.0), which skips the git clone:
 
 ```bash
-npx -y https://github.com/mateuszkania-im/why-diff/releases/download/v0.3.5/why-diff.tgz --version
+npx -y github:mateuszkania-im/why-diff --version
+npx -y https://github.com/mateuszkania-im/why-diff/releases/download/v0.3.6/why-diff.tgz --version
 ```
 
-Tip: `alias why-diff="npx -y github:mateuszkania-im/why-diff"`.
+Tip: `alias why-diff="npx -y @mateuszkania-im/why-diff"` if you do not want a global install.
 
 ## Claude Code plugin
 
