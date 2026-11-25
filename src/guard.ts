@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { buildReport } from './pipeline.js';
 import { claudeCodeAdapter } from './adapters/claude.js';
-import { emptyTree, FailClosedError, git, GitError, hasHead, indexEntries, isCaseInsensitive, listUntracked, repoRoot, sparseExcluded, sparseMissing, worktreeRoots, type SparseTrust } from './git.js';
+import { emptyTree, FailClosedError, git, verifySnapshot, GitError, hasHead, indexEntries, isCaseInsensitive, listUntracked, repoRoot, sparseExcluded, sparseMissing, worktreeRoots, type SparseTrust } from './git.js';
 import { globToRegExp, repoRelativePath, rootVariants } from './attribute.js';
 import { compileGlobs, loadConfig, type WhyDiffConfig } from './config.js';
 import type { Hunk, LabelKind, Session } from './types.js';
@@ -235,7 +235,10 @@ async function guard(payload: GuardPayload, opts: GuardOptions, state: { relevan
       }
       // The index at session start: staged changes from before the session are not the agent's.
       const tree = record.data.indexTree;
-      if (tree && (await git(root, ['cat-file', '-e', `${tree}^{tree}`]).then(() => true, () => false)) && (await writtenBefore(root, tree, windows.firstStart, objectTime))) {
+      // Its object predates the session, or (repacked during it) the whole tree hashes to its name.
+      const trusted = async (t: string): Promise<boolean> =>
+        (await writtenBefore(root, t, windows.firstStart, objectTime)) || (await verifySnapshot(root, t, 'tree').then(() => true, (err: unknown) => { if (err instanceof FailClosedError) return false; throw err; }));
+      if (tree && (await git(root, ['cat-file', '-e', `${tree}^{tree}`]).then(() => true, () => false)) && (await trusted(tree))) {
         indexBase = tree;
         notes.push(`index compared against the index tree recorded at session start: ${tree}`);
       }
@@ -1502,9 +1505,22 @@ async function sessionBase(root: string, startedAt: number, timeOf: (p: string) 
 
   const isCommit = async (sha: string): Promise<boolean> => git(root, ['cat-file', '-e', `${sha}^{commit}`]).then(() => true, () => false);
   if (recorded) {
-    // The commit recorded at SessionStart, out of the agent's reach: still only if its object predates the session.
-    if ((await isCommit(recorded)) && (await writtenAt(recorded)) !== undefined) return recorded;
-    throw new FailClosedError(`the commit recorded at session start (${recorded.slice(0, 12)}) is missing or was not written before the session`);
+    // The commit recorded at SessionStart, out of the agent's reach. Its object predates the session,
+    // or (repacked by gc, maintenance or a fetch during it) its whole snapshot hashes to its name.
+    // `cat-file -e ^{commit}` parses the commit, and git refuses one that does not hash to its name.
+    if (!(await isCommit(recorded))) throw new FailClosedError(`the commit recorded at session start (${recorded.slice(0, 12)}) is missing, or its object no longer hashes to its name`);
+    const old = await writtenAt(recorded).catch((err: unknown) => {
+      if (err instanceof FailClosedError) return undefined;
+      throw err;
+    });
+    if (old !== undefined) return recorded;
+    try {
+      await verifySnapshot(root, recorded);
+    } catch (err) {
+      if (!(err instanceof FailClosedError)) throw err;
+      throw new FailClosedError(`the commit recorded at session start (${recorded.slice(0, 12)}) was repacked during the session, and its snapshot could not be verified: ${err.message}`);
+    }
+    return recorded;
   }
 
   // Candidates, in order of preference for a tie: the reflogs of HEAD and of the current branch

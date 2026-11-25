@@ -481,7 +481,7 @@ describe('sec033 #9: an out-of-band base record from SessionStart', () => {
     expect(res.message).toContain('base record modified during session');
   });
 
-  it('a recorded head whose object was written during the session fails closed', async () => {
+  it('a recorded head whose object was rewritten during the session (a repack) stays the base once its snapshot hashes to its name', async () => {
     const x = await setup();
     let callAt = 0;
     const res = await guardRun(x.repo, x.home, (t) => {
@@ -489,7 +489,7 @@ describe('sec033 #9: an out-of-band base record from SessionStart', () => {
       return [bash(t, 'git reset --hard A')];
     }, { objectTime: async (p) => (p.endsWith(path.join(x.b.slice(0, 2), x.b.slice(2))) ? Date.now() : objectTimes(x.repo, { [x.a]: 1000 })(p)), statTime: times(x, () => callAt, (t) => t - 5000) });
     expect(res.block).toBe(true);
-    expect(res.message).toContain('why-diff could not check this session');
+    expect(res.message).toContain('test-skip-added');
   });
 
   it('a record for another repository is ignored (reflog fallback)', async () => {
