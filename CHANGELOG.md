@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.8
+
+### GitHub Action
+
+- Listed on the GitHub Marketplace: the `action.yml` description is cut to a 102-character card blurb (the permissions and `fetch-depth: 0` notes stay in the README snippet), and the README and docs/github-action.md use the moving `@v0` tag, which follows each release.
+
+### CI
+
+- `ci.yml` runs with `permissions: contents: read`.
+- Windows cleanup hooks get 60 s: deleting the 5000-file submodule fixture in guard-sec035 took over 10 s on windows-latest.
+
 ## 0.3.7
 
 ### Fixes

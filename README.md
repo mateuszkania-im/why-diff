@@ -190,7 +190,7 @@ Alternatives, same file: straight from GitHub, or the tarball attached to each r
 
 ```bash
 npx -y github:mateuszkania-im/why-diff --version
-npx -y https://github.com/mateuszkania-im/why-diff/releases/download/v0.3.7/why-diff.tgz --version
+npx -y https://github.com/mateuszkania-im/why-diff/releases/download/v0.3.8/why-diff.tgz --version
 ```
 
 Tip: `alias why-diff="npx -y @mateuszkania-im/why-diff"` if you do not want a global install.
