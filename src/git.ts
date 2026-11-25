@@ -9,7 +9,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { lstat, mkdtemp, open, readFile, readlink, realpath, rm, stat, writeFile } from 'node:fs/promises';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -1256,4 +1256,169 @@ export async function commitTimes(cwd: string, target: DiffTarget): Promise<Time
 /** Repository name: basename of the repo root. */
 export async function repoName(cwd: string): Promise<string> {
   return path.basename(await repoRoot(cwd));
+}
+
+/** Bytes of base snapshot {@link verifySnapshot} reads at most (`WHY_DIFF_MAX_SNAPSHOT_BYTES` overrides). */
+const MAX_SNAPSHOT_BYTES = 1024 * 1024 * 1024;
+
+/**
+ * Prove that the snapshot under `oid` (a commit or a tree: every tree under it and every blob they
+ * name) is what its name says: each object is read with `git cat-file --batch` and hashed, as it
+ * streams, with the repository's object format, and must hash to the name it was read under, with
+ * the expected type. Git itself does not check this when it reads a tree or a blob, so an object
+ * rewritten in the store (a forged loose file, or a pack whose index maps a name to other content)
+ * would otherwise be believed. Gitlinks are not followed (a submodule is checked on its own). The
+ * blobs' total size is read first (`--batch-check`): past {@link MAX_SNAPSHOT_BYTES} the check fails
+ * closed before reading them, so the guard says why instead of running out of time. Throws
+ * {@link FailClosedError} on any mismatch, a missing object, an unreadable tree or a snapshot too big.
+ */
+export async function verifySnapshot(cwd: string, oid: string, kind: 'commit' | 'tree' = 'commit'): Promise<{ objects: number; bytes: number }> {
+  // A git too old for the flag echoes it back; such a git only has sha1 repositories.
+  const format = (await git(cwd, ['rev-parse', '--show-object-format']).catch(() => 'sha1')) === 'sha256' ? 'sha256' : 'sha1';
+  const rawLen = format === 'sha1' ? 20 : 32;
+  const cap = Number(process.env.WHY_DIFF_MAX_SNAPSHOT_BYTES) > 0 ? Number(process.env.WHY_DIFF_MAX_SNAPSHOT_BYTES) : MAX_SNAPSHOT_BYTES;
+  const seen = new Set<string>();
+  let objects = 0;
+  let bytes = 0;
+  const done = (o: { oid: string; type: string; digest: string; size: number }, want: string): void => {
+    if (o.type !== want) throw new FailClosedError(`the base object ${o.oid.slice(0, 12)} is a ${o.type}, expected a ${want}`);
+    if (o.digest !== o.oid) throw new FailClosedError(`the base object ${o.oid.slice(0, 12)} does not hash to its name (its content was rewritten)`);
+    objects++;
+    bytes += o.size;
+  };
+  let trees: string[] = [];
+  const blobs: string[] = [];
+  if (kind === 'commit') {
+    await catFileBatch(cwd, [oid], format, true, (o) => {
+      done(o, 'commit');
+      const m = /^tree ([0-9a-f]+)\n/.exec(o.body!.subarray(0, 200).toString('latin1'));
+      if (!m) throw new FailClosedError(`the base commit ${oid.slice(0, 12)} names no tree`);
+      trees.push(m[1]!);
+    });
+  } else {
+    trees.push(oid);
+  }
+  // Trees level by level, kept in memory to be parsed (they are small).
+  while (trees.length) {
+    const next: string[] = [];
+    await catFileBatch(cwd, trees, format, true, (o) => {
+      done(o, 'tree');
+      const body = o.body!;
+      let i = 0;
+      while (i < body.length) {
+        const sp = body.indexOf(0x20, i);
+        const nul = sp < 0 ? -1 : body.indexOf(0, sp);
+        if (sp < 0 || nul < 0 || nul + 1 + rawLen > body.length) throw new FailClosedError(`the base tree ${o.oid.slice(0, 12)} cannot be parsed`);
+        const mode = body.toString('latin1', i, sp).replace(/^0+/, ''); // old tools wrote 040000
+        const child = body.toString('hex', nul + 1, nul + 1 + rawLen);
+        i = nul + 1 + rawLen;
+        if (mode === '160000' || seen.has(child)) continue; // a gitlink names a commit of another repository
+        seen.add(child);
+        if (mode === '40000') next.push(child);
+        else blobs.push(child);
+      }
+    });
+    trees = next;
+  }
+  if (!blobs.length) return { objects, bytes };
+  let total = 0;
+  for (const line of (await git(cwd, ['cat-file', '--batch-check=%(objectsize)'], { input: `${blobs.join('\n')}\n` })).split('\n')) total += Number(line) || 0;
+  if (total > cap) throw new FailClosedError(`the base snapshot holds ${total} bytes of files, more than the ${cap} bytes why-diff hashes in one check (WHY_DIFF_MAX_SNAPSHOT_BYTES)`);
+  // Blobs are hashed as they stream and never held in memory.
+  await catFileBatch(cwd, blobs, format, false, (o) => done(o, 'blob'));
+  return { objects, bytes };
+}
+
+/**
+ * Stream `git cat-file --batch` for `oids`, hashing each object (header `type size\0` plus content)
+ * as its bytes arrive, and call `onObject` with its name, type, size, digest and, when `keepBody`,
+ * its content, in order. A missing object, a short or malformed stream, or git failing throws
+ * {@link FailClosedError}; an error thrown by `onObject` stops git and is rethrown.
+ */
+async function catFileBatch(
+  cwd: string,
+  oids: readonly string[],
+  format: 'sha1' | 'sha256',
+  keepBody: boolean,
+  onObject: (o: { oid: string; type: string; size: number; digest: string; body?: Buffer }) => void,
+): Promise<void> {
+  const env = await gitEnv(cwd);
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn('git', hardenedInvocation(['cat-file', '--batch']).args, { cwd, env, stdio: ['pipe', 'pipe', 'ignore'] });
+    let head: Buffer = Buffer.alloc(0); // bytes of a header line not yet complete
+    let cur: { oid: string; type: string; size: number; left: number; hash: ReturnType<typeof createHash>; parts: Buffer[] } | undefined;
+    let trailer = false; // the newline after an object's content is still due
+    let next = 0;
+    let failed: Error | undefined;
+    const fail = (err: Error): void => {
+      if (failed) return;
+      failed = err;
+      child.kill();
+      reject(err);
+    };
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (failed) return;
+      try {
+        let off = 0;
+        while (off < chunk.length) {
+          if (cur) {
+            const take = Math.min(cur.left, chunk.length - off);
+            const piece = chunk.subarray(off, off + take);
+            cur.hash.update(piece);
+            if (keepBody) cur.parts.push(piece);
+            cur.left -= take;
+            off += take;
+            if (cur.left === 0) {
+              const o = cur;
+              cur = undefined;
+              trailer = true;
+              onObject({ oid: o.oid, type: o.type, size: o.size, digest: o.hash.digest('hex'), ...(keepBody ? { body: Buffer.concat(o.parts) } : {}) });
+              next++;
+            }
+            continue;
+          }
+          if (trailer) {
+            if (chunk[off] !== 0x0a) throw new FailClosedError('git cat-file wrote no newline after an object');
+            trailer = false;
+            off++;
+            continue;
+          }
+          const nl = chunk.indexOf(0x0a, off);
+          if (nl < 0) {
+            head = Buffer.concat([head, chunk.subarray(off)]);
+            if (head.length > 4096) throw new FailClosedError('git cat-file wrote a header line that never ends');
+            return;
+          }
+          const line = Buffer.concat([head, chunk.subarray(off, nl)]).toString('latin1');
+          head = Buffer.alloc(0);
+          off = nl + 1;
+          const header = line.split(' ');
+          const oid = oids[next];
+          if (oid === undefined || header[0] !== oid) throw new FailClosedError(`git cat-file answered ${header[0]} for ${oid ?? 'nothing'}`);
+          if (header[1] === 'missing' || header.length !== 3) throw new FailClosedError(`the base object ${oid.slice(0, 12)} is missing`);
+          const size = Number(header[2]);
+          if (!Number.isSafeInteger(size) || size < 0) throw new FailClosedError(`git cat-file gave no size for ${oid.slice(0, 12)}`);
+          cur = { oid, type: header[1]!, size, left: size, hash: createHash(format).update(`${header[1]} ${size}\0`), parts: [] };
+          if (size === 0) {
+            const o = cur;
+            cur = undefined;
+            trailer = true;
+            onObject({ oid: o.oid, type: o.type, size: 0, digest: o.hash.digest('hex'), ...(keepBody ? { body: Buffer.alloc(0) } : {}) });
+            next++;
+          }
+        }
+      } catch (err) {
+        fail(err as Error);
+      }
+    });
+    child.on('error', (err) => fail(err));
+    child.on('close', (code) => {
+      if (failed) return;
+      if (code !== 0) return reject(new FailClosedError(`git cat-file exited with ${code} while reading the base snapshot`));
+      if (next !== oids.length || cur || trailer || head.length) return reject(new FailClosedError(`git cat-file stopped after ${next} of ${oids.length} base objects`));
+      resolve();
+    });
+    child.stdin.on('error', () => {});
+    child.stdin.end(`${oids.join('\n')}\n`);
+  });
 }

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.7
+
+### Fixes
+
+- The guard blocked every Stop of a session in which the repository was repacked (`git gc`, `git maintenance run --auto` after a commit, a `git fetch` that keeps a pack): the commit the SessionStart hook recorded was trusted only while its object sat in a file from before the session, and any pack index written during the session failed the check outright. The recorded commit is now kept as the base in that case once its whole snapshot checks out: every object under it (the commit, each tree, each blob; gitlinks are not followed) is read with `git cat-file --batch`, hashed as it streams in the repository's object format, and must hash to its name with the expected type. A snapshot with a rewritten object (a forged loose file, or a pack whose index maps a name to other content) still fails closed. Blobs are never held in memory; their total size is read first and a snapshot over 1 GiB (`WHY_DIFF_MAX_SNAPSHOT_BYTES`) fails closed with that reason instead of running past the guard's deadline. On this machine 85 MB of snapshot (2,293 objects) takes about 0.5 s.
+- The index tree recorded at session start is kept after a repack the same way, so changes the human staged before the session are still not blamed on the agent.
+- Trees with zero-padded modes (`040000`, written by old tools) are read as trees.
+- The reflog fallback (no record) is unchanged.
+
+### Known limits (not changed here)
+
+- The snapshot is verified once; the diffs that follow read the object store again. A process the agent left running in the background could rewrite an object between the two. Diffing from a private copy of the verified objects would close this.
+- When the recorded commit's own object predates the session, the trees and blobs under it are still not hashed (as before 0.3.7).
+
+### Tests
+
+- `guard-repack`: `git gc` during a session with a plain change passes; with an added skip committed and repacked it still blocks with `test-skip-added`; a rewritten base commit, tree or blob fails closed (tree and blob are the cases git does not catch itself, and fail without the hash check); a snapshot past the byte cap fails closed naming `WHY_DIFF_MAX_SNAPSHOT_BYTES`; a skip staged before the session is not blamed after a repack.
+- `sec033 #9`: a recorded head whose object reads as written during the session now stays the base and the reset to the skipped commit blocks with `test-skip-added` instead of "could not check".
+
 ## 0.3.6
 
 ### Distribution
