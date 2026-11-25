@@ -1,9 +1,5 @@
 name: why-diff
-description: >-
-  Risk scan of a pull request diff (skipped or weakened tests, new dependencies,
-  CI and config changes, lint suppressions, secret-like strings), posted as one
-  sticky PR comment and the job summary. Needs `permissions: pull-requests: write`
-  and `actions/checkout` with `fetch-depth: 0`. Fork PRs get the job summary only.
+description: Risk scan of a PR diff (skipped tests, new dependencies, CI changes, secrets) as one sticky PR comment.
 author: mateuszkania-im
 branding:
   icon: git-pull-request
